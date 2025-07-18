@@ -13,14 +13,12 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 # These will be available when stage_3 is in the path
 try:
     from stage_3.model_client import ModelClient
-    from stage_3.model_instance_manager import CUDATensorRebuildInfo
 except ImportError:
     # For development/testing, assume stage_3 is in the Python path
     import sys
 
     sys.path.append("/home/schwinns/cuda-ipc-poc")
     from stage_3.model_client import ModelClient
-    from stage_3.model_instance_manager import CUDATensorRebuildInfo
 
 logger = init_logger(__name__)
 
@@ -36,57 +34,52 @@ class IPCModelLoader(BaseModelLoader):
                 "IPCModelLoader requires enable_ipc_loading=True in LoadConfig"
             )
 
-        # Initialize the model client
-        try:
-            self.client = ModelClient(
-                server_address=load_config.ipc_server_address,
-                req_port=load_config.ipc_req_port,
-                sub_port=load_config.ipc_sub_port,
-            )
-        except Exception as e:
-            logger.error("Error initializing IPC model loader: %s", e)
-            raise
+        self.server_address = load_config.ipc_server_address
+        self.sub_port = load_config.ipc_sub_port
+        self.req_port = load_config.ipc_req_port
+        self.client = None  # Will be initialized when we know the model
 
         logger.info(
-            "Initialized IPC model loader connected to %s:%s",
-            load_config.ipc_server_address,
-            load_config.ipc_req_port,
+            "IPC model loader initialized. Will connect to server at %s",
+            self.server_address,
         )
 
     def download_model(self, model_config: ModelConfig) -> None:
-        """Request the model to be loaded on the server if not already loaded."""
+        """Connect to the model server and wait for model to be ready."""
+        # Initialize client with the model name
+        try:
+            self.client = ModelClient(
+                model_name=model_config.model,
+                server_address=self.server_address,
+                sub_port=self.sub_port,
+                req_port=self.req_port,
+            )
+        except Exception as e:
+            logger.error("Error connecting to model server: %s", e)
+            raise
+
         logger.info(
-            "Requesting model %s to be loaded via IPC",
+            "Connected to IPC model server for model %s",
             model_config.model,
         )
 
-        # Request model loading - client will handle device mapping
-        response = self.client.load_model(model_config)
+        # Wait for model to be ready with two-phase timeout
+        logger.info("Waiting for model to be ready on server...")
+        success, server_info = self.client.wait_for_model_ready(
+            initial_timeout=15.0,  # 15 seconds to verify server is alive. TODO: Make this configurable
+            loading_timeout=300.0,  # 5 minutes for model to load. TODO: Make this configurable
+        )
 
-        # Check if this is an error response
-        if response.get("type") == "error":
+        if not success:
             raise RuntimeError(
-                f"Server error: {response.get('message', 'Unknown error')}"
+                "Failed to connect to model server or model not ready"
             )
 
-        # Check the status
-        status = response.get("status")
-        if status is None:
-            raise RuntimeError(f"Invalid response from server: {response}")
-
-        if status.value == "loading":
-            logger.info(
-                "Model is being loaded on server, waiting for completion..."
-            )
-            success = self.client.wait_for_model_load(model_config, timeout=300)
-            if not success:
-                raise RuntimeError("Failed to load model on server")
-        elif status.value == "already_exists":
-            logger.info("Model already loaded on server")
-        else:
-            raise RuntimeError(f"Unexpected load status: {status}")
-
-
+        logger.info(
+            "Model %s is ready on server (device: cuda:%s)",
+            model_config.model,
+            server_info.get("device_id", "unknown"),
+        )
 
     def get_all_weights(
         self,
@@ -97,16 +90,16 @@ class IPCModelLoader(BaseModelLoader):
         # First ensure the model is loaded on the server
         self.download_model(model_config)
 
+        if self.client is None:
+            raise RuntimeError("Model client not initialized")
+
         # Get tensor rebuild info from server
         logger.info("Retrieving tensor rebuild info from server...")
-        response = self.client.get_tensor_rebuild_info(model_config)
+        try:
+            tensor_rebuild_info = self.client.get_tensor_rebuild_info()
+        except Exception as e:
+            raise RuntimeError(f"Error getting tensor rebuild info: {e}")
 
-        if response["error"]:
-            raise RuntimeError(
-                f"Error getting tensor rebuild info: {response['error']}"
-            )
-
-        tensor_rebuild_info = response["tensor_rebuild_info"]
         if tensor_rebuild_info is None:
             raise RuntimeError("No tensor rebuild info received from server")
 
@@ -118,20 +111,20 @@ class IPCModelLoader(BaseModelLoader):
         for name, rebuild_info in tensor_rebuild_info.items():
             try:
                 tensor = self.client.reconstruct_tensor(rebuild_info)
-                
+
                 # Verify we got a tensor on a valid device
                 if not tensor.is_cuda:
                     raise RuntimeError(
                         f"Reconstructed tensor is not on CUDA: {tensor.device}"
                     )
-                
+
                 logger.debug(
                     "Reconstructed tensor %s with shape %s on device %s",
                     name,
                     tensor.shape,
                     tensor.device,
                 )
-                
+
                 yield name, tensor
             except Exception as e:
                 logger.error("Failed to reconstruct tensor %s: %s", name, e)
@@ -178,5 +171,5 @@ class IPCModelLoader(BaseModelLoader):
 
     def __del__(self):
         """Clean up the client connection when the loader is destroyed."""
-        if hasattr(self, "client"):
+        if hasattr(self, "client") and self.client is not None:
             self.client.close()
