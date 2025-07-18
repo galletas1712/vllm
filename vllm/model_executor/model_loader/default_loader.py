@@ -266,8 +266,9 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}
-        loaded_weights = model.load_weights(
-            self.get_all_weights(model_config, model))
+        # This is not a dict of {name -> weight}, where the weights are CPU tensors.
+        actual_weights = dict(self.get_all_weights(model_config, model))
+        loaded_weights = model.load_weights(actual_weights.items())
         self.counter_after_loading_weights = time.perf_counter()
         logger.info(
             "Loading weights took %.2f seconds",

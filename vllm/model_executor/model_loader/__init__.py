@@ -23,6 +23,11 @@ from vllm.model_executor.model_loader.utils import (
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
+    # Check if IPC loading is enabled
+    if load_config.enable_ipc_loading:
+        from vllm.model_executor.model_loader.ipc_loader import IPCModelLoader
+        return IPCModelLoader(load_config)
+    
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
 

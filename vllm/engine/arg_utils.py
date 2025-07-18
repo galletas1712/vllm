@@ -441,6 +441,11 @@ class EngineArgs:
 
     async_scheduling: bool = SchedulerConfig.async_scheduling
 
+    enable_ipc_loading: bool = LoadConfig.enable_ipc_loading
+    ipc_server_address: str = LoadConfig.ipc_server_address
+    ipc_req_port: str = LoadConfig.ipc_req_port
+    ipc_sub_port: str = LoadConfig.ipc_sub_port
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -562,6 +567,14 @@ class EngineArgs:
                                 **load_kwargs["use_tqdm_on_load"])
         load_group.add_argument('--pt-load-map-location',
                                 **load_kwargs["pt_load_map_location"])
+        load_group.add_argument("--enable-ipc-loading",
+                                **load_kwargs["enable_ipc_loading"])
+        load_group.add_argument("--ipc-server-address",
+                                **load_kwargs["ipc_server_address"])
+        load_group.add_argument("--ipc-req-port",
+                                **load_kwargs["ipc_req_port"])
+        load_group.add_argument("--ipc-sub-port",
+                                **load_kwargs["ipc_sub_port"])
 
         # Guided decoding arguments
         guided_decoding_kwargs = get_kwargs(DecodingConfig)
@@ -970,6 +983,10 @@ class EngineArgs:
             ignore_patterns=self.ignore_patterns,
             use_tqdm_on_load=self.use_tqdm_on_load,
             pt_load_map_location=self.pt_load_map_location,
+            enable_ipc_loading=self.enable_ipc_loading,
+            ipc_server_address=self.ipc_server_address,
+            ipc_req_port=self.ipc_req_port,
+            ipc_sub_port=self.ipc_sub_port,
         )
 
     def create_speculative_config(

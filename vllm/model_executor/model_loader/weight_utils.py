@@ -619,7 +619,15 @@ def default_weight_loader(param: torch.Tensor,
                 f"Attempted to load weight ({loaded_weight.size()}) "
                 f"into parameter ({param.size()})")
 
-            param.data.copy_(loaded_weight)
+            # TODO: remove!
+            assert loaded_weight.device == param.device, (
+                f"Attempted to load weight ({loaded_weight.device}) "
+                f"into parameter ({param.device})")
+
+            if loaded_weight.device != param.device:
+                param.data.copy_(loaded_weight)
+            else:
+                param.data = loaded_weight
     except Exception:
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.

@@ -1800,6 +1800,14 @@ class LoadConfig:
     in dictionary needs to be double quoted for json parsing. For more details,
     see original doc for `map_location` in https://pytorch.org/docs/stable/generated/torch.load.html
     """
+    enable_ipc_loading: bool = False
+    """Whether to enable loading model weights via IPC from a model server."""
+    ipc_server_address: str = "localhost"
+    """Address of the IPC model server."""
+    ipc_req_port: str = "5556"
+    """Port for REQ-REP socket of the IPC model server."""
+    ipc_sub_port: str = "5557"
+    """Port for PUB-SUB socket of the IPC model server."""
 
     def compute_hash(self) -> str:
         """
