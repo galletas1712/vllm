@@ -12,7 +12,6 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 # Import IPC client components
 # These will be available when stage_3 is in the path
 try:
-    from stage_3.gpu_utils import get_physical_device_index
     from stage_3.model_client import ModelClient
     from stage_3.model_instance_manager import CUDATensorRebuildInfo
 except ImportError:
@@ -20,7 +19,6 @@ except ImportError:
     import sys
 
     sys.path.append("/home/schwinns/cuda-ipc-poc")
-    from stage_3.gpu_utils import get_physical_device_index
     from stage_3.model_client import ModelClient
     from stage_3.model_instance_manager import CUDATensorRebuildInfo
 
@@ -57,19 +55,13 @@ class IPCModelLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Request the model to be loaded on the server if not already loaded."""
-        # Get the physical device index to ensure server and client use the same GPU
-        physical_device = get_physical_device_index()
-        device_str = f"cuda:{physical_device}"
-
         logger.info(
-            "Requesting model %s to be loaded on physical device %s (logical cuda:%d)",
+            "Requesting model %s to be loaded via IPC",
             model_config.model,
-            device_str,
-            torch.cuda.current_device(),
         )
 
-        # Request model loading
-        response = self.client.load_model(model_config, device_str)
+        # Request model loading - client will handle device mapping
+        response = self.client.load_model(model_config)
 
         # Check if this is an error response
         if response.get("type") == "error":
@@ -94,32 +86,7 @@ class IPCModelLoader(BaseModelLoader):
         else:
             raise RuntimeError(f"Unexpected load status: {status}")
 
-    def _reconstruct_tensor(
-        self, rebuild_info: CUDATensorRebuildInfo
-    ) -> torch.Tensor:
-        """Reconstruct a tensor from rebuild info using CUDA IPC."""
-        # Use PyTorch's internal reconstruction mechanism
-        from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-        # Get the rebuild args - PyTorch's IPC mechanism will handle device mapping
-        rebuild_args = rebuild_info.to_rebuild_args()
-
-        # Reconstruct the tensor - PyTorch handles CUDA_VISIBLE_DEVICES mapping
-        tensor = rebuild_cuda_tensor(*rebuild_args)
-
-        # Verify we got a tensor on a valid device
-        if not tensor.is_cuda:
-            raise RuntimeError(
-                f"Reconstructed tensor is not on CUDA: {tensor.device}"
-            )
-
-        logger.debug(
-            "Reconstructed tensor with shape %s on device %s",
-            tensor.shape,
-            tensor.device,
-        )
-
-        return tensor
 
     def get_all_weights(
         self,
@@ -150,7 +117,21 @@ class IPCModelLoader(BaseModelLoader):
         # Reconstruct and yield each tensor
         for name, rebuild_info in tensor_rebuild_info.items():
             try:
-                tensor = self._reconstruct_tensor(rebuild_info)
+                tensor = self.client.reconstruct_tensor(rebuild_info)
+                
+                # Verify we got a tensor on a valid device
+                if not tensor.is_cuda:
+                    raise RuntimeError(
+                        f"Reconstructed tensor is not on CUDA: {tensor.device}"
+                    )
+                
+                logger.debug(
+                    "Reconstructed tensor %s with shape %s on device %s",
+                    name,
+                    tensor.shape,
+                    tensor.device,
+                )
+                
                 yield name, tensor
             except Exception as e:
                 logger.error("Failed to reconstruct tensor %s: %s", name, e)
