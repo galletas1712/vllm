@@ -815,6 +815,218 @@ class GroupCoordinator:
             return hidden_states
 
 
+class DryGroupCoordinator:
+    """
+    A "dry" GroupCoordinator for simulation purposes.
+    
+    This coordinator has the same interface as GroupCoordinator but does not
+    support any actual communication operations. It only supports getting
+    properties and raises NotImplementedError for all send/recv/gather/scatter
+    operations.
+    """
+    
+    def __init__(
+        self,
+        world_size: int,
+        rank: int,
+        local_rank: Optional[int] = None,
+        group_name: Optional[str] = None,
+    ):
+        """Initialize a dry group coordinator.
+        
+        Args:
+            world_size: Total number of processes in the group
+            rank: Global rank of the current process
+            local_rank: Local rank on the node (defaults to rank)
+            group_name: Name of the group (defaults to "dry")
+        """
+        group_name = group_name or "dry"
+        self.unique_name = _get_unique_name(group_name)
+        _register_group(self)
+        
+        self.world_size = world_size
+        self.rank = rank
+        self.ranks = list(range(world_size))
+        self.local_rank = local_rank if local_rank is not None else rank
+        self.rank_in_group = rank
+        
+        # Simulate device assignment
+        from vllm.platforms import current_platform
+        if current_platform.is_cuda_alike():
+            self.device = torch.device(f"cuda:{self.local_rank}")
+        elif current_platform.is_xpu():
+            self.device = torch.device(f"xpu:{self.local_rank}")
+        elif current_platform.is_out_of_tree():
+            self.device = torch.device(
+                f"{current_platform.device_name}:{self.local_rank}")
+        else:
+            self.device = torch.device("cpu")
+        
+        # These are not used but kept for interface compatibility
+        self.cpu_group = None
+        self.device_group = None
+        self.use_device_communicator = False
+        self.device_communicator = None
+        self.mq_broadcaster = None
+        self.use_custom_op_call = False
+        
+    @property
+    def first_rank(self):
+        """Return the global rank of the first process in the group"""
+        return self.ranks[0]
+
+    @property
+    def last_rank(self):
+        """Return the global rank of the last process in the group"""
+        return self.ranks[-1]
+
+    @property
+    def is_first_rank(self):
+        """Return whether the caller is the first process in the group"""
+        return self.rank == self.first_rank
+
+    @property
+    def is_last_rank(self):
+        """Return whether the caller is the last process in the group"""
+        return self.rank == self.last_rank
+
+    @property
+    def next_rank(self):
+        """Return the global rank of the process that follows the caller"""
+        return self.ranks[(self.rank_in_group + 1) % self.world_size]
+
+    @property
+    def prev_rank(self):
+        """Return the global rank of the process that precedes the caller"""
+        return self.ranks[(self.rank_in_group - 1) % self.world_size]
+        
+    @contextmanager
+    def graph_capture(
+            self, graph_capture_context: Optional[GraphCaptureContext] = None):
+        """Context manager for graph capture (no-op for dry runs)."""
+        yield
+        
+    def _raise_not_implemented(self, op_name: str):
+        """Helper to raise NotImplementedError for communication operations."""
+        raise NotImplementedError(
+            f"{op_name} is not supported in DryGroupCoordinator. "
+            "This coordinator is for simulation purposes only and does not "
+            "support actual communication operations.")
+        
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        self._raise_not_implemented("all_reduce")
+        
+    def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+        self._raise_not_implemented("all_reduce")
+        
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        self._raise_not_implemented("all_gather")
+        
+    def _all_gather_out_place(self, input_: torch.Tensor,
+                              dim: int) -> torch.Tensor:
+        self._raise_not_implemented("all_gather")
+        
+    def all_gatherv(self,
+                    input_: Union[torch.Tensor, list[torch.Tensor]],
+                    dim: int = 0,
+                    sizes: Optional[list[int]] = None):
+        self._raise_not_implemented("all_gatherv")
+        
+    def reduce_scatter(self,
+                       input_: torch.Tensor,
+                       dim: int = -1) -> torch.Tensor:
+        self._raise_not_implemented("reduce_scatter")
+        
+    def reduce_scatterv(self,
+                        input_: torch.Tensor,
+                        dim: int = -1,
+                        sizes: Optional[list[int]] = None) -> torch.Tensor:
+        self._raise_not_implemented("reduce_scatterv")
+        
+    def _reduce_scatter_out_place(self, input_: torch.Tensor,
+                                  dim: int) -> torch.Tensor:
+        self._raise_not_implemented("reduce_scatter")
+        
+    def gather(self,
+               input_: torch.Tensor,
+               dst: int = 0,
+               dim: int = -1) -> Optional[torch.Tensor]:
+        self._raise_not_implemented("gather")
+        
+    def broadcast(self, input_: torch.Tensor, src: int = 0):
+        self._raise_not_implemented("broadcast")
+        
+    def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
+        self._raise_not_implemented("broadcast_object")
+        
+    def broadcast_object_list(self,
+                              obj_list: list[Any],
+                              src: int = 0,
+                              group: Optional[ProcessGroup] = None):
+        self._raise_not_implemented("broadcast_object_list")
+        
+    def send_object(self, obj: Any, dst: int) -> None:
+        self._raise_not_implemented("send_object")
+        
+    def recv_object(self, src: int) -> Any:
+        self._raise_not_implemented("recv_object")
+        
+    def broadcast_tensor_dict(
+        self,
+        tensor_dict: Optional[dict[str, Union[torch.Tensor, Any]]] = None,
+        src: int = 0,
+        group: Optional[ProcessGroup] = None,
+        metadata_group: Optional[ProcessGroup] = None
+    ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
+        self._raise_not_implemented("broadcast_tensor_dict")
+        
+    def send_tensor_dict(
+        self,
+        tensor_dict: dict[str, Union[torch.Tensor, Any]],
+        dst: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
+        self._raise_not_implemented("send_tensor_dict")
+        
+    def recv_tensor_dict(
+        self,
+        src: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
+        self._raise_not_implemented("recv_tensor_dict")
+        
+    def barrier(self):
+        """Barrier is a no-op for dry runs."""
+        pass
+        
+    def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
+        self._raise_not_implemented("send")
+        
+    def recv(self,
+             size: torch.Size,
+             dtype: torch.dtype,
+             src: Optional[int] = None) -> torch.Tensor:
+        self._raise_not_implemented("recv")
+        
+    def destroy(self):
+        """Destroy the group (no-op for dry runs)."""
+        pass
+        
+    def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
+        """Prepare communication buffer (no-op for dry runs)."""
+        pass
+        
+    def dispatch(
+            self, hidden_states: torch.Tensor,
+            router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dispatch is a no-op for dry runs."""
+        return hidden_states, router_logits
+        
+    def combine(self, hidden_states) -> torch.Tensor:
+        """Combine is a no-op for dry runs."""
+        return hidden_states
+
+
 _WORLD: Optional[GroupCoordinator] = None
 _NODE_COUNT: Optional[int] = None
 
@@ -930,12 +1142,42 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
 ):
+    global _WORLD, _NODE_COUNT
+    
     logger.debug(
         "world_size=%d rank=%d local_rank=%d "
         "distributed_init_method=%s backend=%s", world_size, rank, local_rank,
         distributed_init_method, backend)
     from vllm.config import get_current_vllm_config
     config = get_current_vllm_config()
+    
+    # Check if dry run mode is enabled
+    if config is not None and config.parallel_config.dry_run:
+        parallel_config = config.parallel_config
+        logger.info("Initializing distributed environment in dry run mode")
+        
+        # Use dry parameters
+        world_size = parallel_config.dry_world_size
+        rank = parallel_config.dry_global_rank
+        if local_rank == -1:
+            local_rank = rank
+        
+        # Initialize dry world group
+        if _WORLD is None:
+            _WORLD = DryGroupCoordinator(
+                world_size=world_size,
+                rank=rank,
+                local_rank=local_rank,
+                group_name="world"
+            )
+            _NODE_COUNT = 1  # Simulate single node for dry runs
+            logger.debug("Initialized dry world group with world_size=%d, rank=%d",
+                        world_size, rank)
+        else:
+            assert _WORLD.world_size == world_size, (
+                "world group already initialized with a different world size")
+        return
+    
     if config is not None and config.parallel_config.data_parallel_size > 1:
         parallel_config = config.parallel_config
         # adjust to take into account data parallelism
@@ -976,7 +1218,6 @@ def init_distributed_environment(
             local_rank = envs.LOCAL_RANK
         else:
             local_rank = rank
-    global _WORLD, _NODE_COUNT
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(ranks, local_rank, backend)
@@ -986,6 +1227,107 @@ def init_distributed_environment(
     else:
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
             "world group already initialized with a different world size")
+
+
+def _initialize_dry_model_parallel(
+    tensor_model_parallel_size: int,
+    pipeline_model_parallel_size: int,
+    parallel_config: Any,
+) -> None:
+    """Initialize dry model parallel groups for simulation."""
+    global _TP, _PP, _DP, _EP
+    
+    world_size = parallel_config.dry_world_size
+    rank = parallel_config.dry_global_rank
+    local_rank = rank  # Assume single node for dry runs
+    
+    data_parallel_size = parallel_config.data_parallel_size
+    
+    # Calculate the dimensions
+    total_parallel_size = (tensor_model_parallel_size * 
+                          pipeline_model_parallel_size * 
+                          data_parallel_size)
+    
+    if total_parallel_size > world_size:
+        raise ValueError(
+            f"Total parallel size ({total_parallel_size}) exceeds world size "
+            f"({world_size}). TP={tensor_model_parallel_size}, "
+            f"PP={pipeline_model_parallel_size}, DP={data_parallel_size}")
+    
+    # Create simulated rank assignments
+    # The layout order is: ExternalDP x DP x PP x TP
+    external_dp_size = world_size // total_parallel_size
+    
+    # Calculate which groups this rank belongs to
+    # Extract indices for each dimension
+    external_dp_idx = rank // total_parallel_size
+    remainder = rank % total_parallel_size
+    
+    dp_idx = remainder // (pipeline_model_parallel_size * tensor_model_parallel_size)
+    remainder = remainder % (pipeline_model_parallel_size * tensor_model_parallel_size)
+    
+    pp_idx = remainder // tensor_model_parallel_size
+    tp_idx = remainder % tensor_model_parallel_size
+    
+    # Build tensor parallel group
+    assert _TP is None, ("tensor model parallel group is already initialized")
+    tp_rank_offset = (external_dp_idx * total_parallel_size + 
+                     dp_idx * pipeline_model_parallel_size * tensor_model_parallel_size +
+                     pp_idx * tensor_model_parallel_size)
+    tp_ranks = list(range(tp_rank_offset, tp_rank_offset + tensor_model_parallel_size))
+    
+    _TP = DryGroupCoordinator(
+        world_size=tensor_model_parallel_size,
+        rank=tp_idx,
+        local_rank=local_rank,
+        group_name="tp"
+    )
+    _TP.ranks = tp_ranks
+    _TP.rank_in_group = tp_idx
+    
+    # Build pipeline parallel group  
+    assert _PP is None, ("pipeline model parallel group is already initialized")
+    pp_ranks = []
+    for i in range(pipeline_model_parallel_size):
+        pp_rank = (external_dp_idx * total_parallel_size +
+                  dp_idx * pipeline_model_parallel_size * tensor_model_parallel_size +
+                  i * tensor_model_parallel_size + tp_idx)
+        pp_ranks.append(pp_rank)
+    
+    _PP = DryGroupCoordinator(
+        world_size=pipeline_model_parallel_size,
+        rank=pp_idx,
+        local_rank=local_rank,
+        group_name="pp"
+    )
+    _PP.ranks = pp_ranks
+    _PP.rank_in_group = pp_idx
+    
+    # Build data parallel group
+    assert _DP is None, ("data parallel group is already initialized")
+    dp_ranks = []
+    for i in range(data_parallel_size):
+        dp_rank = (external_dp_idx * total_parallel_size +
+                  i * pipeline_model_parallel_size * tensor_model_parallel_size +
+                  pp_idx * tensor_model_parallel_size + tp_idx)
+        dp_ranks.append(dp_rank)
+    
+    _DP = DryGroupCoordinator(
+        world_size=data_parallel_size,
+        rank=dp_idx,
+        local_rank=local_rank,
+        group_name="dp"
+    )
+    _DP.ranks = dp_ranks
+    _DP.rank_in_group = dp_idx
+    
+    # Expert parallel defaults to data parallel
+    _EP = _DP
+    
+    logger.info(
+        "Initialized dry model parallel groups: rank %s in world size %s is "
+        "assigned as DP rank %s, PP rank %s, TP rank %s",
+        rank, world_size, dp_idx, pp_idx, tp_idx)
 
 
 def initialize_model_parallel(
@@ -1015,6 +1357,19 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    # Check if we're in dry run mode
+    from vllm.config import get_current_vllm_config
+    config = get_current_vllm_config()
+    
+    if config is not None and config.parallel_config.dry_run:
+        # Initialize dry model parallel groups
+        _initialize_dry_model_parallel(
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            config.parallel_config
+        )
+        return
+        
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -1103,8 +1458,15 @@ def ensure_model_parallel_initialized(
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
     values if the model parallel groups are initialized.
     """
-    backend = backend or torch.distributed.get_backend(
-        get_world_group().device_group)
+    # Check if we're in dry run mode
+    from vllm.config import get_current_vllm_config
+    config = get_current_vllm_config()
+    
+    if config is not None and config.parallel_config.dry_run:
+        backend = "nccl"  # Default backend for dry runs
+    else:
+        backend = backend or torch.distributed.get_backend(
+            get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
                                   pipeline_model_parallel_size, backend)

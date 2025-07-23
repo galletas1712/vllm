@@ -14,11 +14,32 @@ from vllm.model_executor.utils import _make_synced_weight_loader
 __all__ = [
     "BasevLLMParameter", "PackedvLLMParameter", "PerTensorScaleParameter",
     "ModelWeightParameter", "ChannelQuantScaleParameter",
-    "GroupQuantScaleParameter", "PackedColumnParameter", "RowvLLMParameter"
+    "GroupQuantScaleParameter", "PackedColumnParameter", "RowvLLMParameter", "UninitializedParameterFromTensor"
 ]
 
 logger = init_logger(__name__)
 
+
+class UninitializedParameterFromTensor(Parameter):
+
+    cls_to_become = Parameter
+
+    def __new__(cls, requires_grad=False, device=None, dtype=None) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        data = torch.empty(0, **factory_kwargs)
+        return torch.Tensor._make_subclass(cls, data, requires_grad)
+
+    def __deepcopy__(self, memo):
+        if id(self) in memo:
+            return memo[id(self)]
+        else:
+            result = type(self)(self.requires_grad, self.data.device, self.data.dtype)
+            memo[id(self)] = result
+            return result
+    
+    def materialize(self, data_tensor: torch.Tensor):
+        self.data = data_tensor
+        self.__class__ = self.cls_to_become
 
 class BasevLLMParameter(Parameter):
     """

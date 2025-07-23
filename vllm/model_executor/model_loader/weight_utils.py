@@ -619,11 +619,6 @@ def default_weight_loader(param: torch.Tensor,
                 f"Attempted to load weight ({loaded_weight.size()}) "
                 f"into parameter ({param.size()})")
 
-            # TODO: remove!
-            assert loaded_weight.device == param.device, (
-                f"Attempted to load weight ({loaded_weight.device}) "
-                f"into parameter ({param.device})")
-
             if loaded_weight.device != param.device:
                 param.data.copy_(loaded_weight)
             else:

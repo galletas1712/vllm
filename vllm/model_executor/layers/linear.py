@@ -25,10 +25,11 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            PackedColumnParameter,
                                            PackedvLLMParameter,
                                            PerTensorScaleParameter,
-                                           RowvLLMParameter)
+                                           RowvLLMParameter, UninitializedParameterFromTensor)
 # yapf: enable
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.config import get_current_vllm_config
 
 logger = init_logger(__name__)
 
@@ -189,10 +190,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
                        output_partition_sizes: list[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
-        weight = Parameter(torch.empty(sum(output_partition_sizes),
-                                       input_size_per_partition,
-                                       dtype=params_dtype),
-                           requires_grad=False)
+        if get_current_vllm_config().load_config.enable_ipc_loading:
+            logger.warning("Creating uninitialized parameter for weight")
+            weight = UninitializedParameterFromTensor()
+        else:
+            weight = Parameter(torch.empty(sum(output_partition_sizes),
+                                           input_size_per_partition,
+                                           dtype=params_dtype),
+                               requires_grad=False)
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
