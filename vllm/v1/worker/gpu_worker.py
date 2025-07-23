@@ -33,6 +33,37 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
 
+def get_model_weights_size_bytes(model: torch.nn.Module) -> int:
+    """Calculate total unique bytes of all parameters & buffers on CUDA.
+    
+    This accounts for tied weights by tracking unique storage pointers.
+    """
+    seen_storages: set[int] = set()
+    total = 0
+    
+    # Count parameters
+    for param in model.parameters():
+        if not param.is_cuda:
+            continue
+        data_ptr = param.storage().data_ptr()
+        if data_ptr in seen_storages:
+            continue  # Skip tied weights / shared storage
+        seen_storages.add(data_ptr)
+        total += param.storage().nbytes()
+    
+    # Count buffers (e.g., layer norm weights)
+    for buffer in model.buffers():
+        if not buffer.is_cuda:
+            continue
+        data_ptr = buffer.storage().data_ptr()
+        if data_ptr in seen_storages:
+            continue
+        seen_storages.add(data_ptr)
+        total += buffer.storage().nbytes()
+    
+    return total
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -146,8 +177,20 @@ class Worker(WorkerBase):
             self.init_snapshot = MemorySnapshot()
             self.requested_memory = (self.init_snapshot.total_memory *
                                      self.cache_config.gpu_memory_utilization)
-            if self.init_snapshot.free_memory < self.requested_memory:
-                GiB = lambda b: round(b / GiB_bytes, 2)
+            GiB = lambda b: round(b / GiB_bytes, 2)
+            
+            # When using IPC loading, we don't need to allocate memory for model weights
+            # as they are already loaded by the model server. Skip the strict check
+            # since we'll do proper accounting after model loading.
+            if self.load_config.enable_ipc_loading:
+                logger.info(
+                    "IPC loading enabled: Skipping initial memory check. "
+                    "Free memory: %.2f GiB, Total: %.2f GiB, Requested: %.2f GiB",
+                    GiB(self.init_snapshot.free_memory), 
+                    GiB(self.init_snapshot.total_memory), 
+                    GiB(self.requested_memory)
+                )
+            elif self.init_snapshot.free_memory < self.requested_memory:
                 raise ValueError(
                     f"Free memory on device "
                     f"({GiB(self.init_snapshot.free_memory)}/"
@@ -232,14 +275,53 @@ class Worker(WorkerBase):
             "release GPU memory while vLLM is profiling during initialization. "
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container.")
-        available_kv_cache_memory = self.requested_memory \
-            - profile_result.non_kv_cache_memory
+        # Calculate available memory for KV cache
+        if self.load_config.enable_ipc_loading:
+            # With IPC loading, the model server has already allocated memory
+            # for weights. We should only subtract the torch memory increase
+            # from this process, not the non_torch_increase which includes
+            # the model server's memory.
+            weights_bytes = get_model_weights_size_bytes(self.model_runner.model)
+            logger.info(
+                "IPC loading enabled: Model weights (%.2f GiB) are managed by "
+                "model server process", 
+                weights_bytes / GiB_bytes
+            )
+            logger.info(
+                "Memory profiling details:\n"
+                "- Free GPU memory: %.2f GiB\n"
+                "- GPU utilization: %.2f\n"
+                "- torch_peak_increase: %.2f GiB\n"
+                "- non_torch_increase: %.2f GiB (includes model server memory)\n"
+                "- weights_memory: %.2f GiB",
+                free_gpu_memory / GiB_bytes,
+                self.cache_config.gpu_memory_utilization,
+                profile_result.torch_peak_increase / GiB_bytes,
+                profile_result.non_torch_increase / GiB_bytes,
+                profile_result.weights_memory / GiB_bytes
+            )
+            # Only subtract PyTorch memory from this process
+            available_kv_cache_memory = int(free_gpu_memory * 
+                                          self.cache_config.gpu_memory_utilization) \
+                - profile_result.torch_peak_increase
+        else:
+            # Normal loading: use standard calculation
+            available_kv_cache_memory = self.requested_memory \
+                - profile_result.non_kv_cache_memory
 
-        logger.debug(
-            "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
-            "requested GPU memory: %.2f GiB",
-            GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
-            GiB(self.requested_memory))
+        if self.load_config.enable_ipc_loading:
+            logger.debug(
+                "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
+                "using free memory * %.2f = %.2f GiB for KV cache calculation",
+                GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
+                self.cache_config.gpu_memory_utilization,
+                GiB(free_gpu_memory * self.cache_config.gpu_memory_utilization))
+        else:
+            logger.debug(
+                "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
+                "requested GPU memory: %.2f GiB",
+                GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
+                GiB(self.requested_memory))
         logger.debug(profile_result)
         logger.info("Available KV cache memory: %.2f GiB",
                     GiB(available_kv_cache_memory))

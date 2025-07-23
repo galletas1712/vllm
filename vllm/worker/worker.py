@@ -37,6 +37,37 @@ from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
 logger = init_logger(__name__)
 
 
+def get_model_weights_size_bytes(model: torch.nn.Module) -> int:
+    """Calculate total unique bytes of all parameters & buffers on CUDA.
+
+    This accounts for tied weights by tracking unique storage pointers.
+    """
+    seen_storages: set[int] = set()
+    total = 0
+
+    # Count parameters
+    for param in model.parameters():
+        if not param.is_cuda:
+            continue
+        data_ptr = param.storage().data_ptr()
+        if data_ptr in seen_storages:
+            continue  # Skip tied weights / shared storage
+        seen_storages.add(data_ptr)
+        total += param.storage().nbytes()
+
+    # Count buffers (e.g., layer norm weights)
+    for buffer in model.buffers():
+        if not buffer.is_cuda:
+            continue
+        data_ptr = buffer.storage().data_ptr()
+        if data_ptr in seen_storages:
+            continue
+        seen_storages.add(data_ptr)
+        total += buffer.storage().nbytes()
+
+    return total
+
+
 class Worker(LocalOrDistributedWorkerBase):
     """A worker class that executes (a partition of) the model on a GPU.
 
@@ -260,8 +291,40 @@ class Worker(LocalOrDistributedWorkerBase):
 
         memory_for_current_instance = total_gpu_memory * \
             self.cache_config.gpu_memory_utilization
-        available_kv_cache_memory = (memory_for_current_instance -
-                                     result.non_kv_cache_memory)
+        
+        # Calculate available memory for KV cache
+        if self.load_config.enable_ipc_loading:
+            # With IPC loading, the model server has already allocated memory
+            # for weights. We should only subtract the torch memory increase
+            # from this process, not the non_torch_increase which includes
+            # the model server's memory.
+            weights_bytes = get_model_weights_size_bytes(self.model_runner.model)
+            logger.info(
+                "IPC loading enabled: Model weights (%.2f GiB) are managed by "
+                "model server process",
+                weights_bytes / GiB_bytes
+            )
+            logger.info(
+                "Memory profiling details:\n"
+                "- Free GPU memory: %.2f GiB\n"
+                "- GPU utilization: %.2f\n"
+                "- torch_peak_increase: %.2f GiB\n" 
+                "- non_torch_increase: %.2f GiB (includes model server memory)\n"
+                "- weights_memory: %.2f GiB",
+                free_memory_pre_profile / GiB_bytes,
+                self.cache_config.gpu_memory_utilization,
+                result.torch_peak_increase / GiB_bytes,
+                result.non_torch_increase / GiB_bytes,
+                result.weights_memory / GiB_bytes
+            )
+            # Only subtract PyTorch memory from this process
+            available_kv_cache_memory = int(free_memory_pre_profile * 
+                                          self.cache_config.gpu_memory_utilization) \
+                - result.torch_peak_increase
+        else:
+            # Normal loading: use standard calculation
+            available_kv_cache_memory = (memory_for_current_instance -
+                                         result.non_kv_cache_memory)
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
@@ -276,21 +339,38 @@ class Worker(LocalOrDistributedWorkerBase):
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
 
-        msg = (f"Memory profiling takes {result.profile_time:.2f} seconds\n"
-               "the current vLLM instance can use "
-               "total_gpu_memory "
-               f"({(total_gpu_memory / GiB_bytes):.2f}GiB)"
-               " x gpu_memory_utilization "
-               f"({self.cache_config.gpu_memory_utilization:.2f})"
-               f" = {(memory_for_current_instance / GiB_bytes):.2f}GiB\n"
-               "model weights take "
-               f"{(result.weights_memory / GiB_bytes):.2f}GiB;"
-               " non_torch_memory takes "
-               f"{(result.non_torch_increase / GiB_bytes):.2f}GiB;"
-               " PyTorch activation peak memory takes "
-               f"{(result.torch_peak_increase / GiB_bytes):.2f}GiB;"
-               " the rest of the memory reserved for KV Cache is "
-               f"{(available_kv_cache_memory / GiB_bytes):.2f}GiB.")
+        if self.load_config.enable_ipc_loading:
+            msg = (f"Memory profiling takes {result.profile_time:.2f} seconds\n"
+                   "IPC loading enabled - using free GPU memory for calculation\n"
+                   "free_gpu_memory "
+                   f"({(free_memory_pre_profile / GiB_bytes):.2f}GiB)"
+                   " x gpu_memory_utilization "
+                   f"({self.cache_config.gpu_memory_utilization:.2f})"
+                   f" = {(free_memory_pre_profile * self.cache_config.gpu_memory_utilization / GiB_bytes):.2f}GiB\n"
+                   "model weights (managed by server) take "
+                   f"{(weights_bytes / GiB_bytes):.2f}GiB;"
+                   " non_torch_memory increase takes "
+                   f"{(result.non_torch_increase / GiB_bytes):.2f}GiB;"
+                   " PyTorch activation peak memory takes "
+                   f"{(result.torch_peak_increase / GiB_bytes):.2f}GiB;"
+                   " the rest of the memory reserved for KV Cache is "
+                   f"{(available_kv_cache_memory / GiB_bytes):.2f}GiB.")
+        else:
+            msg = (f"Memory profiling takes {result.profile_time:.2f} seconds\n"
+                   "the current vLLM instance can use "
+                   "total_gpu_memory "
+                   f"({(total_gpu_memory / GiB_bytes):.2f}GiB)"
+                   " x gpu_memory_utilization "
+                   f"({self.cache_config.gpu_memory_utilization:.2f})"
+                   f" = {(memory_for_current_instance / GiB_bytes):.2f}GiB\n"
+                   "model weights take "
+                   f"{(result.weights_memory / GiB_bytes):.2f}GiB;"
+                   " non_torch_memory takes "
+                   f"{(result.non_torch_increase / GiB_bytes):.2f}GiB;"
+                   " PyTorch activation peak memory takes "
+                   f"{(result.torch_peak_increase / GiB_bytes):.2f}GiB;"
+                   " the rest of the memory reserved for KV Cache is "
+                   f"{(available_kv_cache_memory / GiB_bytes):.2f}GiB.")
 
         logger.info(msg)
         # Final cleanup
