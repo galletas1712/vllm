@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Generator
 import copy
+import asyncio
+import uvloop
 
 import torch
 from torch import nn
@@ -9,19 +11,22 @@ from torch import nn
 from vllm.config import LoadConfig, ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
-from vllm.model_executor.model_loader.utils import initialize_model, process_weights_after_loading, set_default_torch_dtype
+from vllm.model_executor.model_loader.utils import (
+    initialize_model,
+    process_weights_after_loading,
+    set_default_torch_dtype,
+)
 from vllm.model_executor.parameter import UninitializedParameterFromTensor
 
-# Import IPC client components
-# These will be available when stage_3 is in the path
+# Import Dynamo companion client
 try:
-    from stage_3.model_client import ModelClient
-except ImportError:
-    # For development/testing, assume stage_3 is in the Python path
-    import sys
-
-    sys.path.append("/home/schwinns/cuda-ipc-poc")
-    from stage_3.model_client import ModelClient
+    from dynamo.runtime import DistributedRuntime
+    from dynamo.companion.dynamo_companion_client import create_model_client
+except ImportError as e:
+    raise ImportError(
+        "Failed to import Dynamo companion components. "
+        "Make sure the companion module is installed"
+    ) from e
 
 logger = init_logger(__name__)
 
@@ -52,23 +57,43 @@ class IPCModelLoader(BaseModelLoader):
         """Connect to the model server and wait for model to be ready."""
         assert self.vllm_config is not None, "vllm_config not set"
 
-        # Initialize client with the model name
-        try:
-            self.client = ModelClient(
-                vllm_config=self.vllm_config,
-                server_address=self.server_address,
-                sub_port=self.sub_port,
-                req_port=self.req_port,
-            )
-        except Exception as e:
-            logger.error("Error connecting to model server: %s", e)
-            raise
+        # Initialize Dynamo runtime and client
+        if self.client is None:
+            try:
+                # Create a new event loop for this thread if needed
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        raise RuntimeError("Event loop is closed")
+                except RuntimeError:
+                    # No event loop in this thread, create one
+                    uvloop.install()
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
 
-        # Wait for model to be ready with two-phase timeout
+                # Create a Dynamo runtime instance
+                # Second parameter is whether it's static (False = dynamic, can discover services)
+                self.runtime = DistributedRuntime(loop, False)
+
+                async def _create():
+                    return await create_model_client(
+                        runtime=self.runtime,
+                        vllm_config=self.vllm_config,
+                        namespace="companion",
+                    )
+
+                self.client = loop.run_until_complete(_create())
+            except Exception as e:
+                logger.error("Error creating Dynamo model client: %s", e)
+                raise
+
+        # Wait for model to be ready with two-phase timeout (blocking from sync context)
         logger.info("Waiting for model to be ready on server...")
-        success, server_info = self.client.wait_for_model_ready(
-            initial_timeout=15.0,  # 15 seconds to verify server is alive. TODO: Make this configurable
-            loading_timeout=300.0,  # 5 minutes for model to load. TODO: Make this configurable
+        success, server_info = loop.run_until_complete(
+            self.client.wait_for_model_ready(
+                initial_timeout=15.0,  # TODO: make configurable
+                loading_timeout=300.0,
+            )
         )
 
         if not success:
@@ -94,7 +119,10 @@ class IPCModelLoader(BaseModelLoader):
         # Get tensor rebuild info from server
         logger.info("Retrieving model parameters rebuild info from server...")
         try:
-            model_parameters_rebuild_info = self.client.get_model_parameters()
+            loop = asyncio.get_event_loop()
+            model_parameters_rebuild_info = loop.run_until_complete(
+                self.client.get_model_parameters()
+            )
         except Exception as e:
             raise RuntimeError(f"Error getting tensor rebuild info: {e}")
 
@@ -167,11 +195,15 @@ class IPCModelLoader(BaseModelLoader):
 
             logger.debug("Loading weights on %s ...", load_device)
 
-            # NOTE: we need to set this here for the client to work
+            # Provide rank info for discovering the correct server component
             self.vllm_config = copy.deepcopy(vllm_config)
             self.vllm_config.parallel_config.dry_local_rank = torch.cuda.current_device()
-            self.vllm_config.parallel_config.dry_global_rank = torch.distributed.get_rank()
-            self.vllm_config.parallel_config.dry_world_size = torch.distributed.get_world_size()
+            self.vllm_config.parallel_config.dry_global_rank = (
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            )
+            self.vllm_config.parallel_config.dry_world_size = (
+                torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            )
 
             self.load_weights(model, model_config)
             # Quantization does not happen in `load_weights` but after it
@@ -180,5 +212,6 @@ class IPCModelLoader(BaseModelLoader):
 
     def __del__(self):
         """Clean up the client connection when the loader is destroyed."""
-        if hasattr(self, "client") and self.client is not None:
-            self.client.close()
+        if hasattr(self, "runtime") and self.runtime is not None:
+            # Dynamo runtime cleanup happens automatically when it goes out of scope
+            pass
