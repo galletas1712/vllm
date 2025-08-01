@@ -45,6 +45,104 @@ from vllm.logger import init_logger
 from vllm.utils import (direct_register_custom_op, get_distributed_init_method,
                         resolve_obj_by_qualname, supports_custom_op)
 
+# Backend constant for dry run mode
+DRY_RUN_BACKEND = "dry_run"
+
+# Global state for dry run mode
+_IS_DRY_RUN = False
+
+def is_dry_run() -> bool:
+    """Check if parallel state is in dry run mode."""
+    return _IS_DRY_RUN
+
+# Dry run state - stores parameters when torch.distributed isn't really initialized
+class _DryRunState:
+    def __init__(self):
+        self.world_size = 1
+        self.rank = 0
+        self.is_initialized = False
+        self.backend = DRY_RUN_BACKEND
+
+_DRY_RUN_STATE = _DryRunState()
+
+
+class _MockTorchDistributed:
+    """Mock torch.distributed module for dry runs."""
+    
+    @staticmethod
+    def is_initialized():
+        return _DRY_RUN_STATE.is_initialized
+    
+    @staticmethod
+    def get_world_size(group=None):
+        return _DRY_RUN_STATE.world_size
+    
+    @staticmethod
+    def get_rank(group=None):
+        return _DRY_RUN_STATE.rank
+    
+    @staticmethod
+    def init_process_group(backend, init_method, world_size, rank):
+        _DRY_RUN_STATE.is_initialized = True
+        _DRY_RUN_STATE.world_size = world_size
+        _DRY_RUN_STATE.rank = rank
+        _DRY_RUN_STATE.backend = backend
+    
+    @staticmethod
+    def is_backend_available(backend):
+        return True
+    
+    @staticmethod
+    def is_gloo_available():
+        return True
+    
+    @staticmethod
+    def new_group(ranks, backend):
+        # Return a mock process group object for dry runs
+        class MockProcessGroup:
+            def __init__(self, ranks, backend):
+                self.ranks = ranks
+                self.backend = backend
+        return MockProcessGroup(ranks, backend)
+    
+    @staticmethod
+    def get_backend(group=None):
+        return _DRY_RUN_STATE.backend
+    
+    @staticmethod
+    def destroy_process_group():
+        _DRY_RUN_STATE.is_initialized = False
+    
+    @staticmethod
+    def get_process_group_ranks(pg):
+        # Return the ranks stored in the mock process group
+        if hasattr(pg, 'ranks'):
+            return pg.ranks
+        return list(range(_DRY_RUN_STATE.world_size))
+    
+    @staticmethod
+    def barrier(group=None):
+        # No-op barrier for dry runs
+        pass
+    
+    @staticmethod
+    def broadcast_object_list(obj_list, src, group):
+        # No-op broadcast for dry runs
+        return obj_list
+    
+    @staticmethod
+    def all_reduce(tensor, group=None):
+        # No-op all_reduce for dry runs
+        return tensor
+
+
+# Helper function to get torch.distributed (real or mock)
+def _get_torch_distributed():
+    if _IS_DRY_RUN:
+        return _MockTorchDistributed
+    else:
+        return torch.distributed
+
 
 @dataclass
 class GraphCaptureContext:
@@ -215,17 +313,17 @@ class GroupCoordinator:
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
-        self.rank = torch.distributed.get_rank()
+        self.rank = _get_torch_distributed().get_rank()
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
+            device_group = _get_torch_distributed().new_group(
                 ranks, backend=torch_distributed_backend)
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            cpu_group = _get_torch_distributed().new_group(ranks, backend="gloo")
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -827,60 +925,63 @@ class GroupCoordinator:
             return hidden_states
 
 
-class DryGroupCoordinator:
+class DryGroupCoordinator(GroupCoordinator):
     """
     A "dry" GroupCoordinator for simulation purposes.
     
-    This coordinator has the same interface as GroupCoordinator but does not
-    support any actual communication operations. It only supports getting
-    properties and raises NotImplementedError for all send/recv/gather/scatter
-    operations.
+    This coordinator inherits from GroupCoordinator but overrides
+    communication operations to work without actual distributed communication.
+    It serves as a shadow replica that can run in a separate process.
     """
     
     def __init__(
         self,
-        world_size: int,
-        rank: int,
-        local_rank: Optional[int] = None,
+        group_ranks: list[list[int]],
+        local_rank: int,
+        torch_distributed_backend: Union[str, Backend],
+        use_device_communicator: bool,
+        use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
     ):
         """Initialize a dry group coordinator.
         
-        Args:
-            world_size: Total number of processes in the group
-            rank: Global rank of the current process
-            local_rank: Local rank on the node (defaults to rank)
-            group_name: Name of the group (defaults to "dry")
+        This overrides the parent constructor to avoid actual process group creation.
         """
         group_name = group_name or "dry"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
         
-        self.world_size = world_size
-        self.rank = rank
-        self.ranks = list(range(world_size))
-        self.local_rank = local_rank if local_rank is not None else rank
-        self.rank_in_group = rank
+        self.rank = _get_torch_distributed().get_rank()
+        self.local_rank = local_rank
+        self.device_group = None
+        self.cpu_group = None
         
-        # Simulate device assignment
+        # Find which group this rank belongs to
+        for ranks in group_ranks:
+            if self.rank in ranks:
+                self.ranks = ranks
+                self.world_size = len(ranks)
+                self.rank_in_group = ranks.index(self.rank)
+                break
+        
+        # Set device
         from vllm.platforms import current_platform
         if current_platform.is_cuda_alike():
-            self.device = torch.device(f"cuda:{self.local_rank}")
+            self.device = torch.device(f"cuda:{local_rank}")
         elif current_platform.is_xpu():
-            self.device = torch.device(f"xpu:{self.local_rank}")
+            self.device = torch.device(f"xpu:{local_rank}")
         elif current_platform.is_out_of_tree():
             self.device = torch.device(
-                f"{current_platform.device_name}:{self.local_rank}")
+                f"{current_platform.device_name}:{local_rank}")
         else:
             self.device = torch.device("cpu")
         
-        # These are not used but kept for interface compatibility
-        self.cpu_group = None
-        self.device_group = None
+        # These are not used in dry runs
         self.use_device_communicator = False
         self.device_communicator = None
         self.mq_broadcaster = None
         self.use_custom_op_call = False
+        self.use_cpu_custom_send_recv = False
         
     @property
     def first_rank(self):
@@ -1050,13 +1151,23 @@ def get_world_group() -> GroupCoordinator:
 
 def init_world_group(ranks: list[int], local_rank: int,
                      backend: str) -> GroupCoordinator:
-    return GroupCoordinator(
-        group_ranks=[ranks],
-        local_rank=local_rank,
-        torch_distributed_backend=backend,
-        use_device_communicator=False,
-        group_name="world",
-    )
+    if _IS_DRY_RUN:
+        return DryGroupCoordinator(
+            group_ranks=[ranks],
+            local_rank=local_rank,
+            torch_distributed_backend=backend,
+            use_device_communicator=False,
+            use_message_queue_broadcaster=False,
+            group_name="world",
+        )
+    else:
+        return GroupCoordinator(
+            group_ranks=[ranks],
+            local_rank=local_rank,
+            torch_distributed_backend=backend,
+            use_device_communicator=False,
+            group_name="world",
+        )
 
 
 def init_model_parallel_group(
@@ -1067,14 +1178,24 @@ def init_model_parallel_group(
     group_name: Optional[str] = None,
 ) -> GroupCoordinator:
 
-    return GroupCoordinator(
-        group_ranks=group_ranks,
-        local_rank=local_rank,
-        torch_distributed_backend=backend,
-        use_device_communicator=True,
-        use_message_queue_broadcaster=use_message_queue_broadcaster,
-        group_name=group_name,
-    )
+    if _IS_DRY_RUN:
+        return DryGroupCoordinator(
+            group_ranks=group_ranks,
+            local_rank=local_rank,
+            torch_distributed_backend=backend,
+            use_device_communicator=False,
+            use_message_queue_broadcaster=False,
+            group_name=group_name,
+        )
+    else:
+        return GroupCoordinator(
+            group_ranks=group_ranks,
+            local_rank=local_rank,
+            torch_distributed_backend=backend,
+            use_device_communicator=True,
+            use_message_queue_broadcaster=use_message_queue_broadcaster,
+            group_name=group_name,
+        )
 
 
 _TP: Optional[GroupCoordinator] = None
@@ -1154,42 +1275,20 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
 ):
-    global _WORLD, _NODE_COUNT
+    global _WORLD, _NODE_COUNT, _IS_DRY_RUN
     
     logger.debug(
         "world_size=%d rank=%d local_rank=%d "
         "distributed_init_method=%s backend=%s", world_size, rank, local_rank,
         distributed_init_method, backend)
+    
+    # Set dry run mode based on backend
+    if backend == DRY_RUN_BACKEND:
+        _IS_DRY_RUN = True
+        logger.info("Initializing distributed environment in dry run mode")
+    
     from vllm.config import get_current_vllm_config
     config = get_current_vllm_config()
-    
-    # Check if dry run mode is enabled
-    if config is not None and config.parallel_config.dry_run:
-        parallel_config = config.parallel_config
-        logger.info("Initializing distributed environment in dry run mode")
-        
-        # Use dry parameters
-        world_size = parallel_config.dry_world_size
-        rank = parallel_config.dry_global_rank
-        if local_rank == -1:
-            local_rank = rank
-        
-        # Initialize dry world group
-        if _WORLD is None:
-            _WORLD = DryGroupCoordinator(
-                world_size=world_size,
-                rank=rank,
-                local_rank=local_rank,
-                group_name="world"
-            )
-            _NODE_COUNT = 1  # Simulate single node for dry runs
-            logger.debug("Initialized dry world group with world_size=%d, rank=%d",
-                        world_size, rank)
-        else:
-            assert _WORLD.world_size == world_size, (
-                "world group already initialized with a different world size")
-        return
-    
     if config is not None and config.parallel_config.data_parallel_size > 1:
         parallel_config = config.parallel_config
         # adjust to take into account data parallelism
@@ -1203,19 +1302,20 @@ def init_distributed_environment(
         logger.info(
             "Adjusting world_size=%d rank=%d distributed_init_method=%s for DP",
             world_size, rank, distributed_init_method)
-    if not torch.distributed.is_initialized():
+    distributed = _get_torch_distributed()
+    if not _get_torch_distributed().is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
             "distributed environment")
-        if not torch.distributed.is_backend_available(backend):
+        if not _get_torch_distributed().is_backend_available(backend):
             logger.warning(
                 "Distributed backend %s is not available; "
                 "falling back to gloo.", backend)
-            assert torch.distributed.is_gloo_available(), (
+            assert _get_torch_distributed().is_gloo_available(), (
                 "Fallback Gloo backend is not available.")
             backend = "gloo"
         # this backend is used for WORLD
-        torch.distributed.init_process_group(
+        _get_torch_distributed().init_process_group(
             backend=backend,
             init_method=distributed_init_method,
             world_size=world_size,
@@ -1231,115 +1331,15 @@ def init_distributed_environment(
         else:
             local_rank = rank
     if _WORLD is None:
-        ranks = list(range(torch.distributed.get_world_size()))
+        ranks = list(range(_get_torch_distributed().get_world_size()))
         _WORLD = init_world_group(ranks, local_rank, backend)
+        # Calculate node count
         _NODE_COUNT = _node_count(_WORLD.cpu_group)
         logger.debug("Detected %d nodes in the distributed environment",
                      _NODE_COUNT)
     else:
-        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+        assert _WORLD.world_size == _get_torch_distributed().get_world_size(), (
             "world group already initialized with a different world size")
-
-
-def _initialize_dry_model_parallel(
-    tensor_model_parallel_size: int,
-    pipeline_model_parallel_size: int,
-    parallel_config: Any,
-) -> None:
-    """Initialize dry model parallel groups for simulation."""
-    global _TP, _PP, _DP, _EP
-    
-    world_size = parallel_config.dry_world_size
-    rank = parallel_config.dry_global_rank
-    local_rank = rank  # Assume single node for dry runs
-    
-    data_parallel_size = parallel_config.data_parallel_size
-    
-    # Calculate the dimensions
-    total_parallel_size = (tensor_model_parallel_size * 
-                          pipeline_model_parallel_size * 
-                          data_parallel_size)
-    
-    if total_parallel_size > world_size:
-        raise ValueError(
-            f"Total parallel size ({total_parallel_size}) exceeds world size "
-            f"({world_size}). TP={tensor_model_parallel_size}, "
-            f"PP={pipeline_model_parallel_size}, DP={data_parallel_size}")
-    
-    # Create simulated rank assignments
-    # The layout order is: ExternalDP x DP x PP x TP
-    external_dp_size = world_size // total_parallel_size
-    
-    # Calculate which groups this rank belongs to
-    # Extract indices for each dimension
-    external_dp_idx = rank // total_parallel_size
-    remainder = rank % total_parallel_size
-    
-    dp_idx = remainder // (pipeline_model_parallel_size * tensor_model_parallel_size)
-    remainder = remainder % (pipeline_model_parallel_size * tensor_model_parallel_size)
-    
-    pp_idx = remainder // tensor_model_parallel_size
-    tp_idx = remainder % tensor_model_parallel_size
-    
-    # Build tensor parallel group
-    assert _TP is None, ("tensor model parallel group is already initialized")
-    tp_rank_offset = (external_dp_idx * total_parallel_size + 
-                     dp_idx * pipeline_model_parallel_size * tensor_model_parallel_size +
-                     pp_idx * tensor_model_parallel_size)
-    tp_ranks = list(range(tp_rank_offset, tp_rank_offset + tensor_model_parallel_size))
-    
-    _TP = DryGroupCoordinator(
-        world_size=tensor_model_parallel_size,
-        rank=tp_idx,
-        local_rank=local_rank,
-        group_name="tp"
-    )
-    _TP.ranks = tp_ranks
-    _TP.rank_in_group = tp_idx
-    
-    # Build pipeline parallel group  
-    assert _PP is None, ("pipeline model parallel group is already initialized")
-    pp_ranks = []
-    for i in range(pipeline_model_parallel_size):
-        pp_rank = (external_dp_idx * total_parallel_size +
-                  dp_idx * pipeline_model_parallel_size * tensor_model_parallel_size +
-                  i * tensor_model_parallel_size + tp_idx)
-        pp_ranks.append(pp_rank)
-    
-    _PP = DryGroupCoordinator(
-        world_size=pipeline_model_parallel_size,
-        rank=pp_idx,
-        local_rank=local_rank,
-        group_name="pp"
-    )
-    _PP.ranks = pp_ranks
-    _PP.rank_in_group = pp_idx
-    
-    # Build data parallel group
-    assert _DP is None, ("data parallel group is already initialized")
-    dp_ranks = []
-    for i in range(data_parallel_size):
-        dp_rank = (external_dp_idx * total_parallel_size +
-                  i * pipeline_model_parallel_size * tensor_model_parallel_size +
-                  pp_idx * tensor_model_parallel_size + tp_idx)
-        dp_ranks.append(dp_rank)
-    
-    _DP = DryGroupCoordinator(
-        world_size=data_parallel_size,
-        rank=dp_idx,
-        local_rank=local_rank,
-        group_name="dp"
-    )
-    _DP.ranks = dp_ranks
-    _DP.rank_in_group = dp_idx
-    
-    # Expert parallel defaults to data parallel
-    _EP = _DP
-    
-    logger.info(
-        "Initialized dry model parallel groups: rank %s in world size %s is "
-        "assigned as DP rank %s, PP rank %s, TP rank %s",
-        rank, world_size, dp_idx, pp_idx, tp_idx)
 
 
 def initialize_model_parallel(
@@ -1369,24 +1369,11 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
-    # Check if we're in dry run mode
-    from vllm.config import get_current_vllm_config
-    config = get_current_vllm_config()
-    
-    if config is not None and config.parallel_config.dry_run:
-        # Initialize dry model parallel groups
-        _initialize_dry_model_parallel(
-            tensor_model_parallel_size,
-            pipeline_model_parallel_size,
-            config.parallel_config
-        )
-        return
-        
     # Get world size and rank. Ensure some consistencies.
-    assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
-    rank = torch.distributed.get_rank()
-    backend = backend or torch.distributed.get_backend(
+    assert _get_torch_distributed().is_initialized()
+    world_size: int = _get_torch_distributed().get_world_size()
+    rank = _get_torch_distributed().get_rank()
+    backend = backend or _get_torch_distributed().get_backend(
         get_world_group().device_group)
 
     data_parallel_size = 1
@@ -1470,15 +1457,9 @@ def ensure_model_parallel_initialized(
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
     values if the model parallel groups are initialized.
     """
-    # Check if we're in dry run mode
-    from vllm.config import get_current_vllm_config
-    config = get_current_vllm_config()
+    backend = backend or _get_torch_distributed().get_backend(
+        get_world_group().device_group)
     
-    if config is not None and config.parallel_config.dry_run:
-        backend = "nccl"  # Default backend for dry runs
-    else:
-        backend = backend or torch.distributed.get_backend(
-            get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
                                   pipeline_model_parallel_size, backend)
@@ -1588,20 +1569,27 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
-    global _WORLD, _NODE_COUNT
+    global _WORLD, _NODE_COUNT, _IS_DRY_RUN
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
     _NODE_COUNT = None
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+    distributed = _get_torch_distributed()
+    if _get_torch_distributed().is_initialized():
+        _get_torch_distributed().destroy_process_group()
+    # Reset dry run state
+    _IS_DRY_RUN = False
+    _DRY_RUN_STATE.world_size = 1
+    _DRY_RUN_STATE.rank = 0
+    _DRY_RUN_STATE.is_initialized = False
+    _DRY_RUN_STATE.backend = DRY_RUN_BACKEND
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
     destroy_model_parallel()
     destroy_distributed_environment()
     with contextlib.suppress(AssertionError):
-        torch.distributed.destroy_process_group()
+        torch._get_torch_distributed().destroy_process_group()
     if shutdown_ray:
         import ray  # Lazy import Ray
         ray.shutdown()
@@ -1626,20 +1614,29 @@ def in_the_same_node_as(pg: Union[ProcessGroup, StatelessProcessGroup],
     memory system (shared access to shared memory).
     """
     if isinstance(pg, ProcessGroup):
-        assert torch.distributed.get_backend(
+        distributed = _get_torch_distributed()
+        assert _get_torch_distributed().get_backend(
             pg) != torch.distributed.Backend.NCCL, (
                 "in_the_same_node_as should be tested with a non-NCCL group.")
         # local rank inside the group
-        rank = torch.distributed.get_rank(group=pg)
-        world_size = torch.distributed.get_world_size(group=pg)
+        rank = _get_torch_distributed().get_rank(group=pg)
+        world_size = _get_torch_distributed().get_world_size(group=pg)
 
         # global ranks of the processes in the group
-        ranks = torch.distributed.get_process_group_ranks(pg)
+        ranks = _get_torch_distributed().get_process_group_ranks(pg)
     else:
         rank = pg.rank
         world_size = pg.world_size
         ranks = list(range(world_size))
 
+    # In dry run mode, simulate node assignment
+    # TODO: change this to be based on IP address for dry run
+    if _IS_DRY_RUN:
+        # For dry runs, we simulate that all ranks can access shared memory
+        # This effectively puts all ranks on the same node, which is reasonable
+        # for the dry run use case (weight loading)
+        return [True] * world_size
+    
     # local tensor in each process to store the result
     is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
 
@@ -1723,15 +1720,17 @@ def is_global_first_rank() -> bool:
             return _WORLD.is_first_rank
 
         # If torch distributed is not initialized, assume single process
-        if not torch.distributed.is_initialized():
+        if not _get_torch_distributed().is_initialized():
             return True
 
         # Fallback to torch's global rank
-        return torch.distributed.get_rank() == 0
+        return _get_torch_distributed().get_rank() == 0
 
     except Exception:
         # If anything goes wrong, assume this is the first rank
         return True
+
+
 
 
 def _node_count(pg: Union[ProcessGroup, StatelessProcessGroup]) -> int:
@@ -1745,7 +1744,7 @@ def _node_count(pg: Union[ProcessGroup, StatelessProcessGroup]) -> int:
         int: The total number of nodes
     """
     if isinstance(pg, ProcessGroup):
-        world_size = torch.distributed.get_world_size(group=pg)
+        world_size = _get_torch_distributed().get_world_size(group=pg)
     else:
         world_size = pg.world_size
 
