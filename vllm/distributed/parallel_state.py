@@ -58,8 +58,8 @@ def is_dry_run() -> bool:
 # Dry run state - stores parameters when torch.distributed isn't really initialized
 class _DryRunState:
     def __init__(self):
-        self.world_size = 1
-        self.rank = 0
+        self.world_size = None
+        self.rank = None
         self.is_initialized = False
         self.backend = DRY_RUN_BACKEND
 
@@ -1302,7 +1302,7 @@ def init_distributed_environment(
         logger.info(
             "Adjusting world_size=%d rank=%d distributed_init_method=%s for DP",
             world_size, rank, distributed_init_method)
-    distributed = _get_torch_distributed()
+
     if not _get_torch_distributed().is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
@@ -1338,7 +1338,7 @@ def init_distributed_environment(
         logger.debug("Detected %d nodes in the distributed environment",
                      _NODE_COUNT)
     else:
-        assert _WORLD.world_size == _get_torch_distributed().get_world_size(), (
+        assert get_world_group().world_size == _get_torch_distributed().get_world_size(), (
             "world group already initialized with a different world size")
 
 
@@ -1574,7 +1574,6 @@ def destroy_distributed_environment():
         _WORLD.destroy()
     _WORLD = None
     _NODE_COUNT = None
-    distributed = _get_torch_distributed()
     if _get_torch_distributed().is_initialized():
         _get_torch_distributed().destroy_process_group()
     # Reset dry run state
@@ -1613,8 +1612,9 @@ def in_the_same_node_as(pg: Union[ProcessGroup, StatelessProcessGroup],
     as the source rank. It tests if processes are attached to the same
     memory system (shared access to shared memory).
     """
+    assert _IS_DRY_RUN is False, "in_the_same_node_as is not supported in dry run mode"
+
     if isinstance(pg, ProcessGroup):
-        distributed = _get_torch_distributed()
         assert _get_torch_distributed().get_backend(
             pg) != torch.distributed.Backend.NCCL, (
                 "in_the_same_node_as should be tested with a non-NCCL group.")
@@ -1629,14 +1629,6 @@ def in_the_same_node_as(pg: Union[ProcessGroup, StatelessProcessGroup],
         world_size = pg.world_size
         ranks = list(range(world_size))
 
-    # In dry run mode, simulate node assignment
-    # TODO: change this to be based on IP address for dry run
-    if _IS_DRY_RUN:
-        # For dry runs, we simulate that all ranks can access shared memory
-        # This effectively puts all ranks on the same node, which is reasonable
-        # for the dry run use case (weight loading)
-        return [True] * world_size
-    
     # local tensor in each process to store the result
     is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
 
@@ -1733,16 +1725,18 @@ def is_global_first_rank() -> bool:
 
 
 
-def _node_count(pg: Union[ProcessGroup, StatelessProcessGroup]) -> int:
+def _node_count(pg: Union[ProcessGroup, StatelessProcessGroup | None]) -> int:
     """
     Returns the total number of nodes in the process group.
 
-    Args:
-        pg: The process group to analyze
-
-    Returns:
-        int: The total number of nodes
+    In dry-run mode `pg` can be `None` (e.g. `_WORLD.cpu_group` isn't set).
+    Treat this as a single-node setup to avoid attribute errors.
     """
+    # Gracefully handle the dry-run case where no concrete ProcessGroup exists.
+    if pg is None:
+        assert _IS_DRY_RUN, "pg should not be None if not in dry run mode"
+        return 1
+
     if isinstance(pg, ProcessGroup):
         world_size = _get_torch_distributed().get_world_size(group=pg)
     else:

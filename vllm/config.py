@@ -2069,19 +2069,6 @@ class ParallelConfig:
     placement_group: Optional["PlacementGroup"] = None
     """ray distributed model workers placement group."""
 
-    dry_run: bool = False
-    """Enable dry run mode for simulation purposes. When enabled, the parallel
-    state will be initialized without actual distributed communication."""
-
-    dry_global_rank: Optional[int] = None
-    """The simulated global rank for dry run mode. Required when dry_run=True."""
-
-    dry_world_size: Optional[int] = None
-    """The simulated world size for dry run mode. Required when dry_run=True."""
-
-    dry_local_rank: Optional[int] = None
-    """The simulated local rank for dry run mode. Required when dry_run=True."""
-
     distributed_executor_backend: Optional[Union[DistributedExecutorBackend,
                                                  type["ExecutorBase"]]] = None
     """Backend to use for distributed model
@@ -2214,20 +2201,6 @@ class ParallelConfig:
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
     def __post_init__(self) -> None:
-        # Validate dry run configuration
-        if self.dry_run:
-            if self.dry_local_rank is None:
-                raise ValueError("dry_local_rank must be specified when dry_run=True")
-            if self.dry_global_rank is None:
-                raise ValueError("dry_global_rank must be specified when dry_run=True")
-            if self.dry_world_size is None:
-                raise ValueError(
-                    "dry_world_size must be specified when dry_run=True")
-            if self.dry_global_rank < 0 or self.dry_global_rank >= self.dry_world_size:
-                raise ValueError(
-                    f"dry_global_rank ({self.dry_global_rank}) must be in the range "
-                    f"[0, {self.dry_world_size})")
-        
         self.world_size = self.pipeline_parallel_size * \
             self.tensor_parallel_size
 

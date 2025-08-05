@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from vllm.config import LoadConfig, ModelConfig, VllmConfig
+from vllm.distributed import get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import (
@@ -32,7 +33,17 @@ logger = init_logger(__name__)
 
 
 class IPCModelLoader(BaseModelLoader):
-    """Model loader that retrieves weights via IPC from a model server."""
+    """Model loader that retrieves weights via IPC from a model server.
+    
+    This loader connects to a Dynamo companion server that has pre-loaded the
+    model weights and retrieves them via CUDA IPC. This allows multiple
+    processes to share the same GPU memory for model weights.
+    
+    The loader automatically obtains rank information from vLLM's parallel_state
+    module, which is initialized during init_device() before model loading.
+    This ensures the loader connects to the correct companion server instance
+    based on the worker's rank.
+    """
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -42,15 +53,11 @@ class IPCModelLoader(BaseModelLoader):
                 "IPCModelLoader requires enable_ipc_loading=True in LoadConfig"
             )
 
-        self.server_address = load_config.ipc_server_address
-        self.sub_port = load_config.ipc_sub_port
-        self.req_port = load_config.ipc_req_port
         self.client = None  # Will be initialized when we know the model
         self.vllm_config = None
 
         logger.info(
-            "IPC model loader initialized. Will connect to server at %s",
-            self.server_address,
+            "IPC model loader initialized."
         )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -72,13 +79,22 @@ class IPCModelLoader(BaseModelLoader):
                     asyncio.set_event_loop(loop)
 
                 # Create a Dynamo runtime instance
-                # Second parameter is whether it's static (False = dynamic, can discover services)
+                # Second parameter is whether it's static
+                # (False = dynamic, can discover services)
                 self.runtime = DistributedRuntime(loop, False)
 
                 async def _create():
+                    # Get rank information from the distributed environment
+                    # By the time this is called, init_device() has already
+                    # initialized the distributed environment
+                    world_group = get_world_group()
+                    
                     return await create_model_client(
                         runtime=self.runtime,
                         vllm_config=self.vllm_config,
+                        local_rank=world_group.local_rank,
+                        global_rank=world_group.rank,
+                        world_size=world_group.world_size,
                         namespace="companion",
                     )
 
@@ -87,7 +103,8 @@ class IPCModelLoader(BaseModelLoader):
                 logger.error("Error creating Dynamo model client: %s", e)
                 raise
 
-        # Wait for model to be ready with two-phase timeout (blocking from sync context)
+        # Wait for model to be ready with two-phase timeout
+        # (blocking from sync context)
         logger.info("Waiting for model to be ready on server...")
         success, server_info = loop.run_until_complete(
             self.client.wait_for_model_ready(
@@ -124,10 +141,11 @@ class IPCModelLoader(BaseModelLoader):
                 self.client.get_model_parameters()
             )
         except Exception as e:
-            raise RuntimeError(f"Error getting tensor rebuild info: {e}")
+            raise RuntimeError(f"Error getting tensor rebuild info: {e}") from e
 
         logger.info(
-            "Retrieved rebuild info for %d parameters", len(model_parameters_rebuild_info)
+            "Retrieved rebuild info for %d parameters",
+            len(model_parameters_rebuild_info)
         )
 
         # Reconstruct and yield each tensor
@@ -138,7 +156,8 @@ class IPCModelLoader(BaseModelLoader):
                 # Verify we got a tensor on a valid device
                 if not parameter.is_cuda:
                     raise RuntimeError(
-                        f"Reconstructed tensor is not on CUDA: {parameter.device}"
+                        f"Reconstructed tensor is not on CUDA: "
+                        f"{parameter.device}"
                     )
 
                 logger.debug(
@@ -151,13 +170,16 @@ class IPCModelLoader(BaseModelLoader):
                 yield name, parameter
             except Exception as e:
                 logger.error("Failed to reconstruct parameter %s: %s", name, e)
-                raise
+                raise RuntimeError(
+                    f"Failed to reconstruct parameter {name}: {e}") from e
 
-    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+    def load_weights(self, model: nn.Module,
+                     model_config: ModelConfig) -> None:
         """Load weights into the model using IPC."""
         weights_to_load = {name for name, _ in model.named_parameters()}
 
-        # NOTE: we manually assign weights here, since our model is already remotely initialized
+        # NOTE: we manually assign weights here, since our model is already
+        # remotely initialized
         weight_dict = dict(self.get_all_weights(model_config, model))
 
         for name, param in model.named_parameters():
@@ -195,14 +217,16 @@ class IPCModelLoader(BaseModelLoader):
 
             logger.debug("Loading weights on %s ...", load_device)
 
-            # Provide rank info for discovering the correct server component
+            # Store vllm_config for use in download_model
             self.vllm_config = copy.deepcopy(vllm_config)
-            self.vllm_config.parallel_config.dry_local_rank = torch.cuda.current_device()
-            self.vllm_config.parallel_config.dry_global_rank = (
-                torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            )
-            self.vllm_config.parallel_config.dry_world_size = (
-                torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            
+            # Log rank information for debugging
+            # By this point, the distributed environment is already initialized
+            world_group = get_world_group()
+            logger.info(
+                "IPC loader using rank info from parallel_state: "
+                "local_rank=%d, global_rank=%d, world_size=%d",
+                world_group.local_rank, world_group.rank, world_group.world_size
             )
 
             self.load_weights(model, model_config)
@@ -213,5 +237,6 @@ class IPCModelLoader(BaseModelLoader):
     def __del__(self):
         """Clean up the client connection when the loader is destroyed."""
         if hasattr(self, "runtime") and self.runtime is not None:
-            # Dynamo runtime cleanup happens automatically when it goes out of scope
+            # Dynamo runtime cleanup happens automatically when it goes
+            # out of scope
             pass
