@@ -206,10 +206,11 @@ class GroupCoordinator:
     #   3     |   1  |  3   |     1      |       3
     local_rank: int  # local rank used to assign devices
     rank_in_group: int  # rank inside the group
-    cpu_group: ProcessGroup  # group for CPU communication
-    device_group: ProcessGroup  # group for device communication
+    cpu_group: Optional[ProcessGroup]  # group for CPU communication
+    device_group: Optional[ProcessGroup]  # group for device communication
     use_device_communicator: bool  # whether to use device communicator
-    device_communicator: DeviceCommunicatorBase  # device communicator
+    device_communicator: Optional[
+        DeviceCommunicatorBase]  # device communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
     def __init__(

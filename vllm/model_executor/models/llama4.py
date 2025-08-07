@@ -25,6 +25,7 @@ from torch import nn
 from transformers import Llama4TextConfig
 
 from vllm.attention import Attention
+from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -194,17 +195,18 @@ class Llama4Attention(nn.Module):
             is_neox_style=is_neox_style,
         ) if not self.nope else None
 
-        self.attn = Attention(
+        attn_cls = Attention if self.nope else ChunkedLocalAttention
+        self.attn = attn_cls(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
-            per_layer_sliding_window=None,
-            use_irope=not self.nope,
             prefix=f"{prefix}.attn",
-        )
+            **({
+                "attention_chunk_size": config.attention_chunk_size
+            } if not self.nope else {}))
 
     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
         floor = torch.floor((positions + 1.0) / self.floor_scale)
@@ -256,6 +258,7 @@ class Llama4DecoderLayer(nn.Module):
         super().__init__()
 
         self.layer_idx = extract_layer_index(prefix)
+        self.global_layer = config.no_rope_layers[self.layer_idx] == 0
         self.hidden_size = config.hidden_size
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
