@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     is_rocm_aiter_moe_enabled)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
+from vllm.model_executor.parameter import UninitializedParameterFromTensor
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
@@ -280,22 +281,30 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                        hidden_size: int, intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
         # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            2 * intermediate_size_per_partition,
-            hidden_size,
-            dtype=params_dtype),
-                                        requires_grad=False)
+        if get_current_vllm_config().load_config.enable_ipc_loading:
+            logger.warning("Creating uninitialized parameter for weight")
+            w13_weight = UninitializedParameterFromTensor()
+        else:
+            w13_weight = torch.nn.Parameter(torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype),
+                    requires_grad=False)
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            dtype=params_dtype),
-                                       requires_grad=False)
+        if get_current_vllm_config().load_config.enable_ipc_loading:
+            logger.warning("Creating uninitialized parameter for weight")
+            w2_weight = UninitializedParameterFromTensor()
+        else:
+            w2_weight = torch.nn.Parameter(torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype),
+                   requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
