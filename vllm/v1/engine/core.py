@@ -18,6 +18,7 @@ import msgspec
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
+from torch.profiler import record_function
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
@@ -76,7 +77,8 @@ class EngineCore:
         self.log_stats = log_stats
 
         # Setup Model.
-        self.model_executor = executor_class(vllm_config)
+        with record_function("EngineCore.init.executor"):
+            self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(
                 executor_fail_callback)
@@ -84,15 +86,18 @@ class EngineCore:
         self.available_gpu_memory_for_kv_cache = -1
 
         # Setup KV Caches and update CacheConfig after profiling.
-        num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
-            self._initialize_kv_caches(vllm_config)
+        with record_function("EngineCore.init.kv_cache_and_warmup"):
+            num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
+                self._initialize_kv_caches(vllm_config)
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
         self.collective_rpc("initialize_cache",
                             args=(num_gpu_blocks, num_cpu_blocks))
 
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
+        with record_function("EngineCore.init.structured_output_manager"):
+            self.structured_output_manager = StructuredOutputManager(
+                vllm_config)
 
         # Setup scheduler.
         if isinstance(vllm_config.scheduler_config.scheduler_cls, str):
@@ -117,18 +122,20 @@ class EngineCore:
             logger.info("Disabling chunked prefill for model without KVCache")
             vllm_config.scheduler_config.chunked_prefill_enabled = False
 
-        self.scheduler: SchedulerInterface = Scheduler(
-            vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
-            structured_output_manager=self.structured_output_manager,
-            include_finished_set=vllm_config.parallel_config.data_parallel_size
-            > 1,
-            log_stats=self.log_stats,
-        )
+        with record_function("EngineCore.init.scheduler"):
+            self.scheduler: SchedulerInterface = Scheduler(
+                vllm_config=vllm_config,
+                kv_cache_config=kv_cache_config,
+                structured_output_manager=self.structured_output_manager,
+                include_finished_set=vllm_config.parallel_config.data_parallel_size
+                > 1,
+                log_stats=self.log_stats,
+            )
 
         # Setup MM Input Mapper.
-        self.mm_input_cache_server = MirroredProcessingCache(
-            vllm_config.model_config)
+        with record_function("EngineCore.init.mm_input_cache"):
+            self.mm_input_cache_server = MirroredProcessingCache(
+                vllm_config.model_config)
 
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
@@ -638,6 +645,7 @@ class EngineCoreProc(EngineCore):
                 set_process_title("EngineCore")
                 engine_core = EngineCoreProc(*args, **kwargs)
 
+            # Optional early-exit for startup-only profiling
             engine_core.run_busy_loop()
 
         except SystemExit:

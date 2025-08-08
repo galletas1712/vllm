@@ -602,3 +602,22 @@ class WorkerProc:
             if output_rank is None or self.rank == output_rank:
                 self.worker_response_mq.enqueue(
                     (WorkerProc.ResponseStatus.SUCCESS, output))
+            
+            # Check if we should exit after initialization
+            if method == "compile_or_warm_up_model" and \
+               os.environ.get("VLLM_EXIT_AFTER_INIT", "0") == "1":
+                logger.info("Worker rank %s exiting after initialization "
+                           "(VLLM_EXIT_AFTER_INIT=1)", self.rank)
+                import sys
+                import signal
+                sys.stdout.flush()
+                sys.stderr.flush()
+                # Kill the entire process group to ensure clean shutdown
+                if self.rank == 0:
+                    import time
+                    time.sleep(0.5)  # Give time for response to be sent
+                    pgid = os.getpgid(os.getpid())
+                    logger.info("Sending SIGKILL to process group %d", pgid)
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    os._exit(0)

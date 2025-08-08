@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import torch.distributed
 import torch.nn as nn
+from torch.profiler import record_function
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -96,22 +97,67 @@ class Worker(WorkerBase):
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
 
+        # Startup profiling state
+        self._startup_profiling_active: bool = False
+        self._nvtx_startup_pushed: bool = False
+
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
-        if envs.VLLM_TORCH_PROFILER_DIR:
-            torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
+        # We'll use a simpler approach for startup-only profiling
+        self.profiler = None
+        self.profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
+        if self.profiler_trace_dir:
             logger.info("Profiling enabled. Traces will be saved to: %s",
-                        torch_profiler_trace_dir)
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                with_stack=True,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir, use_gzip=True))
-        else:
-            self.profiler = None
+                        self.profiler_trace_dir)
+
+    def _startup_profiler_start(self) -> None:
+        """Start torch profiler and a top-level NVTX range for engine startup.
+        Safe to call multiple times; will start only once.
+        """
+        if self.profiler_trace_dir and not self._startup_profiling_active:
+            try:
+                # Create a new profiler instance for startup profiling
+                self.profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    with_stack=True,
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                        self.profiler_trace_dir, use_gzip=True))
+                self.profiler.__enter__()  # Enter the profiler context
+                self._startup_profiling_active = True
+                logger.info("Torch profiler started for startup profiling")
+            except Exception:
+                logger.exception("Failed to start torch profiler")
+        from contextlib import suppress
+        with suppress(Exception):
+            if not self._nvtx_startup_pushed:
+                torch.cuda.nvtx.range_push("vLLM.startup")
+                self._nvtx_startup_pushed = True
+
+    def _startup_profiler_stop(self) -> None:
+        """Stop torch profiler and close the top-level NVTX range for startup.
+        Safe to call multiple times; will stop only once.
+        """
+        from contextlib import suppress
+        with suppress(Exception):
+            if self._nvtx_startup_pushed:
+                torch.cuda.nvtx.range_pop()
+                self._nvtx_startup_pushed = False
+        if self.profiler is not None and self._startup_profiling_active:
+            try:
+                logger.info("Stopping torch profiler...")
+                # Step to trigger trace save, then exit the context
+                with suppress(Exception):
+                    self.profiler.step()
+                self.profiler.__exit__(None, None, None)
+                self.profiler = None  # Clear the profiler reference
+                logger.info("Torch profiler stopped and trace saved")
+            except Exception as e:
+                logger.exception("Failed to stop torch profiler: %s", e)
+            finally:
+                self._startup_profiling_active = False
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -172,76 +218,103 @@ class Worker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def init_device(self):
-        if self.device_config.device.type == "cuda":
-            # torch.distributed.all_reduce does not free the input tensor until
-            # the synchronization point. This causes the memory usage to grow
-            # as the number of all_reduce calls increases. This env var disables
-            # this behavior.
-            # Related issue:
-            # https://discuss.pytorch.org/t/cuda-allocation-lifetime-for-inputs-to-distributed-all-reduce/191573
-            os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+        from contextlib import suppress
+        with record_function("Worker.init_device"):
+            nvtx_pushed = False
+            with suppress(Exception):
+                torch.cuda.nvtx.range_push("startup.init_device")
+                nvtx_pushed = True
+            try:
+                if self.device_config.device.type == "cuda":
+                    # torch.distributed.all_reduce does not free the input tensor until
+                    # the synchronization point. This causes the memory usage to grow
+                    # as the number of all_reduce calls increases. This env var disables
+                    # this behavior.
+                    # Related issue:
+                    # https://discuss.pytorch.org/t/cuda-allocation-lifetime-for-inputs-to-distributed-all-reduce/191573
+                    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
 
-            # This env var set by Ray causes exceptions with graph building.
-            os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
-            self.device = torch.device(f"cuda:{self.local_rank}")
-            current_platform.set_device(self.device)
+                    # This env var set by Ray causes exceptions with graph building.
+                    os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+                    self.device = torch.device(f"cuda:{self.local_rank}")
+                    current_platform.set_device(self.device)
 
-            _check_if_gpu_supports_dtype(self.model_config.dtype)
-            gc.collect()
-            torch.cuda.empty_cache()
+                    # Start the startup profiler as early as possible on the GPU worker
+                    self._startup_profiler_start()
 
-            # take current memory snapshot
-            self.init_snapshot = MemorySnapshot()
-            self.requested_memory = (self.init_snapshot.total_memory *
-                                     self.cache_config.gpu_memory_utilization)
-            GiB = lambda b: round(b / GiB_bytes, 2)
-            
-            # When using IPC loading, we don't need to allocate memory for model weights
-            # as they are already loaded by the model server. Skip the strict check
-            # since we'll do proper accounting after model loading.
-            if self.load_config.enable_ipc_loading:
-                logger.info(
-                    "IPC loading enabled: Skipping initial memory check. "
-                    "Free memory: %.2f GiB, Total: %.2f GiB, Requested: %.2f GiB",
-                    GiB(self.init_snapshot.free_memory), 
-                    GiB(self.init_snapshot.total_memory), 
-                    GiB(self.requested_memory)
-                )
-            elif self.init_snapshot.free_memory < self.requested_memory:
-                raise ValueError(
-                    f"Free memory on device "
-                    f"({GiB(self.init_snapshot.free_memory)}/"
-                    f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
-                    f"is less than desired GPU memory utilization "
-                    f"({self.cache_config.gpu_memory_utilization}, "
-                    f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
-                    f"utilization or reduce GPU memory used by other processes."
-                )
-        else:
-            raise RuntimeError(
-                f"Not support device type: {self.device_config.device}")
-        # Initialize the distributed environment.
-        init_worker_distributed_environment(self.vllm_config, self.rank,
-                                            self.distributed_init_method,
-                                            self.local_rank,
-                                            current_platform.dist_backend)
-        # Set random seed.
-        set_random_seed(self.model_config.seed)
+                    _check_if_gpu_supports_dtype(self.model_config.dtype)
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
-        # Construct the model runner
-        self.model_runner: GPUModelRunner = GPUModelRunner(
-            self.vllm_config, self.device)
+                    # take current memory snapshot
+                    self.init_snapshot = MemorySnapshot()
+                    self.requested_memory = (self.init_snapshot.total_memory *
+                                             self.cache_config.gpu_memory_utilization)
+                    GiB = lambda b: round(b / GiB_bytes, 2)
 
-        if self.rank == 0:
-            # If usage stat is enabled, collect relevant info.
-            report_usage_stats(self.vllm_config)
+                    # When using IPC loading, we don't need to allocate memory for model weights
+                    # as they are already loaded by the model server. Skip the strict check
+                    # since we'll do proper accounting after model loading.
+                    if self.load_config.enable_ipc_loading:
+                        logger.info(
+                            "IPC loading enabled: Skipping initial memory check. "
+                            "Free memory: %.2f GiB, Total: %.2f GiB, Requested: %.2f GiB",
+                            GiB(self.init_snapshot.free_memory),
+                            GiB(self.init_snapshot.total_memory),
+                            GiB(self.requested_memory)
+                        )
+                    elif self.init_snapshot.free_memory < self.requested_memory:
+                        raise ValueError(
+                            f"Free memory on device "
+                            f"({GiB(self.init_snapshot.free_memory)}/"
+                            f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
+                            f"is less than desired GPU memory utilization "
+                            f"({self.cache_config.gpu_memory_utilization}, "
+                            f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
+                            f"utilization or reduce GPU memory used by other processes."
+                        )
+                else:
+                    raise RuntimeError(
+                        f"Not support device type: {self.device_config.device}")
+                # Initialize the distributed environment.
+                with record_function("Worker.init_distributed_environment"):
+                    init_worker_distributed_environment(
+                        self.vllm_config,
+                        self.rank,
+                        self.distributed_init_method,
+                        self.local_rank,
+                        current_platform.dist_backend)
+                # Set random seed.
+                set_random_seed(self.model_config.seed)
+
+                # Construct the model runner
+                with record_function("Worker.construct_model_runner"):
+                    self.model_runner: GPUModelRunner = GPUModelRunner(
+                        self.vllm_config, self.device)
+
+                if self.rank == 0:
+                    # If usage stat is enabled, collect relevant info.
+                    report_usage_stats(self.vllm_config)
+            finally:
+                with suppress(Exception):
+                    if nvtx_pushed:
+                        torch.cuda.nvtx.range_pop()
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self) -> None:
         eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
-        with self._maybe_get_memory_pool_context(tag="weights"):
-            self.model_runner.load_model(eep_scale_up=eep_scale_up)
+        with record_function("Worker.load_model"), \
+                self._maybe_get_memory_pool_context(tag="weights"):
+            from contextlib import suppress
+            with suppress(Exception):
+                torch.cuda.nvtx.range_push("startup.load_model")
+            try:
+                self.model_runner.load_model(eep_scale_up=eep_scale_up)
+            finally:
+                from contextlib import suppress
+                with suppress(Exception):
+                    torch.cuda.nvtx.range_pop()
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -263,13 +336,14 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        with record_function("Worker.determine_available_memory.begin"):
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
         GiB = lambda b: b / GiB_bytes
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        with memory_profiling(
+        with record_function("Worker.profile_run_memory"), memory_profiling(
                 self.init_snapshot,
                 weights_memory=int(
                     self.model_runner.model_memory_usage)) as profile_result:
@@ -354,8 +428,16 @@ class Worker(WorkerBase):
         else:
             from contextlib import nullcontext
             context = nullcontext()
-        with context:
-            self.model_runner.initialize_kv_cache(kv_cache_config)
+        with record_function("Worker.initialize_kv_cache"), context:
+            from contextlib import suppress
+            with suppress(Exception):
+                torch.cuda.nvtx.range_push("startup.initialize_kv_cache")
+            try:
+                self.model_runner.initialize_kv_cache(kv_cache_config)
+            finally:
+                from contextlib import suppress
+                with suppress(Exception):
+                    torch.cuda.nvtx.range_pop()
 
     def compile_or_warm_up_model(self) -> None:
         # warm up sizes that are not in cudagraph capture sizes,
@@ -367,12 +449,20 @@ class Worker(WorkerBase):
                 x for x in warmup_sizes if x not in
                 self.vllm_config.compilation_config.cudagraph_capture_sizes
             ]
-        # We skip EPLB here since we don't want to record dummy metrics
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True)
-        if not self.model_config.enforce_eager:
-            self.model_runner.capture_model()
+        with record_function("Worker.compile_and_warmup"):
+            from contextlib import suppress
+            with suppress(Exception):
+                torch.cuda.nvtx.range_push("startup.compile_and_warmup")
+            # We skip EPLB here since we don't want to record dummy metrics
+            for size in sorted(warmup_sizes, reverse=True):
+                with record_function(f"warmup.size_{int(size)}"):
+                    logger.info("Compile and warming up model for size %d", size)
+                    self.model_runner._dummy_run(size, skip_eplb=True)
+            if not self.model_config.enforce_eager:
+                with record_function("Worker.capture_model"):
+                    self.model_runner.capture_model()
+            with suppress(Exception):
+                torch.cuda.nvtx.range_pop()
 
         # Warm up sampler and preallocate memory buffer for logits and other
         # sampling related tensors of max possible shape to avoid memory
@@ -384,20 +474,35 @@ class Worker(WorkerBase):
                                self.scheduler_config.max_num_batched_tokens)
 
             # We skip EPLB here since we don't want to record dummy metrics
-            hidden_states, last_hidden_states = \
-                self.model_runner._dummy_run(
-                    num_tokens=max_num_reqs,
-                    skip_eplb=True,
-                )
+            with record_function("Worker.sampler_pooler_warmup_dummy_run"):
+                hidden_states, last_hidden_states = \
+                    self.model_runner._dummy_run(
+                        num_tokens=max_num_reqs,
+                        skip_eplb=True,
+                    )
             if self.model_runner.is_pooling_model:
-                self.model_runner._dummy_pooler_run(hidden_states)
+                with record_function("Worker.pooler_warmup"):
+                    self.model_runner._dummy_pooler_run(hidden_states)
             else:
-                self.model_runner._dummy_sampler_run(
-                    hidden_states=last_hidden_states)
+                with record_function("Worker.sampler_warmup"):
+                    self.model_runner._dummy_sampler_run(
+                        hidden_states=last_hidden_states)
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
+        logger.info("Worker rank %s: compile_or_warm_up_model completed", self.rank)
+
+        # Stop startup profiler at the end of compile/warmup/capture
+        self._startup_profiler_stop()
+        logger.info("Worker rank %s: profiler stopped", self.rank)
+
+        # Exit will be handled by the multiproc executor after this method returns
+        if os.environ.get("VLLM_EXIT_AFTER_INIT", "0") == "1":
+            logger.info(
+                "Worker rank %s initialization complete, will exit after RPC completes "
+                "(VLLM_EXIT_AFTER_INIT=1)", self.rank)
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

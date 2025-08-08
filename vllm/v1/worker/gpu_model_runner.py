@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import numpy as np
 import torch
+from torch.profiler import record_function
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
@@ -1892,7 +1893,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             old_global_expert_indices = None
             rank_mapping = None
 
-        with DeviceMemoryProfiler() as m:
+        with record_function("ModelRunner.load_model"), DeviceMemoryProfiler() as m:
             time_before_load = time.perf_counter()
             model_loader = get_model_loader(self.load_config)
             logger.info("Loading model from scratch...")
@@ -1937,9 +1938,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             backend = self.vllm_config.compilation_config.init_backend(
                 self.vllm_config)
             compilation_counter.dynamo_as_is_count += 1
-            self.model.compile(
-                fullgraph=envs.VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE,
-                backend=backend)
+            with record_function("ModelRunner.torch_compile"):
+                from contextlib import suppress
+                with suppress(Exception):
+                    torch.cuda.nvtx.range_push("startup.torch_compile")
+                try:
+                    self.model.compile(
+                        fullgraph=envs.VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE,
+                        backend=backend)
+                finally:
+                    with suppress(Exception):
+                        torch.cuda.nvtx.range_pop()
 
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, \
@@ -2447,8 +2456,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.encoder_cache["tmp"] = dict(enumerate(dummy_encoder_outputs))
 
         # Add `is_profile` here to pre-allocate communication buffers
-        hidden_states, last_hidden_states \
-            = self._dummy_run(self.max_num_tokens, is_profile=True)
+        with record_function("ModelRunner.profile_run.dummy_run"):
+            hidden_states, last_hidden_states \
+                = self._dummy_run(self.max_num_tokens, is_profile=True)
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
@@ -2492,7 +2502,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(), graph_capture(device=self.device):
+        with record_function("ModelRunner.capture_model"), freeze_gc(), graph_capture(device=self.device):
             full_cg = self.full_cuda_graph
             # Only rank 0 should print progress bar during capture
             compilation_cases = reversed(self.cudagraph_batch_sizes)
@@ -2505,12 +2515,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # We skip EPLB here since we don't want to record dummy metrics
                 for _ in range(
                         self.compilation_config.cudagraph_num_of_warmups):
+                    with record_function(f"ModelRunner.cudagraph.warmup.size_{int(num_tokens)}"):
+                        self._dummy_run(num_tokens,
+                                        capture_attn_cudagraph=full_cg,
+                                        skip_eplb=True)
+                with record_function(f"ModelRunner.cudagraph.capture.size_{int(num_tokens)}"):
                     self._dummy_run(num_tokens,
                                     capture_attn_cudagraph=full_cg,
                                     skip_eplb=True)
-                self._dummy_run(num_tokens,
-                                capture_attn_cudagraph=full_cg,
-                                skip_eplb=True)
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
