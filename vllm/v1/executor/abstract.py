@@ -61,9 +61,10 @@ class Executor(ExecutorBase):
         Initialize the KV caches and begin the model execution loop of the
         underlying workers.
         """
+        # Only initialize caches here. The orchestration of compile/warmup
+        # is handled by the EngineCore initialization sequence.
         self.collective_rpc("initialize_from_config",
                             args=(kv_cache_configs, ))
-        self.collective_rpc("compile_or_warm_up_model")
 
     def register_failure_callback(self, callback: FailureCallback):
         """

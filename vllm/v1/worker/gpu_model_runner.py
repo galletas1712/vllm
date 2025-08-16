@@ -1934,6 +1934,53 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
+    def recreate_persistent_buffers(self) -> None:
+        """Recreate persistent CUDA buffers after two-phase finalization.
+        
+        This is needed because during two-phase init with non-device mode,
+        the buffers may get corrupted by fake collective operations.
+        We recreate them here with the same sizes and properties.
+        
+        Note: This doesn't affect torch.compile graphs since those reference
+        the model weights, not these input buffers.
+        """
+        logger.info("Recreating persistent CUDA buffers after "
+                    "two-phase finalization")
+        
+        # Recreate main persistent buffers
+        self.input_ids = torch.zeros(self.max_num_tokens,
+                                     dtype=torch.int32,
+                                     device=self.device)
+        self.positions = torch.zeros(self.max_num_tokens,
+                                     dtype=torch.int64,
+                                     device=self.device)
+        self.query_start_loc = torch.zeros(self.max_num_reqs + 1,
+                                           dtype=torch.int32,
+                                           device=self.device)
+        self.seq_lens = torch.zeros(self.max_num_reqs,
+                                    dtype=torch.int32,
+                                    device=self.device)
+        self.slot_mapping = torch.zeros(self.max_num_tokens,
+                                        dtype=torch.int64,
+                                        device=self.device)
+        
+        # Recreate inputs_embeds buffer
+        self.inputs_embeds = torch.zeros(
+            (self.max_num_tokens, self.hidden_size),
+            dtype=self.dtype,
+            device=self.device)
+        
+        # Recreate M-RoPE positions if needed
+        if self.uses_mrope:
+            self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1),
+                                               dtype=torch.int64,
+                                               device=self.device)
+        
+        # Recreate additional buffers for specific configurations
+        if hasattr(self, 'kv_sharing_fast_prefill_logits_indices'):
+            self.kv_sharing_fast_prefill_logits_indices = torch.zeros(
+                self.max_num_tokens, dtype=torch.int32, device=self.device)
+
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
         Args:
@@ -2477,6 +2524,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        # If we're in non-device mode (two-phase init), skip profiling
+        # We'll do it later after torch.compile but before CUDA graph capture
+        from vllm.distributed.parallel_state import IS_NON_DEVICE
+        if IS_NON_DEVICE():
+            logger.info("Skipping profile_run during two-phase init (will run after compile)")
+            return
+        
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_budget = self.mm_budget

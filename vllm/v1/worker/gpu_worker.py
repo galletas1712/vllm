@@ -17,6 +17,12 @@ from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+from vllm.distributed.parallel_state import (
+    destroy_model_parallel,
+    destroy_distributed_environment,
+    model_parallel_is_initialized,
+    NON_DEVICE_BACKEND,
+)
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -183,6 +189,9 @@ class Worker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def init_device(self):
+        # Check if two-phase initialization is enabled
+        use_two_phase = os.environ.get("VLLM_TWO_PHASE_INIT", "0") == "1"
+        
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
@@ -231,11 +240,30 @@ class Worker(WorkerBase):
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
-        # Initialize the distributed environment.
-        init_worker_distributed_environment(self.vllm_config, self.rank,
-                                            self.distributed_init_method,
-                                            self.local_rank,
-                                            current_platform.dist_backend)
+        
+        if use_two_phase:
+            # Initialize with NonDeviceGroupCoordinator
+            logger.info(
+                "Init: creating non-device distributed groups "
+                "(two-phase enabled)")
+            init_worker_distributed_environment(
+                self.vllm_config, self.rank,
+                self.distributed_init_method,
+                self.local_rank,
+                backend=NON_DEVICE_BACKEND  # Use non-device backend
+            )
+            # Store flag to complete initialization later
+            self._two_phase_init_pending = True
+        else:
+            # Standard initialization
+            init_worker_distributed_environment(
+                self.vllm_config, self.rank,
+                self.distributed_init_method,
+                self.local_rank,
+                current_platform.dist_backend
+            )
+            self._two_phase_init_pending = False
+        
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
@@ -250,6 +278,9 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self) -> None:
+        if getattr(self, '_two_phase_init_pending', False):
+            logger.info("Init: loading model weights")
+        
         eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
@@ -260,6 +291,40 @@ class Worker(WorkerBase):
     def reload_weights(self) -> None:
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.reload_weights()
+
+    def precompile_model(self) -> None:
+        """Pre-compile (torch.compile) in non-device env during two-phase.
+
+        Runs dummy forwards to trigger compilation for configured sizes only.
+        Does not capture CUDA graphs or finalize distributed state.
+        """
+        compile_cfg = self.vllm_config.compilation_config
+
+        # Collect sizes to compile: explicit compile sizes plus cudagraph
+        # capture sizes (to avoid recompile later) when not forcing eager.
+        sizes: set[int] = set()
+        for s in getattr(compile_cfg, "compile_sizes", []) or []:
+            if isinstance(s, int) and s > 0:
+                sizes.add(int(s))
+        if not self.model_config.enforce_eager:
+            for s in getattr(compile_cfg, "cudagraph_capture_sizes", []) or []:
+                if isinstance(s, int) and s > 0:
+                    sizes.add(int(s))
+
+        max_tokens = self.scheduler_config.max_num_batched_tokens
+        bounded = sorted([s for s in sizes if s <= max_tokens], reverse=True)
+        if not bounded:
+            # Fallback: compile at a reasonable default size to ensure graph
+            # exists before finalize.
+            fallback = min(getattr(compile_cfg, "max_capture_size",
+                                   max_tokens) or max_tokens, max_tokens)
+            fallback = int(fallback) if fallback and fallback > 0 else 1
+            bounded = [fallback]
+
+        logger.info("Init: precompile model (sizes=%s)", bounded)
+        for size in bounded:
+            # Ensure this only triggers compile; no CUDA graph capture here.
+            self.model_runner._dummy_run(size, skip_eplb=True)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -274,6 +339,11 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        # If we're in two-phase init mode, skip profiling for now
+        # It will be done after compilation in compile_or_warm_up_model
+        from vllm.distributed.parallel_state import IS_NON_DEVICE
+        assert not IS_NON_DEVICE(), "Memory profiling should not be called in non-device mode"
+        
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         GiB = lambda b: b / GiB_bytes
@@ -368,21 +438,71 @@ class Worker(WorkerBase):
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
-    def compile_or_warm_up_model(self) -> None:
-        # warm up sizes that are not in cudagraph capture sizes,
-        # but users still want to compile for better performance,
-        # e.g. for the max-num-batched token size in chunked prefill.
-        warmup_sizes = self.vllm_config.compilation_config.compile_sizes.copy()
-        if not self.model_config.enforce_eager:
-            warmup_sizes = [
-                x for x in warmup_sizes if x not in
-                self.vllm_config.compilation_config.cudagraph_capture_sizes
-            ]
-        # We skip EPLB here since we don't want to record dummy metrics
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True)
+    def finalize_two_phase_init(
+            self,
+            new_distributed_init_method: Optional[str] = None) -> None:
+        """Finalize two-phase by switching to real distributed groups.
+        EngineCore will handle memory profiling afterwards.
+        Optionally overrides the distributed_init_method.
+        """
+        if getattr(self, '_two_phase_init_pending', False):
+            # Ensure all ranks reach this point before tearing down the old PG
+            if torch.distributed.is_initialized():
+                from contextlib import suppress
+                with suppress(Exception):
+                    torch.distributed.barrier()
 
+            logger.info("Init: switching to real distributed groups")
+
+            # Override init method if provided
+            if new_distributed_init_method:
+                self.distributed_init_method = (
+                    new_distributed_init_method)
+
+            # Re-init under current vLLM config context
+            from vllm.config import set_current_vllm_config
+            with set_current_vllm_config(self.vllm_config):
+                # Destroy non-device groups
+                if model_parallel_is_initialized():
+                    destroy_model_parallel()
+                destroy_distributed_environment()
+                
+                # Re-initialize with actual backend
+                init_worker_distributed_environment(
+                    self.vllm_config, self.rank,
+                    self.distributed_init_method,
+                    self.local_rank,
+                    current_platform.dist_backend
+                )
+                
+                # Clear the non-device mode flag
+                from vllm.distributed.parallel_state import set_non_device_mode
+                set_non_device_mode(False)
+                
+                self._two_phase_init_pending = False
+                # Track that we did two-phase init
+                self._did_two_phase_init = True
+                logger.info("Init: two-phase complete")
+
+            # Ensure all ranks have re-initialized before proceeding
+            if torch.distributed.is_initialized():
+                from contextlib import suppress
+                with suppress(Exception):
+                    torch.distributed.barrier()
+            
+            # Recreate persistent buffers that may have been corrupted
+            # during non-device mode operations
+            if hasattr(self, 'model_runner'):
+                self.model_runner.recreate_persistent_buffers()
+
+    def compile_or_warm_up_model(self) -> None:
+        """Capture CUDA graphs and runtime warmups only.
+        No torch.compile or finalize here.
+        
+        Note: If two-phase init was used, persistent buffers were recreated
+        in finalize_two_phase_init() to avoid illegal memory access errors
+        during CUDA graph capture.
+        """
         if not self.model_config.enforce_eager:
             self.model_runner.capture_model()
 
@@ -676,7 +796,11 @@ def init_worker_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
 ) -> None:
-    """Initialize the distributed environment."""
+    """Initialize the distributed environment.
+    
+    If backend is NON_DEVICE_BACKEND, initializes with NonDeviceGroupCoordinator
+    for two-phase initialization support.
+    """
     parallel_config = vllm_config.parallel_config
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
@@ -686,7 +810,9 @@ def init_worker_distributed_environment(
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
-    ensure_kv_transfer_initialized(vllm_config)
+    # Only initialize KV transfer for real device backends
+    if backend != NON_DEVICE_BACKEND:
+        ensure_kv_transfer_initialized(vllm_config)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):

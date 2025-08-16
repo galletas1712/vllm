@@ -82,14 +82,42 @@ class EngineCore:
 
         self.available_gpu_memory_for_kv_cache = -1
 
-        # Setup KV Caches and update CacheConfig after profiling.
+        # Centralized, ordered initialization sequence
+        # 1) Device and (fake/real) distributed init inside workers
+        logger.info("Init stage: device + distributed setup")
+        self.collective_rpc("init_device")
+
+        # 2) Load model weights
+        logger.info("Init stage: load model weights")
+        self.collective_rpc("load_model")
+
+        # 3) Pre-compile model in non-device (fake) distributed env
+        logger.info("Init stage: compile model (pre-NCCL)")
+        self.collective_rpc("precompile_model")
+
+        # 4) Finalize two-phase distributed environment (switch to real backend)
+        logger.info("Init stage: finalize two-phase distributed env")
+        self.collective_rpc("finalize_two_phase_init")
+
+        # 5) Profile available memory (now in real distributed env)
+        logger.info("Init stage: determine available memory")
+        available_gpu_memory = self.model_executor.determine_available_memory()
+
+        # 6) Setup KV Caches and update CacheConfig after profiling
+        logger.info("Init stage: initialize KV cache config")
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
-            self._initialize_kv_caches(vllm_config)
+            self._initialize_kv_caches(vllm_config,
+                                       precomputed_available_gpu_memory=
+                                       available_gpu_memory)
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
         self.collective_rpc("initialize_cache",
                             args=(num_gpu_blocks, num_cpu_blocks))
+
+        # 7) Capture CUDA graphs / warm up (no further torch.compile here)
+        logger.info("Init stage: capture CUDA graphs / warm up model")
+        self.collective_rpc("compile_or_warm_up_model")
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
@@ -141,7 +169,9 @@ class EngineCore:
             self.batch_queue = queue.Queue(self.batch_queue_size)
 
     def _initialize_kv_caches(
-            self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
+            self, vllm_config: VllmConfig,
+            precomputed_available_gpu_memory: Optional[list[int]] = None
+            ) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
 
         # Get all kv cache needed by the model
@@ -158,10 +188,13 @@ class EngineCore:
                     self.available_gpu_memory_for_kv_cache
                 ] * len(kv_cache_specs)
             else:
-                # Profiles the peak memory usage of the model to determine how
-                # much memory can be allocated for kv cache.
-                available_gpu_memory = (
-                    self.model_executor.determine_available_memory())
+                # Determine how much memory can be allocated for kv cache.
+                # Use precomputed values when provided to avoid double profiling.
+                if precomputed_available_gpu_memory is None:
+                    available_gpu_memory = (
+                        self.model_executor.determine_available_memory())
+                else:
+                    available_gpu_memory = precomputed_available_gpu_memory
                 self.available_gpu_memory_for_kv_cache = \
                     available_gpu_memory[0]
         else:

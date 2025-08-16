@@ -56,6 +56,11 @@ def IS_NON_DEVICE() -> bool:
     """Check if parallel state is in non-device mode."""
     return _IS_NON_DEVICE
 
+def set_non_device_mode(enabled: bool) -> None:
+    """Set the non-device mode state."""
+    global _IS_NON_DEVICE
+    _IS_NON_DEVICE = enabled
+
 
 @dataclass
 class GraphCaptureContext:
@@ -107,13 +112,62 @@ def _get_unique_name(name: str) -> str:
 
 
 _groups: dict[str, Callable[[], Optional["GroupCoordinator"]]] = {}
+_group_aliases: dict[str, str] = {}
 
 
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
+    # Maintain stable aliases for compiled graphs that captured earlier names
+    # Map the family prefix (e.g., "tp:") to the latest unique name
+    prefix = group.unique_name.split(":")[0] + ":"
+    _group_aliases[prefix] = group.unique_name
+    # Opportunistically prune dead groups and refresh alias to a live group
+    _prune_dead_groups()
+    live = _find_live_group_by_prefix(prefix)
+    if live is not None:
+        _group_aliases[prefix] = live
+
+
+def _resolve_group_name(group_name: str) -> str:
+    # Exact match and still alive → use it
+    ref = _groups.get(group_name)
+    if ref is not None:
+        grp = ref()
+        if grp is not None:
+            return group_name
+        # Stale entry; fall through to alias resolution
+
+    # Alias by family prefix, e.g., "tp:" → current active tp group
+    if ":" in group_name:
+        prefix = group_name.split(":")[0] + ":"
+        aliased = _group_aliases.get(prefix)
+        if aliased is not None:
+            return aliased
+
+    return group_name
+
+
+def _find_live_group_by_prefix(prefix: str) -> Optional[str]:
+    for name, ref in list(_groups.items()):
+        if not name.startswith(prefix):
+            continue
+        grp = ref()
+        if grp is not None:
+            return name
+    return None
+
+
+def _prune_dead_groups() -> None:
+    dead = [name for name, ref in _groups.items() if ref() is None]
+    for name in dead:
+        _groups.pop(name, None)
 
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    # In non-device mode (precompile), avoid device comms entirely.
+    if IS_NON_DEVICE():
+        return all_reduce_fake(tensor, group_name)
+    group_name = _resolve_group_name(group_name)
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -122,11 +176,25 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
 
 
 def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Fake implementation for all_reduce during torch.compile tracing.
+    
+    During non-device mode (two-phase init), this returns a tensor with the same
+    shape and properties as the input, allowing torch.compile to trace through
+    without actually performing communication.
+    """
+    # During non-device mode, just return a copy to maintain graph structure
+    if IS_NON_DEVICE():
+        # Return a tensor with same properties but allow gradient flow
+        return tensor.clone()
+    # Normal fake implementation for other cases
     return torch.empty_like(tensor)
 
 
 def reduce_scatter(tensor: torch.Tensor, dim: int, world_size: int,
                    group_name: str) -> torch.Tensor:
+    if IS_NON_DEVICE():
+        return reduce_scatter_fake(tensor, dim, world_size, group_name)
+    group_name = _resolve_group_name(group_name)
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -136,13 +204,23 @@ def reduce_scatter(tensor: torch.Tensor, dim: int, world_size: int,
 
 def reduce_scatter_fake(tensor: torch.Tensor, dim: int, world_size: int,
                         group_name: str) -> torch.Tensor:
+    """Fake implementation for reduce_scatter during torch.compile tracing."""
     new_shape = list(tensor.shape)
     new_shape[dim] = tensor.shape[dim] // world_size
+    if IS_NON_DEVICE():
+        # During non-device mode, return a properly shaped slice
+        # This maintains the correct tensor properties for tracing
+        slices = [slice(None)] * tensor.ndim
+        slices[dim] = slice(0, new_shape[dim])
+        return tensor[tuple(slices)].clone()
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
 
 def all_gather(tensor: torch.Tensor, dim: int, world_size: int,
                group_name: str) -> torch.Tensor:
+    if IS_NON_DEVICE():
+        return all_gather_fake(tensor, dim, world_size, group_name)
+    group_name = _resolve_group_name(group_name)
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -152,8 +230,15 @@ def all_gather(tensor: torch.Tensor, dim: int, world_size: int,
 
 def all_gather_fake(tensor: torch.Tensor, dim: int, world_size: int,
                     group_name: str) -> torch.Tensor:
+    """Fake implementation for all_gather during torch.compile tracing."""
     new_shape = list(tensor.shape)
     new_shape[dim] = tensor.shape[dim] * world_size
+    if IS_NON_DEVICE():
+        # During non-device mode, return a repeated tensor
+        # This maintains the correct tensor properties for tracing
+        repeats = [1] * tensor.ndim
+        repeats[dim] = world_size
+        return tensor.repeat(repeats)
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
 
@@ -884,11 +969,12 @@ class NonDeviceGroupCoordinator(GroupCoordinator):
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
     ):
-        """Initialize a dry group coordinator by inheriting from GroupCoordinator.
-        
+        """Initialize a dry coordinator inheriting from GroupCoordinator.
+
         Creates only a CPU group for coordination, no device group.
-        Since companion runs in a separate process, it can use torch.distributed
-        directly without conflicts. The companion port ensures no network conflicts.
+        Since companion runs in a separate process, it can use
+        torch.distributed directly without conflicts. The companion port
+        ensures no network conflicts.
         """
         group_name = group_name or "dry"
         self.unique_name = _get_unique_name(group_name)
@@ -902,15 +988,16 @@ class NonDeviceGroupCoordinator(GroupCoordinator):
         # Find which group this rank belongs to and create CPU group only
         # IMPORTANT: ALL ranks must create ALL groups (collective operation)
         for i, ranks in enumerate(group_ranks):
-            # ALL ranks must create ALL groups - this is a collective operation!
+            # ALL ranks must create ALL groups (collective operation)!
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
                 self.cpu_group = cpu_group
-                # In dry mode, use cpu_group as device_group for MoE compatibility
-                # MoE models call .rank() and .size() on device_group
+                # In dry mode, use cpu_group as device_group for MoE
+                # compatibility. MoE models call .rank() and .size()
+                # on device_group
                 self.device_group = cpu_group
                 # DO NOT BREAK - must create all groups!
         
@@ -941,24 +1028,37 @@ class NonDeviceGroupCoordinator(GroupCoordinator):
         yield
         
     def _raise_not_implemented(self, op_name: str):
-        """Helper to raise NotImplementedError for communication operations."""
+        """Helper to raise NotImplementedError for communication ops.
+
+        When functional collectives are available, specific collectives
+        are implemented below to enable Dynamo tracing/compilation in
+        non-device mode without invoking device communicators.
+        """
         raise NotImplementedError(
-            f"{op_name} is not supported in CPUGroupCoordinator. "
-            "This coordinator is for simulation purposes only and does not "
-            "support actual communication operations.")
+            f"{op_name} is not supported in CPUGroupCoordinator.")
         
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        self._raise_not_implemented("all_reduce")
+        # Use custom ops during non-device mode for torch.compile compatibility
+        if self.world_size == 1:
+            return input_
+        # Always use custom ops in non-device mode
+        # The fake implementation will handle this correctly
+        return torch.ops.vllm.all_reduce(
+            input_, group_name=self.unique_name)
         
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
-        self._raise_not_implemented("all_reduce")
+        return self.all_reduce(input_)
         
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        self._raise_not_implemented("all_gather")
+        if self.world_size == 1:
+            return input_
+        # Use custom ops for torch.compile compatibility
+        return torch.ops.vllm.all_gather(
+            input_, dim, self.world_size, group_name=self.unique_name)
         
     def _all_gather_out_place(self, input_: torch.Tensor,
                               dim: int) -> torch.Tensor:
-        self._raise_not_implemented("all_gather")
+        return self.all_gather(input_, dim)
         
     def all_gatherv(self,
                     input_: Union[torch.Tensor, list[torch.Tensor]],
@@ -969,7 +1069,11 @@ class NonDeviceGroupCoordinator(GroupCoordinator):
     def reduce_scatter(self,
                        input_: torch.Tensor,
                        dim: int = -1) -> torch.Tensor:
-        self._raise_not_implemented("reduce_scatter")
+        if self.world_size == 1:
+            return input_
+        # Use custom ops for torch.compile compatibility
+        return torch.ops.vllm.reduce_scatter(
+            input_, dim, self.world_size, group_name=self.unique_name)
         
     def reduce_scatterv(self,
                         input_: torch.Tensor,
@@ -979,7 +1083,7 @@ class NonDeviceGroupCoordinator(GroupCoordinator):
         
     def _reduce_scatter_out_place(self, input_: torch.Tensor,
                                   dim: int) -> torch.Tensor:
-        self._raise_not_implemented("reduce_scatter")
+        return self.reduce_scatter(input_, dim)
         
     def gather(self,
                input_: torch.Tensor,
@@ -1049,10 +1153,12 @@ class NonDeviceGroupCoordinator(GroupCoordinator):
             self.cpu_group = None
         # device_communicator and mq_broadcaster are already None
     
-    # The following methods are inherited and work correctly for CPUGroupCoordinator:
+    # The following methods are inherited and work correctly for
+    # CPUGroupCoordinator:
     # - dispatch(): returns inputs unchanged when device_communicator is None
     # - combine(): returns inputs unchanged when device_communicator is None
-    # - prepare_communication_buffer_for_model(): no-op when device_communicator is None
+    # - prepare_communication_buffer_for_model(): no-op when
+    #   device_communicator is None
 
 
 _WORLD: Optional[GroupCoordinator] = None
@@ -1204,14 +1310,15 @@ def init_distributed_environment(
     
     # Set non-device mode based on backend
     if backend == NON_DEVICE_BACKEND:
-        _IS_NON_DEVICE = True
+        set_non_device_mode(True)
         # Use gloo backend for non-device since we only need CPU communication
         backend = "gloo"
     
     from vllm.config import get_current_vllm_config
     config = get_current_vllm_config()
     if config is not None and config.parallel_config.data_parallel_size > 1:
-        assert not _IS_NON_DEVICE, "Data parallel is not supported in non-device mode"
+        assert not _IS_NON_DEVICE, (
+            "Data parallel is not supported in non-device mode")
         parallel_config = config.parallel_config
         # adjust to take into account data parallelism
         # offset the rank by the data parallel rank
@@ -1491,11 +1598,12 @@ def destroy_model_parallel():
 
 def destroy_distributed_environment():
     global _WORLD, _NODE_COUNT
-    global _IS_NON_DEVICE
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
     _NODE_COUNT = None
+    # Reset non-device mode state
+    set_non_device_mode(False)
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 

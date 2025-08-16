@@ -397,9 +397,8 @@ class WorkerProc:
         # Initializes a message queue for sending the model output
         self.worker_response_mq = MessageQueue(1, 1)
 
-        # Initialize device and loads weights
-        self.worker.init_device()
-        self.worker.load_model()
+        # Do not initialize device or load model here. EngineCore orchestrates
+        # initialization by dispatching ordered RPCs to workers.
 
     @staticmethod
     def make_worker_process(
