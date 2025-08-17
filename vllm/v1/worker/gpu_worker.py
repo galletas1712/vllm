@@ -494,6 +494,25 @@ class Worker(WorkerBase):
             # during non-device mode operations
             if hasattr(self, 'model_runner'):
                 self.model_runner.recreate_persistent_buffers()
+                
+            # Disable custom all-reduce after two-phase init
+            # The custom all-reduce has cached buffer addresses that become
+            # invalid after recreating persistent buffers. It's safer to
+            # disable it and fall back to NCCL for CUDA graph capture.
+            from vllm.distributed.parallel_state import get_tp_group
+            from vllm.distributed.device_communicators.cuda_communicator import \
+                CudaCommunicator
+            tp_group = get_tp_group()
+            if (tp_group.device_communicator is not None
+                    and isinstance(tp_group.device_communicator,
+                                   CudaCommunicator)
+                    and hasattr(tp_group.device_communicator, 'ca_comm')
+                    and tp_group.device_communicator.ca_comm is not None):
+                # Disable custom all-reduce to avoid memory access errors
+                tp_group.device_communicator.ca_comm.disabled = True
+                logger.info("Init: disabled custom all-reduce after two-phase "
+                            "init to avoid memory corruption during CUDA graph "
+                            "capture")
 
     def compile_or_warm_up_model(self) -> None:
         """Capture CUDA graphs and runtime warmups only.
