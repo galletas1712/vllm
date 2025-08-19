@@ -78,8 +78,27 @@ class WarmSpareExecutor(MultiprocExecutor):
         # Call parent initialization (sets up basic structures)
         super()._init_executor()
         
-        # Create warm spare workers after primary workers are ready
-        self._create_warm_spare_workers()
+        # Create warm spare workers in background - don't block primary startup
+        # This allows the engine to start serving immediately while warm spares
+        # are being initialized in the background
+        logger.info("Starting warm spare creation in background")
+        threading.Thread(
+            target=self._create_warm_spare_workers,
+            daemon=True,
+            name="InitialWarmSpareCreator"
+        ).start()
+    
+    def initialize_from_config(self,
+                               kv_cache_configs: list) -> None:
+        """Override to store KV cache config for warm spares."""
+        # Store the primary KV cache configuration for potential reuse
+        # Store the full config objects, not just the num_blocks
+        self.primary_kv_cache_configs = kv_cache_configs.copy()
+        logger.info(f"Storing primary KV cache config: "
+                   f"{kv_cache_configs[0].num_blocks} GPU blocks")
+        
+        # Call parent implementation to actually initialize workers
+        super().initialize_from_config(kv_cache_configs)
     
     def start_worker_monitor(self):
         """Override parent's worker monitor to intercept failures for warm spare recovery.
@@ -138,8 +157,13 @@ class WarmSpareExecutor(MultiprocExecutor):
                name="WarmSpareMonitor").start()
         
     def _create_warm_spare_workers(self) -> None:
-        """Create and partially initialize warm spare workers."""
-        logger.info("Creating warm spare workers...")
+        """Create and partially initialize warm spare workers.
+        
+        This method can be called from a background thread to avoid blocking
+        the main engine operations. The engine can continue serving while
+        warm spares are being created and initialized.
+        """
+        logger.info("Creating warm spare workers in background...")
         
         try:
             # Get new distributed init method for warm spares
@@ -179,6 +203,7 @@ class WarmSpareExecutor(MultiprocExecutor):
             self._initialize_warm_spares_phase1()
             
             logger.info("Warm spare workers created and initialized to phase 1")
+            logger.info("Warm spares ready for fast failover")
             
             # Now start the worker monitor (was skipped when parent called it)
             self.start_worker_monitor()
@@ -272,11 +297,13 @@ class WarmSpareExecutor(MultiprocExecutor):
             return False
             
         if not self.warm_spares_initialized:
-            logger.warning(f"Worker {failed_worker_idx} failed but warm spares not ready")
-            # Wait a bit for warm spares to be ready
-            for _ in range(30):  # Wait up to 30 seconds
+            logger.warning(f"Worker {failed_worker_idx} failed but warm spares not ready yet")
+            # Wait for warm spares to be ready - we need them for failover
+            logger.info("Waiting for warm spares to initialize...")
+            for i in range(60):  # Wait up to 60 seconds
                 time.sleep(1)
                 if self.warm_spares_initialized:
+                    logger.info(f"Warm spares ready after {i+1} seconds")
                     break
             else:
                 logger.error("Warm spares failed to initialize in time")
@@ -308,7 +335,8 @@ class WarmSpareExecutor(MultiprocExecutor):
             
         self.switching_to_warm_spare = True
         logger.info("Starting switch to warm spare workers...")
-        
+
+        # NOTE: New warm spares are created asynchronously in background
         try:
             # Signal warm spares that primary workers are terminated
             # This ensures they can safely proceed with memory profiling
@@ -332,30 +360,33 @@ class WarmSpareExecutor(MultiprocExecutor):
             self.warm_spare_workers = []
             self.warm_spares_initialized = False
             
-            # Clean up old message queues
-            try:
-                old_rpc_mq.close()
-            except Exception as e:
-                logger.warning(f"Error closing old RPC queue: {e}")
+            # MessageQueue doesn't have a close method - cleanup happens on GC
+            # Just let the old queue be garbage collected
+            del old_rpc_mq
             
             # Reset is_failed flag since we recovered
             self.is_failed = False
             
-            # Create new warm spares in background
+            # CRITICAL: Reset switching flag IMMEDIATELY after successful switch
+            # This allows the engine to resume serving requests right away
+            self.switching_to_warm_spare = False
+            logger.info("Successfully switched to warm spare workers - engine can now serve")
+            
+            # Create new warm spares in background - non-blocking
+            # The engine continues serving while new warm spares are created
+            logger.info("Starting new warm spare creation in background")
             threading.Thread(
                 target=self._create_warm_spare_workers,
                 daemon=True,
                 name="WarmSpareCreator"
             ).start()
             
-            logger.info("Successfully switched to warm spare workers")
             return True
             
         except Exception as e:
             logger.error(f"Unexpected error during warm spare switch: {e}")
-            return False
-        finally:
             self.switching_to_warm_spare = False
+            return False
         
     def _terminate_all_primary_workers(self) -> None:
         """Terminate all primary workers and ensure complete cleanup.
@@ -417,35 +448,49 @@ class WarmSpareExecutor(MultiprocExecutor):
             logger.info("Finalizing two-phase init for warm spares...")
             self._collective_rpc_warm_spares("finalize_two_phase_init", timeout=60)
             
-            # CRITICAL: Refresh memory snapshot after primary workers are gone
-            # The warm spares' init_snapshot was taken during phase 1 when primary
-            # workers were still using GPU memory. We need a fresh snapshot now.
-            logger.info("Refreshing memory snapshot for accurate profiling...")
-            self._collective_rpc_warm_spares("refresh_memory_snapshot", timeout=30)
+            # Check if we should skip memory profiling for faster failover
+            skip_memory_profiling = os.environ.get(
+                "VLLM_SKIP_WARM_SPARE_MEMORY_PROFILING", "0") == "1"
             
-            # Phase 5: Determine available memory
-            logger.info("Determining available memory for warm spares...")
-            available_memory = self._collective_rpc_warm_spares(
-                "determine_available_memory", timeout=120)
+            if skip_memory_profiling:
+                # Verify that parallel configuration matches exactly
+                logger.info("Skipping memory profiling (using primary config)")
+                # Get the existing KV cache config from primary initialization
+                # Use the stored configs from when primary workers were initialized
+                if not hasattr(self, 'primary_kv_cache_configs'):
+                    raise RuntimeError(
+                        "Cannot skip memory profiling: primary KV cache configs not stored")
+                
+                kv_cache_configs = self.primary_kv_cache_configs
+                logger.info(f"Using cached KV config with {kv_cache_configs[0].num_blocks} GPU blocks")
+            else:
+                # Do normal memory profiling
+                # CRITICAL: Refresh memory snapshot after primary workers are gone
+                # The warm spares' init_snapshot was taken during phase 1 when primary
+                # workers were still using GPU memory. We need a fresh snapshot now.
+                logger.info("Refreshing memory snapshot for accurate profiling...")
+                self._collective_rpc_warm_spares("refresh_memory_snapshot", timeout=30)
+                
+                # Phase 5: Determine available memory
+                logger.info("Determining available memory for warm spares...")
+                available_memory = self._collective_rpc_warm_spares(
+                    "determine_available_memory", timeout=120)
+                
+                # Phase 6: Initialize KV cache
+                # Use the same logic as EngineCore to determine cache config
+                from vllm.v1.core.kv_cache_utils import get_kv_cache_config, unify_kv_cache_configs
+                
+                logger.info("Getting KV cache specs from warm spares...")
+                kv_cache_specs = self._collective_rpc_warm_spares("get_kv_cache_spec", timeout=30)
+                kv_cache_configs = [
+                    get_kv_cache_config(self.vllm_config, spec, mem)
+                    for spec, mem in zip(kv_cache_specs, available_memory)
+                ]
+                unify_kv_cache_configs(kv_cache_configs)
             
-            # Phase 6: Initialize KV cache
-            # Use the same logic as EngineCore to determine cache config
-            from vllm.v1.core.kv_cache_utils import get_kv_cache_config, unify_kv_cache_configs
-            
-            logger.info("Getting KV cache specs from warm spares...")
-            kv_cache_specs = self._collective_rpc_warm_spares("get_kv_cache_spec", timeout=30)
-            kv_cache_configs = [
-                get_kv_cache_config(self.vllm_config, spec, mem)
-                for spec, mem in zip(kv_cache_specs, available_memory)
-            ]
-            unify_kv_cache_configs(kv_cache_configs)
-            
-            num_gpu_blocks = kv_cache_configs[0].num_blocks
-            num_cpu_blocks = 0
-            
-            logger.info(f"Initializing KV cache with {num_gpu_blocks} GPU blocks...")
+            logger.info(f"Initializing KV cache with {kv_cache_configs[0].num_blocks} GPU blocks...")
             self._collective_rpc_warm_spares(
-                "initialize_cache", args=(num_gpu_blocks, num_cpu_blocks), timeout=60)
+                "initialize_from_config", args=(kv_cache_configs,), timeout=60)
             
             # Phase 7: Compile/warm up model
             logger.info("Compiling/warming up models on warm spares...")
