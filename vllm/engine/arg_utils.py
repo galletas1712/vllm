@@ -440,6 +440,7 @@ class EngineArgs:
     ipc_server_address: str = LoadConfig.ipc_server_address
     ipc_req_port: str = LoadConfig.ipc_req_port
     ipc_sub_port: str = LoadConfig.ipc_sub_port
+    use_warm_spare: bool = LoadConfig.use_warm_spare
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
@@ -576,6 +577,8 @@ class EngineArgs:
                                 **load_kwargs["ipc_req_port"])
         load_group.add_argument("--ipc-sub-port",
                                 **load_kwargs["ipc_sub_port"])
+        load_group.add_argument("--use-warm-spare",
+                                **load_kwargs["use_warm_spare"])
 
         # Guided decoding arguments
         guided_decoding_kwargs = get_kwargs(DecodingConfig)
@@ -979,6 +982,7 @@ class EngineArgs:
             ipc_server_address=self.ipc_server_address,
             ipc_req_port=self.ipc_req_port,
             ipc_sub_port=self.ipc_sub_port,
+            use_warm_spare=self.use_warm_spare,
         )
 
     def create_speculative_config(

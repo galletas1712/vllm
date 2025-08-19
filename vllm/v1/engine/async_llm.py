@@ -94,6 +94,8 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.log_requests = log_requests
         self.log_stats = log_stats
+        # Get warm spare setting from LoadConfig
+        self.use_warm_spare = vllm_config.load_config.use_warm_spare
 
         if self.model_config.skip_tokenizer_init:
             self.tokenizer = None
@@ -683,3 +685,39 @@ class AsyncLLM(EngineClient):
     @property
     def dead_error(self) -> BaseException:
         return EngineDeadError()
+    
+    async def reinitialize_workers(self) -> None:
+        """
+        Reinitialize workers by switching to warm spare workers.
+        
+        This method triggers a switchover from primary workers to warm spare
+        workers. The warm spares will complete their initialization and become
+        the new primary workers, while new warm spares are created in the
+        background.
+        
+        Requires warm spare mode to be enabled (use_warm_spare=True and IPC
+        loading enabled).
+        """
+        if not self.use_warm_spare:
+            raise RuntimeError(
+                "Cannot reinitialize workers: warm spare mode not enabled")
+        
+        logger.info("Reinitializing workers by switching to warm spares...")
+        
+        # Wait for existing requests to drain
+        await self.wait_for_requests_to_drain(drain_timeout=60)
+        
+        # Switch the EngineCore to use warm spare workers
+        await self._switch_to_warm_spares()
+        
+        logger.info("Successfully reinitialized workers with warm spares")
+    
+    async def _switch_to_warm_spares(self) -> None:
+        """Internal method to switch to warm spare workers."""
+        # Call the EngineCore method to switch
+        if hasattr(self.engine_core, 'switch_to_warm_spares'):
+            await self.engine_core.switch_to_warm_spares_async()
+        else:
+            # For MPClient, we need to add a method to trigger the switch
+            # via collective RPC to the EngineCore
+            await self.engine_core.collective_rpc_async("switch_to_warm_spares")

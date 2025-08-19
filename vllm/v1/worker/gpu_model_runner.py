@@ -2526,8 +2526,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def profile_run(self) -> None:
         # If we're in non-device mode (two-phase init), skip profiling
         # We'll do it later after torch.compile but before CUDA graph capture
-        from vllm.distributed.parallel_state import IS_NON_DEVICE
-        if IS_NON_DEVICE():
+        from vllm.distributed.parallel_state import IS_FAKE_DISTRIBUTED
+        if IS_FAKE_DISTRIBUTED():
             logger.info("Skipping profile_run during two-phase init (will run after compile)")
             return
         

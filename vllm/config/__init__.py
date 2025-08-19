@@ -1803,6 +1803,10 @@ class LoadConfig:
     """Port for REQ-REP socket of the IPC model server."""
     ipc_sub_port: str = "5557"
     """Port for PUB-SUB socket of the IPC model server."""
+    use_warm_spare: bool = False
+    """Whether to use warm spare workers for resilience. Requires IPC loading
+    to be enabled. Warm spare workers are partially initialized (model loaded
+    via IPC but no KV cache) and can quickly replace failed primary workers."""
 
     def compute_hash(self) -> str:
         """

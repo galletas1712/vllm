@@ -47,19 +47,19 @@ from vllm.utils import (direct_register_custom_op, get_distributed_init_method,
                         resolve_obj_by_qualname, supports_custom_op)
 
 # Backend constant for non-device mode
-NON_DEVICE_BACKEND = "non_device"
+FAKE_DISTRIBUTED_BACKEND = "fake_distributed"
 
 # Global state for non-device mode
-_IS_NON_DEVICE = False
+_IS_FAKE_DISTRIBUTED = False
 
-def IS_NON_DEVICE() -> bool:
+def IS_FAKE_DISTRIBUTED() -> bool:
     """Check if parallel state is in non-device mode."""
-    return _IS_NON_DEVICE
+    return _IS_FAKE_DISTRIBUTED
 
-def set_non_device_mode(enabled: bool) -> None:
+def set_fake_distributed_mode(enabled: bool) -> None:
     """Set the non-device mode state."""
-    global _IS_NON_DEVICE
-    _IS_NON_DEVICE = enabled
+    global _IS_FAKE_DISTRIBUTED
+    _IS_FAKE_DISTRIBUTED = enabled
 
 
 @dataclass
@@ -165,7 +165,7 @@ def _prune_dead_groups() -> None:
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     # In non-device mode (precompile), avoid device comms entirely.
-    if IS_NON_DEVICE():
+    if IS_FAKE_DISTRIBUTED():
         return all_reduce_fake(tensor, group_name)
     group_name = _resolve_group_name(group_name)
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -183,7 +183,7 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     without actually performing communication.
     """
     # During non-device mode, just return a copy to maintain graph structure
-    if IS_NON_DEVICE():
+    if IS_FAKE_DISTRIBUTED():
         # Return a tensor with same properties but allow gradient flow
         return tensor.clone()
     # Normal fake implementation for other cases
@@ -192,7 +192,7 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
 
 def reduce_scatter(tensor: torch.Tensor, dim: int, world_size: int,
                    group_name: str) -> torch.Tensor:
-    if IS_NON_DEVICE():
+    if IS_FAKE_DISTRIBUTED():
         return reduce_scatter_fake(tensor, dim, world_size, group_name)
     group_name = _resolve_group_name(group_name)
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -207,7 +207,7 @@ def reduce_scatter_fake(tensor: torch.Tensor, dim: int, world_size: int,
     """Fake implementation for reduce_scatter during torch.compile tracing."""
     new_shape = list(tensor.shape)
     new_shape[dim] = tensor.shape[dim] // world_size
-    if IS_NON_DEVICE():
+    if IS_FAKE_DISTRIBUTED():
         # During non-device mode, return a properly shaped slice
         # This maintains the correct tensor properties for tracing
         slices = [slice(None)] * tensor.ndim
@@ -218,7 +218,7 @@ def reduce_scatter_fake(tensor: torch.Tensor, dim: int, world_size: int,
 
 def all_gather(tensor: torch.Tensor, dim: int, world_size: int,
                group_name: str) -> torch.Tensor:
-    if IS_NON_DEVICE():
+    if IS_FAKE_DISTRIBUTED():
         return all_gather_fake(tensor, dim, world_size, group_name)
     group_name = _resolve_group_name(group_name)
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -233,7 +233,7 @@ def all_gather_fake(tensor: torch.Tensor, dim: int, world_size: int,
     """Fake implementation for all_gather during torch.compile tracing."""
     new_shape = list(tensor.shape)
     new_shape[dim] = tensor.shape[dim] * world_size
-    if IS_NON_DEVICE():
+    if IS_FAKE_DISTRIBUTED():
         # During non-device mode, return a repeated tensor
         # This maintains the correct tensor properties for tracing
         repeats = [1] * tensor.ndim
@@ -1172,7 +1172,7 @@ def get_world_group() -> GroupCoordinator:
 
 def init_world_group(ranks: list[int], local_rank: int,
                      backend: str) -> GroupCoordinator:
-    if _IS_NON_DEVICE:
+    if _IS_FAKE_DISTRIBUTED:
         return NonDeviceGroupCoordinator(
             group_ranks=[ranks],
             local_rank=local_rank,
@@ -1199,7 +1199,7 @@ def init_model_parallel_group(
     group_name: Optional[str] = None,
 ) -> GroupCoordinator:
 
-    if _IS_NON_DEVICE:
+    if _IS_FAKE_DISTRIBUTED:
         return NonDeviceGroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
@@ -1309,15 +1309,15 @@ def init_distributed_environment(
         distributed_init_method, backend)
     
     # Set non-device mode based on backend
-    if backend == NON_DEVICE_BACKEND:
-        set_non_device_mode(True)
+    if backend == FAKE_DISTRIBUTED_BACKEND:
+        set_fake_distributed_mode(True)
         # Use gloo backend for non-device since we only need CPU communication
         backend = "gloo"
     
     from vllm.config import get_current_vllm_config
     config = get_current_vllm_config()
     if config is not None and config.parallel_config.data_parallel_size > 1:
-        assert not _IS_NON_DEVICE, (
+        assert not _IS_FAKE_DISTRIBUTED, (
             "Data parallel is not supported in non-device mode")
         parallel_config = config.parallel_config
         # adjust to take into account data parallelism
@@ -1603,7 +1603,7 @@ def destroy_distributed_environment():
     _WORLD = None
     _NODE_COUNT = None
     # Reset non-device mode state
-    set_non_device_mode(False)
+    set_fake_distributed_mode(False)
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 

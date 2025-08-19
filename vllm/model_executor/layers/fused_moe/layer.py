@@ -285,7 +285,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                        params_dtype: torch.dtype, **extra_weight_attrs):
         # Fused gate_up_proj (column parallel)
         if get_current_vllm_config().load_config.enable_ipc_loading:
-            logger.warning("Creating uninitialized parameter for weight")
             w13_weight = UninitializedParameterFromTensor()
         else:
             w13_weight = torch.nn.Parameter(torch.empty(
@@ -306,7 +305,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             set_weight_attrs(w13_bias, extra_weight_attrs)
         # down_proj (row parallel)
         if get_current_vllm_config().load_config.enable_ipc_loading:
-            logger.warning("Creating uninitialized parameter for weight")
             w2_weight = UninitializedParameterFromTensor()
         else:
             w2_weight = torch.nn.Parameter(torch.empty(

@@ -69,12 +69,30 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        # Get warm spare setting from LoadConfig
+        self.use_warm_spare = vllm_config.load_config.use_warm_spare
         logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
                     VLLM_VERSION, vllm_config)
+        if self.use_warm_spare:
+            logger.info(
+                "Warm spare mode enabled for resilient worker management")
 
         self.log_stats = log_stats
 
         # Setup Model.
+        # Use WarmSpareExecutor if warm spare mode is enabled and IPC loading
+        # is enabled
+        if self.use_warm_spare and vllm_config.load_config.enable_ipc_loading:
+            from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
+            # Override executor_class to use WarmSpareExecutor
+            executor_class = WarmSpareExecutor
+            logger.info(
+                "Using WarmSpareExecutor for resilient worker management")
+        elif self.use_warm_spare:
+            logger.warning(
+                "Warm spare mode requested but IPC loading not enabled. "
+                "Using regular executor.")
+        
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(
@@ -189,7 +207,8 @@ class EngineCore:
                 ] * len(kv_cache_specs)
             else:
                 # Determine how much memory can be allocated for kv cache.
-                # Use precomputed values when provided to avoid double profiling.
+                # Use precomputed values when provided to avoid double
+                # profiling.
                 if precomputed_available_gpu_memory is None:
                     available_gpu_memory = (
                         self.model_executor.determine_available_memory())
@@ -426,6 +445,21 @@ class EngineCore:
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args,
                                                   kwargs)
+    
+    def switch_to_warm_spares(self) -> None:
+        """Switch from primary workers to warm spare workers."""
+        if self.use_warm_spare:
+            from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
+            if isinstance(self.model_executor, WarmSpareExecutor):
+                logger.info("Switching to warm spare workers...")
+                self.model_executor.switch_to_warm_spares()
+                logger.info("Successfully switched to warm spare workers")
+            else:
+                logger.warning(
+                    "Warm spare mode enabled but executor is not "
+                    "WarmSpareExecutor")
+        else:
+            logger.warning("Warm spare mode not enabled, cannot switch")
 
     def save_tensorized_model(
         self,

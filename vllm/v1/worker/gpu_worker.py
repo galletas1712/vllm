@@ -21,7 +21,7 @@ from vllm.distributed.parallel_state import (
     destroy_model_parallel,
     destroy_distributed_environment,
     model_parallel_is_initialized,
-    NON_DEVICE_BACKEND,
+    FAKE_DISTRIBUTED_BACKEND,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
@@ -250,7 +250,7 @@ class Worker(WorkerBase):
                 self.vllm_config, self.rank,
                 self.distributed_init_method,
                 self.local_rank,
-                backend=NON_DEVICE_BACKEND  # Use non-device backend
+                backend=FAKE_DISTRIBUTED_BACKEND  # Use non-device backend
             )
             # Store flag to complete initialization later
             self._two_phase_init_pending = True
@@ -326,6 +326,40 @@ class Worker(WorkerBase):
             # Ensure this only triggers compile; no CUDA graph capture here.
             self.model_runner._dummy_run(size, skip_eplb=True)
 
+    def acknowledge_primaries_terminated(self) -> None:
+        """Acknowledge that primary workers have been terminated.
+        
+        This serves as a synchronization barrier to ensure warm spares
+        know that primary workers are fully terminated before proceeding
+        with memory-sensitive operations like profiling.
+        """
+        logger.info("Acknowledged primary workers termination")
+        # Synchronize to ensure GPU operations are complete
+        torch.cuda.synchronize()
+        
+        # Use a distributed barrier if available to ensure all warm spares
+        # are at the same point
+        if torch.distributed.is_initialized():
+            try:
+                torch.distributed.barrier()
+                logger.info("All warm spare workers synchronized")
+            except Exception as e:
+                logger.warning(f"Barrier synchronization failed: {e}")
+    
+    def refresh_memory_snapshot(self) -> None:
+        """Refresh the initial memory snapshot.
+        
+        This is used by warm spares after primary workers are terminated
+        to get an accurate baseline for memory profiling.
+        """
+        logger.info("Refreshing memory snapshot for accurate profiling")
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # Take a new snapshot of current memory state
+        self.init_snapshot = MemorySnapshot()
+        logger.info(f"New memory snapshot: {self.init_snapshot.free_memory / GiB_bytes:.2f} GiB free")
+    
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -341,8 +375,8 @@ class Worker(WorkerBase):
         """
         # If we're in two-phase init mode, skip profiling for now
         # It will be done after compilation in compile_or_warm_up_model
-        from vllm.distributed.parallel_state import IS_NON_DEVICE
-        assert not IS_NON_DEVICE(), "Memory profiling should not be called in non-device mode"
+        from vllm.distributed.parallel_state import IS_FAKE_DISTRIBUTED
+        assert not IS_FAKE_DISTRIBUTED(), "Memory profiling should not be called in non-device mode"
         
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -476,8 +510,8 @@ class Worker(WorkerBase):
                 )
                 
                 # Clear the non-device mode flag
-                from vllm.distributed.parallel_state import set_non_device_mode
-                set_non_device_mode(False)
+                from vllm.distributed.parallel_state import set_fake_distributed_mode
+                set_fake_distributed_mode(False)
                 
                 self._two_phase_init_pending = False
                 # Track that we did two-phase init
@@ -817,7 +851,7 @@ def init_worker_distributed_environment(
 ) -> None:
     """Initialize the distributed environment.
     
-    If backend is NON_DEVICE_BACKEND, initializes with NonDeviceGroupCoordinator
+    If backend is FAKE_DISTRIBUTED_BACKEND, initializes with NonDeviceGroupCoordinator
     for two-phase initialization support.
     """
     parallel_config = vllm_config.parallel_config
@@ -830,7 +864,7 @@ def init_worker_distributed_environment(
                                       parallel_config.pipeline_parallel_size)
 
     # Only initialize KV transfer for real device backends
-    if backend != NON_DEVICE_BACKEND:
+    if backend != FAKE_DISTRIBUTED_BACKEND:
         ensure_kv_transfer_initialized(vllm_config)
 
 
