@@ -509,10 +509,6 @@ class Worker(WorkerBase):
                     current_platform.dist_backend
                 )
                 
-                # Clear the non-device mode flag
-                from vllm.distributed.parallel_state import set_fake_distributed_mode
-                set_fake_distributed_mode(False)
-                
                 self._two_phase_init_pending = False
                 # Track that we did two-phase init
                 self._did_two_phase_init = True
@@ -520,33 +516,19 @@ class Worker(WorkerBase):
 
             # Ensure all ranks have re-initialized before proceeding
             if torch.distributed.is_initialized():
-                from contextlib import suppress
-                with suppress(Exception):
-                    torch.distributed.barrier()
-            
-            # Recreate persistent buffers that may have been corrupted
-            # during non-device mode operations
-            if hasattr(self, 'model_runner'):
-                self.model_runner.recreate_persistent_buffers()
-                
+                torch.distributed.barrier()
+
             # Disable custom all-reduce after two-phase init
             # The custom all-reduce has cached buffer addresses that become
             # invalid after recreating persistent buffers. It's safer to
             # disable it and fall back to NCCL for CUDA graph capture.
             from vllm.distributed.parallel_state import get_tp_group
-            from vllm.distributed.device_communicators.cuda_communicator import \
-                CudaCommunicator
-            tp_group = get_tp_group()
-            if (tp_group.device_communicator is not None
-                    and isinstance(tp_group.device_communicator,
-                                   CudaCommunicator)
-                    and hasattr(tp_group.device_communicator, 'ca_comm')
-                    and tp_group.device_communicator.ca_comm is not None):
-                # Disable custom all-reduce to avoid memory access errors
-                tp_group.device_communicator.ca_comm.disabled = True
-                logger.info("Init: disabled custom all-reduce after two-phase "
-                            "init to avoid memory corruption during CUDA graph "
-                            "capture")
+            assert get_tp_group().device_communicator.ca_comm is None, "Custom all-reduce should be disabled after two-phase init"
+            
+            # Recreate persistent buffers that may have been corrupted
+            # during non-device mode operations
+            if hasattr(self, 'model_runner'):
+                self.model_runner.recreate_persistent_buffers()
 
     def compile_or_warm_up_model(self) -> None:
         """Capture CUDA graphs and runtime warmups only.
@@ -579,11 +561,18 @@ class Worker(WorkerBase):
                     capture_attn_cudagraph=attn_cudagraph,
                     skip_eplb=True,
                 )
+            
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(
                     hidden_states=last_hidden_states)
+            
+            # CRITICAL: Reset InputBatch state after ALL dummy runs!
+            # These dummy runs happen during warm spare activation and leave
+            # stale num_computed_tokens values that cause position corruption
+            # Must be after _dummy_run AND _dummy_sampler_run/_dummy_pooler_run
+            self.model_runner.reset_input_batch_state()
 
         # Warmup kernels used during model execution
         kernel_warmup(self)
@@ -591,6 +580,11 @@ class Worker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        
+        # CRITICAL: Reset InputBatch state after dummy runs
+        # Dummy runs during initialization leave stale num_computed_tokens
+        # values that cause position encoding corruption for warm spares
+        self.model_runner.reset_input_batch_state()
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

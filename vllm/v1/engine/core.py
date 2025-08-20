@@ -281,8 +281,71 @@ class EngineCore:
             logger.warning("Got kv_transfer_params, but no KVConnector found. "
                            "Disabling KVTransfer for this request.")
 
+        # If warm spare recovery just occurred and we haven't processed it yet,
+        # process it now before adding the new request
+        if self.use_warm_spare:
+            from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
+            if isinstance(self.model_executor, WarmSpareExecutor):
+                if getattr(self.model_executor, 'warm_spare_recovery_occurred', False):
+                    # Process recovery before adding the new request
+                    self._handle_warm_spare_recovery()
+        
         self.scheduler.add_request(request)
 
+    def _handle_warm_spare_recovery(self) -> None:
+        """Handle warm spare recovery by aborting pre-failover requests."""
+        from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
+        
+        if not isinstance(self.model_executor, WarmSpareExecutor):
+            return
+            
+        # Clear the flag immediately
+        self.model_executor.warm_spare_recovery_occurred = False
+        
+        # Only process recovery cleanup once
+        if hasattr(self, '_warm_spare_recovery_processed'):
+            return
+            
+        self._warm_spare_recovery_processed = True
+        
+        logger.info("Processing warm spare recovery - cleaning up pre-failover state")
+        
+        # Collect all pre-failover request IDs
+        pre_failover_request_ids = []
+        for request in self.scheduler.running:
+            pre_failover_request_ids.append(request.request_id)
+        
+        # Check waiting queue for pre-failover requests
+        waiting_requests = []
+        while self.scheduler.waiting:
+            req = self.scheduler.waiting.pop_request()
+            waiting_requests.append(req)
+        
+        # All requests currently in queues existed before recovery
+        for req in waiting_requests:
+            pre_failover_request_ids.append(req.request_id)
+            # Put them back temporarily
+            self.scheduler.waiting.add_request(req)
+        
+        # Abort all pre-failover requests to clear their corrupted state
+        if pre_failover_request_ids:
+            logger.info(f"Aborting {len(pre_failover_request_ids)} pre-failover requests: {pre_failover_request_ids}")
+            self.scheduler.finish_requests(
+                pre_failover_request_ids,
+                RequestStatus.FINISHED_ABORTED
+            )
+        
+        # CRITICAL: Reset prefix cache to ensure clean state for new requests
+        logger.info("Resetting prefix cache after warm spare recovery")
+        cache_reset = self.scheduler.reset_prefix_cache()
+        if not cache_reset:
+            logger.warning("Failed to reset prefix cache - new requests may still be affected")
+        
+        logger.info("Recovery cleanup completed - new requests will be processed normally")
+        
+        # Clear the flag for future recoveries
+        delattr(self, '_warm_spare_recovery_processed')
+    
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
@@ -316,6 +379,16 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
+        
+        # Check if warm spare recovery occurred and handle it
+        if self.use_warm_spare:
+            from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
+            if isinstance(self.model_executor, WarmSpareExecutor):
+                if getattr(self.model_executor, 'warm_spare_recovery_occurred', False):
+                    self._handle_warm_spare_recovery()
+                    # If no requests left after cleanup, return empty
+                    if not self.scheduler.has_requests():
+                        return {}, False
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
@@ -452,6 +525,31 @@ class EngineCore:
             from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
             if isinstance(self.model_executor, WarmSpareExecutor):
                 logger.info("Switching to warm spare workers...")
+                
+                # CRITICAL: Clear all in-flight requests from the scheduler
+                # These have corrupted state from the failed primary workers
+                # and would cause position encoding errors on warm spares
+                logger.info("Clearing scheduler state for warm spare failover...")
+                
+                # Get all unfinished request IDs
+                unfinished_requests = []
+                # Check running requests
+                for request in self.scheduler.running:
+                    unfinished_requests.append(request.request_id)
+                # Check waiting requests  
+                while self.scheduler.waiting:
+                    req = self.scheduler.waiting.pop_request()
+                    unfinished_requests.append(req.request_id)
+                
+                # Abort all unfinished requests
+                if unfinished_requests:
+                    logger.info(f"Aborting {len(unfinished_requests)} in-flight requests")
+                    self.scheduler.finish_requests(
+                        unfinished_requests, 
+                        RequestStatus.FINISHED_ABORTED
+                    )
+                
+                # Switch to warm spares
                 self.model_executor.switch_to_warm_spares()
                 logger.info("Successfully switched to warm spare workers")
             else:

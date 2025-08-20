@@ -475,6 +475,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 to_update = model.pooler.get_pooling_updates(task)
                 to_update.apply(pooling_params)
 
+            # Debug: Check for corrupted state in new requests
+            if new_req_data.num_computed_tokens != 0:
+                logger.warning(f"NEW REQUEST HAS NON-ZERO num_computed_tokens: {new_req_data.num_computed_tokens}")
+                logger.warning(f"Request ID: {req_id}, prompt_len: {len(new_req_data.prompt_token_ids)}")
+            
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
@@ -719,6 +724,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                arange,
                out=positions_np)
+
+        # Debug logging - check for state corruption
+        import logging
+        logger = logging.getLogger(__name__)
+        # Check if this is the first request after warm spare activation
+
+        logger.info(f"Debug positions: first 10 values = {positions_np[:10]}")
+        logger.info(f"Debug num_computed_tokens: {self.input_batch.num_computed_tokens_cpu[:num_reqs]}")
+        logger.info(f"Debug arange: first 10 values = {arange[:10]}")
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1934,6 +1948,30 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
+    def reset_input_batch_state(self) -> None:
+        """Reset InputBatch state after dummy runs.
+        
+        This clears any stale state left over from dummy runs during
+        initialization (e.g., CUDA graph capture, warmup).
+        """
+        # Log state before reset for debugging
+        import traceback
+        logger.info(f"Resetting InputBatch state (called from: {traceback.extract_stack()[-2].name})")
+        logger.info(f"Before reset - num_computed_tokens[0:5]: {self.input_batch.num_computed_tokens_cpu[:5]}")
+        
+        # Reset num_computed_tokens to zero for all slots
+        self.input_batch.num_computed_tokens_cpu.fill(0)
+        self.input_batch.num_tokens.fill(0)
+        self.input_batch.num_tokens_no_spec.fill(0)
+        self.input_batch.num_prompt_tokens.fill(0)
+        # Clear request tracking
+        self.input_batch._req_ids.clear()
+        self.input_batch.req_id_to_index.clear()
+        # Clear cached request states
+        self.requests.clear()
+        
+        logger.info(f"After reset - num_computed_tokens[0:5]: {self.input_batch.num_computed_tokens_cpu[:5]}")
+    
     def recreate_persistent_buffers(self) -> None:
         """Recreate persistent CUDA buffers after two-phase finalization.
         

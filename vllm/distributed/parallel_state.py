@@ -1313,6 +1313,8 @@ def init_distributed_environment(
         set_fake_distributed_mode(True)
         # Use gloo backend for non-device since we only need CPU communication
         backend = "gloo"
+    else:
+        set_fake_distributed_mode(False)
     
     from vllm.config import get_current_vllm_config
     config = get_current_vllm_config()

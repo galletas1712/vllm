@@ -67,6 +67,7 @@ class WarmSpareExecutor(MultiprocExecutor):
         # Track initialization state - MUST be set before calling parent init
         self.warm_spares_initialized = False
         self.switching_to_warm_spare = False
+        self.warm_spare_recovery_occurred = False
         
         # Worker monitoring  
         self.rpc_timeout = DEFAULT_RPC_TIMEOUT
@@ -334,6 +335,8 @@ class WarmSpareExecutor(MultiprocExecutor):
             return False
             
         self.switching_to_warm_spare = True
+        # Set recovery flag so EngineCore knows to clean up
+        self.warm_spare_recovery_occurred = True
         logger.info("Starting switch to warm spare workers...")
 
         # NOTE: New warm spares are created asynchronously in background
@@ -445,6 +448,8 @@ class WarmSpareExecutor(MultiprocExecutor):
         
         try:
             # Phase 4: Finalize two-phase init (switch to real distributed)
+            # This also calls recreate_persistent_buffers() to ensure fresh CPU/GPU
+            # buffers with correct initialization - critical for position encoding
             logger.info("Finalizing two-phase init for warm spares...")
             self._collective_rpc_warm_spares("finalize_two_phase_init", timeout=60)
             
