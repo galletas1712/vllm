@@ -13,6 +13,7 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.distributed.parallel_state import FAKE_DISTRIBUTED_BACKEND
 from vllm.model_executor.parameter import UninitializedParameterFromTensor
 from vllm.companion.messages import CUDATensorRebuildInfo
+from vllm.utils import get_distributed_init_method
 
 
 logger = init_logger(__name__)
@@ -174,18 +175,10 @@ class ModelInstanceManager:
             self.companion_master_port,
         )
         
-        # For companion servers, we use a file-based init method to avoid port conflicts
-        # All ranks in the same distributed group must use the SAME file for coordination
-        import tempfile
-        import os
-        import hashlib
-        temp_dir = tempfile.gettempdir()
-        # Create a unique file name based on the model config hash and world size
-        # This ensures all ranks in the same group use the same file
-        config_str = f"{self.vllm_config.compute_hash()}_{self.world_size}"
-        unique_id = hashlib.md5(config_str.encode()).hexdigest()[:8]
-        init_file = os.path.join(temp_dir, f"vllm_companion_dist_{unique_id}")
-        init_method = f"file://{init_file}"
+        init_method = get_distributed_init_method(
+            self.vllm_config.parallel_config.data_parallel_master_ip,
+            self.companion_master_port
+        )
         
         logger.info(
             "[DIST-INIT] About to call parallel_state.init_distributed_environment:\n"
