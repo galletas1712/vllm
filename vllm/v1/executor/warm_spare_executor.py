@@ -164,6 +164,11 @@ class WarmSpareExecutor(MultiprocExecutor):
         the main engine operations. The engine can continue serving while
         warm spares are being created and initialized.
         """
+        # Don't create warm spares if we're shutting down
+        if getattr(self, 'shutting_down', False):
+            logger.info("System is shutting down, skipping warm spare creation")
+            return
+            
         logger.info("Creating warm spare workers in background...")
         
         try:
@@ -293,6 +298,11 @@ class WarmSpareExecutor(MultiprocExecutor):
         Returns:
             bool: True if recovery successful, False otherwise
         """
+        # Don't attempt recovery if we're shutting down
+        if getattr(self, 'shutting_down', False):
+            logger.info("System is shutting down, skipping warm spare recovery")
+            return False
+            
         if self.switching_to_warm_spare:
             logger.warning("Already switching to warm spare")
             return False
@@ -397,7 +407,13 @@ class WarmSpareExecutor(MultiprocExecutor):
         This is called when ANY worker fails, to prevent NCCL communication
         hangs in the remaining workers. Uses proper process synchronization.
         """
-        logger.info("Terminating ALL primary workers to prevent NCCL hangs...")
+        # Check if we're shutting down normally vs recovery
+        is_normal_shutdown = getattr(self, 'shutting_down', False)
+        
+        if is_normal_shutdown:
+            logger.info("Terminating ALL primary workers for shutdown...")
+        else:
+            logger.info("Terminating ALL primary workers to prevent NCCL hangs...")
         
         # First, send SIGKILL to all workers for immediate termination
         for i, worker in enumerate(self.workers):
@@ -561,11 +577,18 @@ class WarmSpareExecutor(MultiprocExecutor):
                 
     def shutdown(self) -> None:
         """Shutdown both primary and warm spare workers."""
+        # Set the shutting_down flag to prevent monitor from trying recovery
+        if not getattr(self, 'shutting_down', False):
+            self.shutting_down = True
+            logger.info("WarmSpareExecutor shutting down...")
+        
         if hasattr(self, 'monitoring_enabled'):
             self.monitoring_enabled = False
         
         # Shutdown warm spare workers
         if hasattr(self, 'warm_spare_workers'):
+            logger.info("Shutting down %d warm spare workers...", 
+                       len(self.warm_spare_workers))
             for worker in self.warm_spare_workers:
                 try:
                     worker.proc.terminate()
