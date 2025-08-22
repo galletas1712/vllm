@@ -1803,6 +1803,11 @@ class LoadConfig:
     """Port for REQ-REP socket of the IPC model server."""
     ipc_sub_port: str = "5557"
     """Port for PUB-SUB socket of the IPC model server."""
+    companion_master_port: int = 55700
+    """Master port for companion process CPU group initialization. Used when
+    enable_ipc_loading is True with MultiProc companion backend. Even though
+    companions use fake distributed for device ops, they need real CPU groups
+    (gloo backend) for node detection, which requires a network port."""
     use_warm_spare: bool = False
     """Whether to use warm spare workers for resilience. Requires IPC loading
     to be enabled. Warm spare workers are partially initialized (model loaded

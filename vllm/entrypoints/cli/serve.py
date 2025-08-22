@@ -178,7 +178,7 @@ def run_multi_api_server(args: argparse.Namespace):
 
     with launch_core_engines(vllm_config, executor_class, log_stats,
                              num_api_servers) as (local_engine_manager,
-                                                  coordinator, addresses):
+                                                  coordinator, addresses, _):
 
         # Construct common args for the APIServerProcessManager up-front.
         api_server_manager_kwargs = dict(

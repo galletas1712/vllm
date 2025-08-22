@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Generator
+import contextlib
 import copy
 import asyncio
+import os
 import uvloop
 
 import torch
@@ -19,25 +21,44 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.model_executor.parameter import UninitializedParameterFromTensor
 
-# Import Dynamo companion client
-try:
-    from dynamo.runtime import DistributedRuntime
-    from dynamo.companion.dynamo_companion_client import create_model_client
-except ImportError as e:
-    raise ImportError(
-        "Failed to import Dynamo companion components. "
-        "Make sure the companion module is installed"
-    ) from e
-
 logger = init_logger(__name__)
+
+# Determine which companion backend to use
+USE_MULTIPROC = os.environ.get("VLLM_IPC_USE_MULTIPROC", "1") == "1"
+
+if USE_MULTIPROC:
+    # Import MultiProc companion client (default)
+    try:
+        from vllm.companion.multiproc_companion_client import (
+            MultiProcCompanionClient)
+        logger.info("Using MultiProc companion backend for IPC loading")
+    except ImportError as e:
+        raise ImportError(
+            "Failed to import MultiProc companion components. "
+            "Make sure the vllm.companion module is available"
+        ) from e
+else:
+    # Import Dynamo companion client
+    try:
+        from dynamo.runtime import DistributedRuntime
+        from dynamo.companion.dynamo_companion_client import create_model_client
+        logger.info("Using Dynamo companion backend for IPC loading")
+    except ImportError as e:
+        raise ImportError(
+            "Failed to import Dynamo companion components. "
+            "Make sure the companion module is installed"
+        ) from e
 
 
 class IPCModelLoader(BaseModelLoader):
     """Model loader that retrieves weights via IPC from a model server.
     
-    This loader connects to a Dynamo companion server that has pre-loaded the
-    model weights and retrieves them via CUDA IPC. This allows multiple
-    processes to share the same GPU memory for model weights.
+    This loader connects to a companion server (MultiProc or Dynamo) that has
+    pre-loaded the model weights and retrieves them via CUDA IPC. This allows
+    multiple processes to share the same GPU memory for model weights.
+    
+    The backend can be selected via the VLLM_IPC_USE_MULTIPROC environment
+    variable (default: "1" for MultiProc, "0" for Dynamo).
     
     The loader automatically obtains rank information from vLLM's parallel_state
     module, which is initialized during init_device() before model loading.
@@ -55,74 +76,87 @@ class IPCModelLoader(BaseModelLoader):
 
         self.client = None  # Will be initialized when we know the model
         self.vllm_config = None
+        self.use_multiproc = USE_MULTIPROC
+        self.runtime = None  # Only used for Dynamo backend
 
         logger.info(
-            "IPC model loader initialized."
+            "IPC model loader initialized with %s backend",
+            "MultiProc" if self.use_multiproc else "Dynamo"
         )
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Connect to the model server and wait for model to be ready."""
         assert self.vllm_config is not None, "vllm_config not set"
 
-        # Initialize Dynamo runtime and client
         if self.client is None:
-            try:
-                # Create a new event loop for this thread if needed
+            if self.use_multiproc:
+                # Initialize MultiProc client
                 try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_closed():
-                        raise RuntimeError("Event loop is closed")
-                except RuntimeError:
-                    # No event loop in this thread, create one
-                    uvloop.install()
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+                    self.client = MultiProcCompanionClient()
+                    logger.info("MultiProc companion client initialized")
+                except Exception as e:
+                    logger.error(
+                        "Error creating MultiProc companion client: %s", e)
+                    raise
+            else:
+                # Initialize Dynamo runtime and client
+                try:
+                    # Create a new event loop for this thread if needed
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_closed():
+                            raise RuntimeError("Event loop is closed")
+                    except RuntimeError:
+                        # No event loop in this thread, create one
+                        uvloop.install()
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
 
-                # Create a Dynamo runtime instance
-                # Second parameter is whether it's static
-                # (False = dynamic, can discover services)
-                self.runtime = DistributedRuntime(loop, False)
+                    # Create a Dynamo runtime instance
+                    # Second parameter is whether it's static
+                    # (False = dynamic, can discover services)
+                    self.runtime = DistributedRuntime(loop, False)
 
-                async def _create():
-                    # Get rank information from the distributed environment
-                    # By the time this is called, init_device() has already
-                    # initialized the distributed environment
-                    world_group = get_world_group()
-                    
-                    return await create_model_client(
-                        runtime=self.runtime,
-                        vllm_config=self.vllm_config,
-                        local_rank=world_group.local_rank,
-                        global_rank=world_group.rank,
-                        world_size=world_group.world_size,
-                        namespace="companion",
+                    async def _create():
+                        # Get rank information from the distributed environment
+                        # By the time this is called, init_device() has already
+                        # initialized the distributed environment
+                        world_group = get_world_group()
+                        
+                        return await create_model_client(
+                            runtime=self.runtime,
+                            vllm_config=self.vllm_config,
+                            local_rank=world_group.local_rank,
+                            global_rank=world_group.rank,
+                            world_size=world_group.world_size,
+                            namespace="companion",
+                        )
+
+                    self.client = loop.run_until_complete(_create())
+                except Exception as e:
+                    logger.error("Error creating Dynamo model client: %s", e)
+                    raise
+
+                # Wait for model to be ready with two-phase timeout
+                # (blocking from sync context)
+                logger.info("Waiting for model to be ready on server...")
+                success, server_info = loop.run_until_complete(
+                    self.client.wait_for_model_ready(
+                        initial_timeout=15.0,  # TODO: make configurable
+                        loading_timeout=300.0,
+                    )
+                )
+
+                if not success:
+                    raise RuntimeError(
+                        "Failed to connect to model server or model not ready"
                     )
 
-                self.client = loop.run_until_complete(_create())
-            except Exception as e:
-                logger.error("Error creating Dynamo model client: %s", e)
-                raise
-
-        # Wait for model to be ready with two-phase timeout
-        # (blocking from sync context)
-        logger.info("Waiting for model to be ready on server...")
-        success, server_info = loop.run_until_complete(
-            self.client.wait_for_model_ready(
-                initial_timeout=15.0,  # TODO: make configurable
-                loading_timeout=300.0,
-            )
-        )
-
-        if not success:
-            raise RuntimeError(
-                "Failed to connect to model server or model not ready"
-            )
-
-        logger.info(
-            "Model %s is ready on server (device: cuda:%s)",
-            model_config.model,
-            server_info.get("device_id", "unknown"),
-        )
+                logger.info(
+                    "Model %s is ready on server (device: cuda:%s)",
+                    model_config.model,
+                    server_info.get("device_id", "unknown"),
+                )
 
     def get_all_weights(
         self,
@@ -133,22 +167,35 @@ class IPCModelLoader(BaseModelLoader):
         # First ensure the model is loaded on the server
         self.download_model(model_config)
 
-        # Get tensor rebuild info from server
-        logger.info("Retrieving model parameters rebuild info from server...")
+        # Both clients now have the same API - they return rebuild info
+        logger.info(
+            "Retrieving model parameters rebuild info from %s companion...",
+            "MultiProc" if self.use_multiproc else "Dynamo"
+        )
+        
         try:
-            loop = asyncio.get_event_loop()
-            model_parameters_rebuild_info = loop.run_until_complete(
-                self.client.get_model_parameters()
-            )
+            if self.use_multiproc:
+                # MultiProc client returns rebuild info directly
+                model_parameters_rebuild_info = self.client.get_model_parameters(
+                    vllm_config=self.vllm_config,
+                    device_id=torch.cuda.current_device()
+                )
+            else:
+                # Dynamo client is async
+                loop = asyncio.get_event_loop()
+                model_parameters_rebuild_info = loop.run_until_complete(
+                    self.client.get_model_parameters()
+                )
         except Exception as e:
-            raise RuntimeError(f"Error getting tensor rebuild info: {e}") from e
+            raise RuntimeError(
+                f"Error getting tensor rebuild info: {e}") from e
 
         logger.info(
             "Retrieved rebuild info for %d parameters",
             len(model_parameters_rebuild_info)
         )
 
-        # Reconstruct and yield each tensor
+        # Reconstruct and yield each tensor - same for both backends
         for name, rebuild_info in model_parameters_rebuild_info.items():
             try:
                 parameter = self.client.reconstruct_parameter(rebuild_info)
@@ -169,7 +216,8 @@ class IPCModelLoader(BaseModelLoader):
 
                 yield name, parameter
             except Exception as e:
-                logger.error("Failed to reconstruct parameter %s: %s", name, e)
+                logger.error(
+                    "Failed to reconstruct parameter %s: %s", name, e)
                 raise RuntimeError(
                     f"Failed to reconstruct parameter {name}: {e}") from e
 
@@ -236,7 +284,13 @@ class IPCModelLoader(BaseModelLoader):
 
     def __del__(self):
         """Clean up the client connection when the loader is destroyed."""
-        if hasattr(self, "runtime") and self.runtime is not None:
+        if hasattr(self, "use_multiproc") and self.use_multiproc:
+            # Clean up MultiProc client
+            if hasattr(self, "client") and self.client is not None:
+                with contextlib.suppress(Exception):
+                    self.client.close()
+        else:
             # Dynamo runtime cleanup happens automatically when it goes
             # out of scope
-            pass
+            if hasattr(self, "runtime") and self.runtime is not None:
+                pass

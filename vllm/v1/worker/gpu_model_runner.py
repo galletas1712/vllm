@@ -725,15 +725,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                arange,
                out=positions_np)
 
-        # Debug logging - check for state corruption
-        import logging
-        logger = logging.getLogger(__name__)
-        # Check if this is the first request after warm spare activation
-
-        logger.info(f"Debug positions: first 10 values = {positions_np[:10]}")
-        logger.info(f"Debug num_computed_tokens: {self.input_batch.num_computed_tokens_cpu[:num_reqs]}")
-        logger.info(f"Debug arange: first 10 values = {arange[:10]}")
-
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1954,10 +1945,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         This clears any stale state left over from dummy runs during
         initialization (e.g., CUDA graph capture, warmup).
         """
-        # Log state before reset for debugging
-        import traceback
-        logger.info(f"Resetting InputBatch state (called from: {traceback.extract_stack()[-2].name})")
-        logger.info(f"Before reset - num_computed_tokens[0:5]: {self.input_batch.num_computed_tokens_cpu[:5]}")
         
         # Reset num_computed_tokens to zero for all slots
         self.input_batch.num_computed_tokens_cpu.fill(0)
@@ -1969,8 +1956,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.input_batch.req_id_to_index.clear()
         # Clear cached request states
         self.requests.clear()
-        
-        logger.info(f"After reset - num_computed_tokens[0:5]: {self.input_batch.num_computed_tokens_cpu[:5]}")
     
     def recreate_persistent_buffers(self) -> None:
         """Recreate persistent CUDA buffers after two-phase finalization.
