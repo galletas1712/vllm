@@ -3,7 +3,6 @@
 
 """Simple companion client for GPU workers to retrieve model parameters."""
 
-import os
 import pickle
 from typing import Optional
 
@@ -11,6 +10,7 @@ import torch
 import zmq
 
 from vllm.config import VllmConfig
+from vllm.config.companion import CompanionConfig
 from vllm.distributed import get_world_group
 from vllm.logger import init_logger
 from vllm.companion.messages import (
@@ -28,20 +28,19 @@ class MultiProcCompanionClient:
     companion servers.
     """
     
-    def __init__(self, coordinator_address: Optional[str] = None):
+    def __init__(self, companion_config: CompanionConfig):
         """
         Initialize the client.
         
         Args:
-            coordinator_address: Address of coordinator
-                (e.g., "tcp://127.0.0.1:5555")
-                If None, will use VLLM_COMPANION_COORDINATOR_ADDRESS
+            companion_config: CompanionConfig object containing coordinator address
+                and other companion settings.
         """
-        self.coordinator_address = coordinator_address or os.environ.get(
-            "VLLM_COMPANION_COORDINATOR_ADDRESS")
+        if not companion_config or not companion_config.coordinator_address:
+            raise ValueError("CompanionConfig with coordinator_address is required")
         
-        if not self.coordinator_address:
-            raise ValueError("No coordinator address provided")
+        self.companion_config = companion_config
+        self.coordinator_address = companion_config.coordinator_address
         
         # ZMQ context and socket
         self.context = zmq.Context()
@@ -67,19 +66,45 @@ class MultiProcCompanionClient:
         if device_id is None:
             device_id = torch.cuda.current_device()
         
-        # Get rank information from world group (must be initialized)
+        # Get rank information from the distributed environment
+        # Send local TP/PP rank and let companion server handle DP adjustment
+        # This makes it consistent with how workers are initialized
         world_group = get_world_group()
-        local_rank = world_group.rank
-        global_rank = world_group.rank
-        world_size = world_group.world_size
+        wg_rank = world_group.rank
+        wg_world_size = world_group.world_size
         
-        # Create request with rank info (same as Dynamo client)
+        tp_pp_world_size = vllm_config.parallel_config.world_size
+        
+        # For companions, we pass the local TP/PP rank and world size
+        # The companion server will handle DP adjustment in parallel_state
+        if wg_world_size == tp_pp_world_size:
+            # World group is TP*PP only (no DP adjustment yet)
+            local_tp_pp_rank = wg_rank
+            local_tp_pp_world = wg_world_size
+        else:
+            # World group already includes DP
+            # Extract the local TP/PP rank by undoing DP adjustment
+            dp_rank = vllm_config.parallel_config.data_parallel_rank
+            local_tp_pp_rank = wg_rank - (dp_rank * tp_pp_world_size)
+            local_tp_pp_world = tp_pp_world_size
+
+        # Use physical device id for local_rank (for logging/device selection)
+        local_rank = device_id if device_id is not None else local_tp_pp_rank
+
+        logger.info(
+            "[COMPANION-CLIENT] Sending local TP/PP rank=%d (TP*PP world=%d) "
+            "DP rank=%d to companion for DP adjustment",
+            local_tp_pp_rank, local_tp_pp_world,
+            vllm_config.parallel_config.data_parallel_rank)
+        
+        # Create request with local TP/PP rank info
+        # Companion server will handle DP adjustment like workers do
         request = GetModelParametersRequest(
             vllm_config=vllm_config,
             device_id=device_id,
             local_rank=local_rank,
-            global_rank=global_rank,
-            world_size=world_size
+            global_rank=local_tp_pp_rank,  # Pass local TP/PP rank
+            world_size=local_tp_pp_world    # Pass TP*PP world size
         )
         
         # Send request and get response
@@ -157,6 +182,3 @@ class MultiProcCompanionClient:
         self.context.term()
 
 
-def create_multiproc_companion_client() -> MultiProcCompanionClient:
-    """Create a companion client using environment configuration."""
-    return MultiProcCompanionClient()

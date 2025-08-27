@@ -293,7 +293,7 @@ class Worker(LocalOrDistributedWorkerBase):
             self.cache_config.gpu_memory_utilization
         
         # Calculate available memory for KV cache
-        if self.load_config.enable_ipc_loading:
+        if self.load_config.enable_companion_process:
             # With IPC loading, the model server has already allocated memory
             # for weights. We should only subtract the torch memory increase
             # from this process, not the non_torch_increase which includes
@@ -339,7 +339,7 @@ class Worker(LocalOrDistributedWorkerBase):
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
 
-        if self.load_config.enable_ipc_loading:
+        if self.load_config.enable_companion_process:
             msg = (f"Memory profiling takes {result.profile_time:.2f} seconds\n"
                    "IPC loading enabled - using free GPU memory for calculation\n"
                    "free_gpu_memory "

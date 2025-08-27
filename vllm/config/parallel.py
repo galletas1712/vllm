@@ -56,7 +56,11 @@ class ParallelConfig:
     data_parallel_rpc_port: int = 29550
     """Port for data parallel messaging."""
     data_parallel_master_port: int = 29500
-    """Port of the data parallel master."""
+    """Port of the data parallel master (base port for primary workers)."""
+    warm_spare_port_offset: int = 100
+    """Port offset for warm spare workers (shadows primary workers with this offset)."""
+    process_type: str = "primary_worker"
+    """Type of process: primary_worker, warm_spare_worker, primary_companion."""
     data_parallel_backend: str = "mp"
     """Backend to use for data parallel, either "mp" or "ray"."""
     data_parallel_external_lb: bool = False
@@ -147,7 +151,7 @@ class ParallelConfig:
         including data parallelism."""
         return self.world_size * self.data_parallel_size
 
-    def get_next_dp_init_port(self) -> int:
+    def get_next_dp_init_port(self, offset: int = 0) -> int:
         """
         We might need to initialize process groups in multiple
         processes that is related to data parallelism,
@@ -155,8 +159,12 @@ class ParallelConfig:
         can live in different processes. To avoid port conflicts, we
         increment the port number each time we need to initialize a
         new process group related to data parallelism.
+        
+        Args:
+            offset: Optional offset to add to the port number.
+                    Used by companion processes to avoid conflicts.
         """
-        answer = self.data_parallel_master_port
+        answer = self.data_parallel_master_port + offset
         self.data_parallel_master_port += 1
         return answer
 
@@ -175,12 +183,17 @@ class ParallelConfig:
 
         max_retries = 5
         last_exc: Optional[Exception] = None
-        for _ in range(max_retries):
+        
+        # Use a fixed port for EngineCore DP group (base-1) to avoid conflicts
+        # with primary workers' phase 1 (base+0) and phase 2 (base+1)
+        dp_group_port = self.data_parallel_master_port - 1
+        
+        for retry in range(max_retries):
             try:
                 # use gloo since the engine process might not have cuda device
                 return stateless_init_torch_distributed_process_group(
                     self.data_parallel_master_ip,
-                    self.get_next_dp_init_port(),
+                    dp_group_port,
                     self.data_parallel_rank,
                     self.data_parallel_size,
                     backend="gloo")
@@ -188,7 +201,10 @@ class ParallelConfig:
                 # We only want to retry when the root cause is EADDRINUSE.
                 if "EADDRINUSE" in str(e):
                     logger.warning(
-                        "Address already in use. Retrying with a new port.")
+                        f"Address already in use (port {dp_group_port}). "
+                        f"Retrying with a new port (attempt {retry + 1}/{max_retries}).")
+                    # Try with a different offset
+                    dp_group_port = self.data_parallel_master_port - 10 - retry
                     last_exc = e
                     continue  # try again with a new port
                 raise e

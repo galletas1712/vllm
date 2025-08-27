@@ -94,25 +94,22 @@ class MultiProcCoordinator:
         return companion
     
     async def handle_client_request(self, client_id: bytes, message: bytes):
-        """Route client request to appropriate companion."""
+        """Route client request to appropriate companion.
+
+        Note: For DP/EP, requests may carry a global world_size across DP to
+        enable correct rank mapping on the companion side. We no longer use
+        world_size to gate/batch local forwarding because a single local
+        coordinator should not wait for remote ranks it cannot observe. Gloo
+        rendezvous in the companion processes provides the necessary global
+        synchronization.
+        """
         import pickle
         
         # Decode the request to get device_id
         request = pickle.loads(message)
         device_id = request.device_id
         
-        # Check if this is a model loading request that needs coordination
-        world_size = getattr(request, 'world_size', 1)
-        if world_size > 1:
-            # This is a distributed initialization - collect all requests
-            self.pending_init_requests[device_id] = (client_id, message)
-            
-            # If we have all expected requests, broadcast them together
-            if len(self.pending_init_requests) == world_size:
-                await self._broadcast_init_requests()
-            return
-        
-        # For non-distributed requests, handle normally
+        # Always forward immediately. Global sync happens inside companions.
         await self._forward_single_request(client_id, message, device_id)
     
     async def _broadcast_init_requests(self):

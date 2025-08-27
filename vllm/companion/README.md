@@ -25,7 +25,7 @@ The MultiProc Companion System allows multiple vLLM processes to share model wei
 
 ## How It Works
 
-1. **Startup**: When vLLM starts with `enable_ipc_loading=True`, the coordinator automatically starts
+1. **Startup**: When vLLM starts with `enable_companion_process=True`, the coordinator automatically starts
 2. **Companion Creation**: Coordinator starts one companion server per GPU
 3. **Weight Sharing**: GPU workers request weights from companions via CUDA IPC
 4. **Memory Efficiency**: Multiple workers share the same GPU memory for model weights
@@ -44,7 +44,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 
 engine_args = AsyncEngineArgs(
     model="meta-llama/Llama-2-7b-hf",
-    enable_ipc_loading=True,  # Enables companion system
+    enable_companion_process=True,  # Enables companion system
 )
 
 engine = AsyncLLM.from_engine_args(engine_args)

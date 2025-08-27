@@ -104,7 +104,7 @@ def register_model_loader(load_format: str):
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     # Check if IPC loading is enabled
-    if load_config.enable_ipc_loading:
+    if load_config.enable_companion_process:
         from vllm.model_executor.model_loader.ipc_loader import IPCModelLoader
         return IPCModelLoader(load_config)
 

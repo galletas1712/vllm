@@ -628,32 +628,38 @@ def launch_core_engines(
     else:
         coordinator = None
     
-    # Start companion coordinator if IPC loading is enabled (rank 0 only)
+    # Start companion coordinator if IPC loading is enabled
     companion_coordinator = None
-    if vllm_config.load_config.enable_ipc_loading and (
-            dp_rank == 0 or offline_mode):
+    if vllm_config.load_config.enable_companion_process:
         use_multiproc = os.environ.get("VLLM_IPC_USE_MULTIPROC", "1") == "1"
         
         if use_multiproc:
-            from vllm.companion.multiproc_coordinator import run_coordinator
-            from vllm.utils import get_open_port
+            # Get the coordinator port from config
+            coordinator_port = vllm_config.companion_config.coordinator_port
             
-            coordinator_port = get_open_port()
-            # Get companion_master_port from config
-            companion_master_port = (
-                vllm_config.load_config.companion_master_port)
-            companion_coordinator = Process(
-                target=run_coordinator,
-                args=(coordinator_port, companion_master_port),
-                name="CompanionCoordinator"
-            )
-            companion_coordinator.start()
-            
-            os.environ["VLLM_COMPANION_COORDINATOR_ADDRESS"] = \
+            # All ranks set the address in their config
+            vllm_config.companion_config.coordinator_address = \
                 f"tcp://127.0.0.1:{coordinator_port}"
             
-            logger.info("Started companion coordinator on port %d",
-                       coordinator_port)
+            # Only rank 0 actually starts the coordinator
+            if dp_rank == 0 or offline_mode:
+                from vllm.companion.multiproc_coordinator import run_coordinator
+                
+                # Get companion_master_port from config
+                companion_master_port = (
+                    vllm_config.companion_config.companion_master_port)
+                companion_coordinator = Process(
+                    target=run_coordinator,
+                    args=(coordinator_port, companion_master_port),
+                    name="CompanionCoordinator"
+                )
+                companion_coordinator.start()
+                
+                logger.info("Started companion coordinator on port %d",
+                           coordinator_port)
+            else:
+                logger.info("Using companion coordinator at %s (started by rank 0)",
+                           vllm_config.companion_config.coordinator_address)
 
     if parallel_config.data_parallel_backend == "ray":
         logger.info("Starting ray-based data parallel backend")

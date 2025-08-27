@@ -191,7 +191,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                        output_partition_sizes: list[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
-        if get_current_vllm_config().load_config.enable_ipc_loading:
+        if get_current_vllm_config().load_config.enable_companion_process:
             weight = UninitializedParameterFromTensor()
         else:
             weight = Parameter(torch.empty(sum(output_partition_sizes),

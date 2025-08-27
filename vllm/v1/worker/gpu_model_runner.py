@@ -1960,7 +1960,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def recreate_persistent_buffers(self) -> None:
         """Recreate persistent CUDA buffers after two-phase finalization.
         
-        This is needed because during two-phase init with non-device mode,
+        This is needed because during two-phase init with fake mode,
         the buffers may get corrupted by fake collective operations.
         We recreate them here with the same sizes and properties.
         
@@ -2547,7 +2547,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
-        # If we're in non-device mode (two-phase init), skip profiling
+        # If we're in fake mode (two-phase init), skip profiling
         # We'll do it later after torch.compile but before CUDA graph capture
         from vllm.distributed.parallel_state import IS_FAKE_DISTRIBUTED
         if IS_FAKE_DISTRIBUTED():

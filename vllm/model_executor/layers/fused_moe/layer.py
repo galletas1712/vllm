@@ -284,7 +284,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                        hidden_size: int, intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
         # Fused gate_up_proj (column parallel)
-        if get_current_vllm_config().load_config.enable_ipc_loading:
+        if get_current_vllm_config().load_config.enable_companion_process:
             w13_weight = UninitializedParameterFromTensor()
         else:
             w13_weight = torch.nn.Parameter(torch.empty(
@@ -304,7 +304,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             layer.register_parameter("w13_bias", w13_bias)
             set_weight_attrs(w13_bias, extra_weight_attrs)
         # down_proj (row parallel)
-        if get_current_vllm_config().load_config.enable_ipc_loading:
+        if get_current_vllm_config().load_config.enable_companion_process:
             w2_weight = UninitializedParameterFromTensor()
         else:
             w2_weight = torch.nn.Parameter(torch.empty(

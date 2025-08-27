@@ -27,6 +27,7 @@ import gc
 import pickle
 import weakref
 from collections import namedtuple
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from multiprocessing import shared_memory
@@ -46,18 +47,18 @@ from vllm.logger import init_logger
 from vllm.utils import (direct_register_custom_op, get_distributed_init_method,
                         resolve_obj_by_qualname, supports_custom_op)
 
-# Backend constant for non-device mode
+# Backend constant for fake mode
 FAKE_DISTRIBUTED_BACKEND = "fake_distributed"
 
-# Global state for non-device mode
+# Global state for fake mode
 _IS_FAKE_DISTRIBUTED = False
 
 def IS_FAKE_DISTRIBUTED() -> bool:
-    """Check if parallel state is in non-device mode."""
+    """Check if parallel state is in fake mode."""
     return _IS_FAKE_DISTRIBUTED
 
 def set_fake_distributed_mode(enabled: bool) -> None:
-    """Set the non-device mode state."""
+    """Set the fake mode state."""
     global _IS_FAKE_DISTRIBUTED
     _IS_FAKE_DISTRIBUTED = enabled
 
@@ -164,7 +165,7 @@ def _prune_dead_groups() -> None:
 
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
-    # In non-device mode (precompile), avoid device comms entirely.
+    # In fake mode (precompile), avoid device comms entirely.
     if IS_FAKE_DISTRIBUTED():
         return all_reduce_fake(tensor, group_name)
     group_name = _resolve_group_name(group_name)
@@ -178,11 +179,11 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
 def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     """Fake implementation for all_reduce during torch.compile tracing.
     
-    During non-device mode (two-phase init), this returns a tensor with the same
+    During fake mode (two-phase init), this returns a tensor with the same
     shape and properties as the input, allowing torch.compile to trace through
     without actually performing communication.
     """
-    # During non-device mode, just return a copy to maintain graph structure
+    # During fake mode, just return a copy to maintain graph structure
     if IS_FAKE_DISTRIBUTED():
         # Return a tensor with same properties but allow gradient flow
         return tensor.clone()
@@ -208,7 +209,7 @@ def reduce_scatter_fake(tensor: torch.Tensor, dim: int, world_size: int,
     new_shape = list(tensor.shape)
     new_shape[dim] = tensor.shape[dim] // world_size
     if IS_FAKE_DISTRIBUTED():
-        # During non-device mode, return a properly shaped slice
+        # During fake mode, return a properly shaped slice
         # This maintains the correct tensor properties for tracing
         slices = [slice(None)] * tensor.ndim
         slices[dim] = slice(0, new_shape[dim])
@@ -234,7 +235,7 @@ def all_gather_fake(tensor: torch.Tensor, dim: int, world_size: int,
     new_shape = list(tensor.shape)
     new_shape[dim] = tensor.shape[dim] * world_size
     if IS_FAKE_DISTRIBUTED():
-        # During non-device mode, return a repeated tensor
+        # During fake mode, return a repeated tensor
         # This maintains the correct tensor properties for tracing
         repeats = [1] * tensor.ndim
         repeats[dim] = world_size
@@ -946,7 +947,7 @@ class GroupCoordinator:
             return hidden_states
 
 
-class NonDeviceGroupCoordinator(GroupCoordinator):
+class FakeGroupCoordinator(GroupCoordinator):
     """
     A "dry" GroupCoordinator for simulation purposes.
     
@@ -1032,16 +1033,16 @@ class NonDeviceGroupCoordinator(GroupCoordinator):
 
         When functional collectives are available, specific collectives
         are implemented below to enable Dynamo tracing/compilation in
-        non-device mode without invoking device communicators.
+        fake mode without invoking device communicators.
         """
         raise NotImplementedError(
             f"{op_name} is not supported in CPUGroupCoordinator.")
         
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        # Use custom ops during non-device mode for torch.compile compatibility
+        # Use custom ops during fake mode for torch.compile compatibility
         if self.world_size == 1:
             return input_
-        # Always use custom ops in non-device mode
+        # Always use custom ops in fake mode
         # The fake implementation will handle this correctly
         return torch.ops.vllm.all_reduce(
             input_, group_name=self.unique_name)
@@ -1173,7 +1174,7 @@ def get_world_group() -> GroupCoordinator:
 def init_world_group(ranks: list[int], local_rank: int,
                      backend: str) -> GroupCoordinator:
     if _IS_FAKE_DISTRIBUTED:
-        return NonDeviceGroupCoordinator(
+        return FakeGroupCoordinator(
             group_ranks=[ranks],
             local_rank=local_rank,
             torch_distributed_backend=backend,
@@ -1200,7 +1201,7 @@ def init_model_parallel_group(
 ) -> GroupCoordinator:
 
     if _IS_FAKE_DISTRIBUTED:
-        return NonDeviceGroupCoordinator(
+        return FakeGroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
@@ -1308,10 +1309,10 @@ def init_distributed_environment(
         "distributed_init_method=%s backend=%s", world_size, rank, local_rank,
         distributed_init_method, backend)
     
-    # Set non-device mode based on backend
+    # Set fake mode based on backend
     if backend == FAKE_DISTRIBUTED_BACKEND:
         set_fake_distributed_mode(True)
-        # Use gloo backend for non-device since we only need CPU communication
+        # Use gloo backend for fake since we only need CPU communication
         backend = "gloo"
     else:
         set_fake_distributed_mode(False)
@@ -1319,16 +1320,41 @@ def init_distributed_environment(
     from vllm.config import get_current_vllm_config
     config = get_current_vllm_config()
     if config is not None and config.parallel_config.data_parallel_size > 1:
-        assert not _IS_FAKE_DISTRIBUTED, (
-            "Data parallel is not supported in non-device mode")
+        # Allow DP in both device and fake mode
+        # Adjust rank and world size for data parallelism
         parallel_config = config.parallel_config
-        # adjust to take into account data parallelism
-        # offset the rank by the data parallel rank
+        # Offset the rank by DP rank and expand world size across DP.
         rank = parallel_config.data_parallel_rank * world_size + rank
-        # adjust the world size to take into account data parallelism
         world_size = parallel_config.world_size_across_dp
+        
+        # Use the configured DP init method if explicitly provided,
+        # otherwise synthesize one
         ip = parallel_config.data_parallel_master_ip
-        port = parallel_config.get_next_dp_init_port()
+        process_type = parallel_config.process_type
+        
+        # Choose the appropriate port based on process type
+        # Port allocation strategy:
+        # - EngineCore DP group: base-1 (fixed, never changes)
+        # - Primary workers: base+0 for phase 1, base+1 for phase 2
+        # - Warm spare workers: base+100 for phase 1, base+1 for phase 2 (when promoted)
+        # - Companion processes: base+200, base+201, etc.
+        
+        if process_type == "warm_spare_worker":
+            # Warm spare workers use base+100 for phase 1
+            # For phase 2, the process_type is temporarily cleared in finalize_two_phase_init
+            # so they fall through to use primary worker ports (base+1)
+            offset = parallel_config.warm_spare_port_offset
+            port = parallel_config.data_parallel_master_port + offset
+            logger.info(f"Warm spare using phase 1 port: {port}")
+        elif process_type == "primary_companion":
+            # Companion processes use offset of 200 from base
+            # Both primary and warm spare workers share these companions
+            port = parallel_config.get_next_dp_init_port(offset=200)
+        else:
+            # Primary workers use no offset
+            # They will use base+0 for phase 1, base+1 for phase 2
+            port = parallel_config.get_next_dp_init_port()
+        
         distributed_init_method = get_distributed_init_method(ip, port)
         logger.info(
             "Adjusting world_size=%d rank=%d distributed_init_method=%s for DP",
@@ -1604,10 +1630,11 @@ def destroy_distributed_environment():
         _WORLD.destroy()
     _WORLD = None
     _NODE_COUNT = None
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
     # Reset non-device mode state
     set_fake_distributed_mode(False)
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):

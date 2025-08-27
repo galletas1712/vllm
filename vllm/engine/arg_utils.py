@@ -436,10 +436,7 @@ class EngineArgs:
     # DEPRECATED
     enable_prompt_adapter: bool = False
 
-    enable_ipc_loading: bool = LoadConfig.enable_ipc_loading
-    ipc_server_address: str = LoadConfig.ipc_server_address
-    ipc_req_port: str = LoadConfig.ipc_req_port
-    ipc_sub_port: str = LoadConfig.ipc_sub_port
+    enable_companion_process: bool = LoadConfig.enable_companion_process
     use_warm_spare: bool = LoadConfig.use_warm_spare
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
@@ -569,14 +566,9 @@ class EngineArgs:
                                 **load_kwargs["use_tqdm_on_load"])
         load_group.add_argument('--pt-load-map-location',
                                 **load_kwargs["pt_load_map_location"])
-        load_group.add_argument("--enable-ipc-loading",
-                                **load_kwargs["enable_ipc_loading"])
-        load_group.add_argument("--ipc-server-address",
-                                **load_kwargs["ipc_server_address"])
-        load_group.add_argument("--ipc-req-port",
-                                **load_kwargs["ipc_req_port"])
-        load_group.add_argument("--ipc-sub-port",
-                                **load_kwargs["ipc_sub_port"])
+        load_group.add_argument("--enable-companion-process",
+                                dest="enable_companion_process",
+                                **load_kwargs["enable_companion_process"])
         load_group.add_argument("--use-warm-spare",
                                 **load_kwargs["use_warm_spare"])
 
@@ -978,10 +970,7 @@ class EngineArgs:
             ignore_patterns=self.ignore_patterns,
             use_tqdm_on_load=self.use_tqdm_on_load,
             pt_load_map_location=self.pt_load_map_location,
-            enable_ipc_loading=self.enable_ipc_loading,
-            ipc_server_address=self.ipc_server_address,
-            ipc_req_port=self.ipc_req_port,
-            ipc_sub_port=self.ipc_sub_port,
+            enable_companion_process=self.enable_companion_process,
             use_warm_spare=self.use_warm_spare,
         )
 
@@ -1340,6 +1329,10 @@ class EngineArgs:
             collect_detailed_traces=self.collect_detailed_traces,
         )
 
+        from vllm.config import CompanionConfig
+        
+        companion_config = CompanionConfig()
+        
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1349,6 +1342,7 @@ class EngineArgs:
             lora_config=lora_config,
             speculative_config=speculative_config,
             load_config=load_config,
+            companion_config=companion_config,
             decoding_config=decoding_config,
             observability_config=observability_config,
             compilation_config=self.compilation_config,

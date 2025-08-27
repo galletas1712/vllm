@@ -10,7 +10,10 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import parallel_state
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.distributed.parallel_state import FAKE_DISTRIBUTED_BACKEND
+from vllm.distributed.parallel_state import (
+    FAKE_DISTRIBUTED_BACKEND,
+    init_distributed_environment
+)
 from vllm.model_executor.parameter import UninitializedParameterFromTensor
 from vllm.companion.messages import CUDATensorRebuildInfo
 from vllm.utils import get_distributed_init_method
@@ -31,13 +34,13 @@ def override_vllm_config(
         device_config=vllm_config.device_config,
         load_config=vllm_config.load_config,
     )
-    # Override load config for non-device run on SPECIFIED device
+    # Override load config for fake run on SPECIFIED device
     # NOTE: we use device_id and not local_rank because we assume CUDA_VISIBLE_DEVICES is not set
     # local_rank would come from the client view which may not be correct
     new_vllm_config.load_config.device = torch.device(f"cuda:{device_id}")
 
     # We want to load the model for real here
-    new_vllm_config.load_config.enable_ipc_loading = False
+    new_vllm_config.load_config.enable_companion_process = False
     
     return new_vllm_config
 
@@ -89,7 +92,7 @@ class ModelInstanceManager:
         
         # Create model loader
         assert self.vllm_config.load_config is not None
-        assert self.vllm_config.load_config.enable_ipc_loading is False
+        assert self.vllm_config.load_config.enable_companion_process is False
         
         logger.info(
             "[MODEL-LOAD] Creating DefaultModelLoader with load_config:\n"
@@ -161,10 +164,10 @@ class ModelInstanceManager:
         )
 
     def _initialize_fake_distributed_environment(self):
-        """Initialize distributed environment in non-device mode for correct weight loading."""
+        """Initialize distributed environment in fake mode for correct weight loading."""
         logger.info(
             "[DIST-INIT] Starting companion shadow process initialization:\n"
-            "  local_rank=%d, global_rank=%d, world_size=%d\n"
+            "  local_rank=%d, rank=%d (TP/PP), world_size=%d (TP/PP)\n"
             "  TP=%d, PP=%d, DP=%d, Expert Parallel enabled=%s\n"
             "  companion_master_port=%d",
             self.local_rank, self.global_rank, self.world_size,
@@ -183,8 +186,9 @@ class ModelInstanceManager:
         logger.info(
             "[DIST-INIT] About to call parallel_state.init_distributed_environment:\n"
             "  init_method=%s\n"
-            "  backend=%s (will use gloo for non-device run)\n"
-            "  world_size=%d, rank=%d, local_rank=%d",
+            "  backend=%s (will use gloo for fake run)\n"
+            "  world_size=%d (TP*PP), rank=%d (TP/PP), local_rank=%d\n"
+            "  DP adjustment will be handled by parallel_state",
             init_method,
             FAKE_DISTRIBUTED_BACKEND,
             self.world_size,
@@ -202,9 +206,23 @@ class ModelInstanceManager:
                 torch.distributed.get_world_size() if torch.distributed.is_initialized() else -1,
             )
         
-        logger.info("[DIST-INIT] Calling parallel_state.init_distributed_environment NOW...")
+        # Set the process type in the config
+        # This determines which DP port to use for rendezvous
+        if self.vllm_config and self.vllm_config.parallel_config:
+            # Determine if this is a warm spare companion based on context
+            # (This would need to be passed from the coordinator)
+            is_warm_spare = getattr(self, 'is_warm_spare', False)
+            if is_warm_spare:
+                self.vllm_config.parallel_config.process_type = "warm_spare_companion"
+            else:
+                self.vllm_config.parallel_config.process_type = "primary_companion"
+
+        # Set the current vLLM config so init_distributed_environment can access it
+        set_current_vllm_config(self.vllm_config)
         
-        parallel_state.init_distributed_environment(
+        logger.info("[DIST-INIT] Calling init_distributed_environment NOW...")
+        
+        init_distributed_environment(
             world_size=self.world_size,
             rank=self.global_rank,
             distributed_init_method=init_method,
@@ -282,7 +300,7 @@ class ModelInstanceManager:
         )
 
         logger.info(
-            "[DIST-INIT] ✅ COMPLETE - Non-device distributed environment initialized successfully:\n"
+            "[DIST-INIT] ✅ COMPLETE - fake distributed environment initialized successfully:\n"
             "  local_rank=%d, global_rank=%d, world_size=%d\n"
             "  TP=%d (rank %d), PP=%d (rank %d), DP=%d (rank %d), EP=%d (rank %d)",
             self.local_rank,

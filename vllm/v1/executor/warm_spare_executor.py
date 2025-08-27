@@ -6,6 +6,19 @@ Warm Spare Executor for resilient worker management with IPC loading.
 This executor maintains "warm spare" workers that are partially initialized
 (model loaded via IPC but no KV cache) alongside primary workers. On failure
 or reinitialize request, it switches from primary to warm spare workers.
+
+Architecture:
+- Port allocation uses consistent offsets:
+  - Primary workers: base_port + 0, base_port + 1 (two-phase init)
+  - Warm spares: base_port + 100, base_port + 101 (two-phase init with offset)
+  - Companions: base_port + 200, base_port + 201, etc.
+- Warm spares share companion processes with primary workers
+  - This ensures only one copy of model weights on GPU (via IPC)
+  - Both primary and warm spare workers connect to same companions
+- Each DP rank creates its own warm spare worker(s)
+- Proper synchronization ensures ports can be safely reused:
+  - Barriers and RPC sync ensure old processes release ports before new ones use them
+  - Port counter is reset after promotion to allow port reuse
 """
 import os
 import signal
@@ -19,7 +32,6 @@ from dataclasses import dataclass
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils import get_distributed_init_method, get_loopback_ip, get_open_port
 from vllm.v1.executor.multiproc_executor import (
     MultiprocExecutor, WorkerProc, WorkerProcHandle, UnreadyWorkerProcHandle
 )
@@ -55,10 +67,10 @@ class WarmSpareExecutor(MultiprocExecutor):
     
     def __init__(self, vllm_config: VllmConfig):
         # Check prerequisites
-        if not vllm_config.load_config.enable_ipc_loading:
+        if not vllm_config.load_config.enable_companion_process:
             raise ValueError(
                 "WarmSpareExecutor requires IPC loading to be enabled. "
-                "Set --enable-ipc-loading or load_config.enable_ipc_loading=True"
+                "Set --enable-ipc-loading or load_config.enable_companion_process=True"
             )
         
         # Enable two-phase initialization
@@ -69,8 +81,14 @@ class WarmSpareExecutor(MultiprocExecutor):
         self.switching_to_warm_spare = False
         self.warm_spare_recovery_occurred = False
         
+        # Track the primary worker port for reuse when promoting warm spares
+        self.primary_distributed_init_port = None
+        
         # Worker monitoring  
         self.rpc_timeout = DEFAULT_RPC_TIMEOUT
+        
+        # DP coordination callback (set by EngineCore if in DP mode)
+        self.dp_warm_spare_callback = None
         
         super().__init__(vllm_config)
         
@@ -116,7 +134,13 @@ class WarmSpareExecutor(MultiprocExecutor):
         if not self.warm_spares_initialized:
             logger.debug("Skipping monitor start - warm spares not yet initialized")
             return
-            
+        
+        # Prevent duplicate monitors during recovery
+        if getattr(self, '_monitor_active', False):
+            logger.debug("Monitor already active, skipping duplicate start")
+            return
+        
+        self._monitor_active = True
         workers = self.workers
         self_ref = weakref.ref(self)
 
@@ -126,6 +150,7 @@ class WarmSpareExecutor(MultiprocExecutor):
             died = multiprocessing.connection.wait(sentinels)
             _self = self_ref()
             if not _self or getattr(_self, 'shutting_down', False):
+                _self._monitor_active = False
                 return
                 
             # Find which worker died
@@ -135,6 +160,9 @@ class WarmSpareExecutor(MultiprocExecutor):
             
             logger.error("Worker proc %s (idx %d) died unexpectedly, "
                         "attempting warm spare recovery...", proc_name, failed_idx)
+            
+            # Mark monitor as inactive before recovery attempt
+            _self._monitor_active = False
             
             # Attempt warm spare recovery
             recovery_successful = _self._attempt_warm_spare_recovery(failed_idx)
@@ -148,10 +176,8 @@ class WarmSpareExecutor(MultiprocExecutor):
                 if callback is not None:
                     _self.failure_callback = None
                     callback()
-            else:
-                logger.info("Successfully recovered using warm spares")
-                # Start monitoring the new workers
-                _self.start_worker_monitor()
+            # Note: Don't restart monitor here for DP case
+            # The monitor will be restarted after the actual switch completes
 
         Thread(target=monitor_workers,
                daemon=True,
@@ -172,9 +198,27 @@ class WarmSpareExecutor(MultiprocExecutor):
         logger.info("Creating warm spare workers in background...")
         
         try:
-            # Get new distributed init method for warm spares
-            distributed_init_method = get_distributed_init_method(
-                get_loopback_ip(), get_open_port())
+            # Warm spares share companion processes with primary workers
+            # This ensures only one copy of model weights exists on GPU
+            if self.vllm_config.load_config.enable_companion_process:
+                use_multiproc = os.environ.get("VLLM_IPC_USE_MULTIPROC", "1") == "1"
+                
+                if use_multiproc:
+                    # Verify companion coordinator address is set
+                    primary_coordinator_address = self.vllm_config.companion_config.coordinator_address
+                    
+                    if primary_coordinator_address:
+                        logger.info("Warm spares will share companion processes at %s", 
+                                   primary_coordinator_address)
+                        # The address will be copied to warm spare configs via deep copy
+                    else:
+                        logger.error("Companion coordinator address not found in config!")
+                        raise RuntimeError("Cannot create warm spares without companion coordinator")
+            
+            # Warm spares shadow primary workers with a port offset
+            # The distributed_init_method will be set automatically in parallel_state.py
+            # when it detects process_type == "warm_spare_worker"
+            distributed_init_method = None
             
             # Create scheduler output handle for warm spares
             max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
@@ -182,21 +226,56 @@ class WarmSpareExecutor(MultiprocExecutor):
                 self.world_size, self.world_size, max_chunk_bytes=max_chunk_bytes)
             warm_spare_scheduler_handle = self.warm_spare_rpc_mq.export_handle()
             
-            # Create warm spare workers
-            # Set environment variable to indicate these are warm spares
-            os.environ["VLLM_WARM_SPARE_WORKER"] = "1"
+            # Create warm spare workers with proper DP configuration
+            # Each engine process only creates its own warm spare worker(s)
             unready_warm_spares: list[UnreadyWorkerProcHandle] = []
-            for rank in range(self.world_size):
+            
+            import copy
+            
+            # Determine which warm spare workers this engine process should create
+            # In DP mode, each engine process creates warm spares for its DP rank only
+            dp_size = self.vllm_config.parallel_config.data_parallel_size
+            if dp_size > 1:
+                # Each engine process creates warm spares for its own DP rank
+                # The warm spare will have the same dp_rank as this engine
+                my_dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+                logger.info("Engine DP rank %d creating its warm spare workers",
+                           my_dp_rank)
+            else:
+                # No DP, single engine creates all warm spares
+                my_dp_rank = 0
+            
+            # Create warm spare workers for all ranks in this TP/PP group
+            # but with the dp_rank of this engine process
+            for rank_within_tp_pp in range(self.world_size):
+                # Create a copy of vllm_config with proper settings for warm spares
+                warm_spare_config = copy.deepcopy(self.vllm_config)
+                
+                # Set process type to warm_spare_worker
+                warm_spare_config.parallel_config.process_type = "warm_spare_worker"
+                
+                # Warm spare inherits the dp_rank from this engine process
+                warm_spare_config.parallel_config.data_parallel_rank = my_dp_rank
+                
+                # Verify the dp_rank is set correctly
+                assert warm_spare_config.parallel_config.data_parallel_rank == my_dp_rank, \
+                    f"DP rank mismatch: expected {my_dp_rank}, got {warm_spare_config.parallel_config.data_parallel_rank}"
+                
+                logger.info("Engine DP rank %d creating warm spare: rank_within_tp_pp=%d, dp_rank=%d, dp_size=%d",
+                           my_dp_rank, rank_within_tp_pp, my_dp_rank,
+                           warm_spare_config.parallel_config.data_parallel_size)
+                
+                # Warm spares share companion processes with primary workers
+                
+                # Pass the rank within TP/PP group, not global rank
                 unready_warm_spares.append(
                     WorkerProc.make_worker_process(
-                        vllm_config=self.vllm_config,
-                        local_rank=rank,
-                        rank=rank,
+                        vllm_config=warm_spare_config,
+                        local_rank=rank_within_tp_pp,  # Local rank within the node
+                        rank=rank_within_tp_pp,  # Rank within TP/PP group (DP handled by parallel_state)
                         distributed_init_method=distributed_init_method,
                         input_shm_handle=warm_spare_scheduler_handle,
                     ))
-            # Clear the environment variable after creating workers
-            os.environ.pop("VLLM_WARM_SPARE_WORKER", None)
             
             # Wait for warm spares to be ready
             self.warm_spare_workers = WorkerProc.wait_for_ready(unready_warm_spares)
@@ -292,11 +371,69 @@ class WarmSpareExecutor(MultiprocExecutor):
             
         return responses
         
+    def set_dp_warm_spare_callback(self, callback: Callable[[], bool]):
+        """Set callback for DP-wide warm spare coordination.
+        
+        Args:
+            callback: Function to call when warm spare switch is needed in DP setup
+        """
+        self.dp_warm_spare_callback = callback
+        logger.info("DP warm spare callback registered")
+    
+    def execute_warm_spare_switch(self) -> bool:
+        """Execute warm spare switch when commanded by EngineCore.
+        
+        This is called when EngineCore coordinates DP-wide switch.
+        """
+        logger.info("Executing warm spare switch on EngineCore command")
+        
+        # Clear the queued flag now that we're actually executing
+        self._warm_spare_switch_queued = False
+        
+        # Don't attempt if we're shutting down
+        if getattr(self, 'shutting_down', False):
+            logger.info("System is shutting down, skipping warm spare switch")
+            return False
+            
+        if self.switching_to_warm_spare:
+            logger.warning("Already switching to warm spare")
+            return True  # Consider it success if already switching
+            
+        if not self.warm_spares_initialized:
+            logger.warning("Warm spares not ready yet")
+            # Wait for warm spares to be ready
+            logger.info("Waiting for warm spares to initialize...")
+            for i in range(60):  # Wait up to 60 seconds
+                time.sleep(1)
+                if self.warm_spares_initialized:
+                    logger.info(f"Warm spares ready after {i+1} seconds")
+                    break
+            else:
+                logger.error("Warm spares failed to initialize in time")
+                return False
+        
+        # Terminate primary workers and switch to warm spares
+        self._terminate_all_primary_workers()
+        
+        try:
+            success = self._switch_to_warm_spares_internal()
+            if success:
+                # Restart monitor after successful switch
+                logger.info("Warm spare switch successful, restarting worker monitor")
+                self.start_worker_monitor()
+            return success
+        except Exception as e:
+            logger.error(f"Exception during warm spare switch: {e}")
+            logger.exception("Full traceback:")
+            return False
+    
     def _attempt_warm_spare_recovery(self, failed_worker_idx: int) -> bool:
         """Attempt to recover from worker failure using warm spares.
         
+        For DP setups, coordinates with all DP ranks to switch together.
+        
         Returns:
-            bool: True if recovery successful, False otherwise
+            bool: True if recovery successful (or queued), False otherwise
         """
         # Don't attempt recovery if we're shutting down
         if getattr(self, 'shutting_down', False):
@@ -307,32 +444,43 @@ class WarmSpareExecutor(MultiprocExecutor):
             logger.warning("Already switching to warm spare")
             return False
             
-        if not self.warm_spares_initialized:
-            logger.warning(f"Worker {failed_worker_idx} failed but warm spares not ready yet")
-            # Wait for warm spares to be ready - we need them for failover
-            logger.info("Waiting for warm spares to initialize...")
-            for i in range(60):  # Wait up to 60 seconds
-                time.sleep(1)
-                if self.warm_spares_initialized:
-                    logger.info(f"Warm spares ready after {i+1} seconds")
-                    break
-            else:
-                logger.error("Warm spares failed to initialize in time")
-                return False
-                
-        logger.info(f"Worker {failed_worker_idx} failure detected - "
-                   f"switching ALL {len(self.workers)} workers to warm spares")
-        
-        # Immediately terminate ALL primary workers to prevent NCCL hangs
-        self._terminate_all_primary_workers()
-        
-        # Now switch to warm spares
-        try:
-            return self._switch_to_warm_spares_internal()
-        except Exception as e:
-            logger.error(f"Exception during warm spare recovery: {e}")
-            logger.exception("Full traceback:")
-            return False
+        # Prevent monitor from restarting while switch is pending
+        if getattr(self, '_warm_spare_switch_queued', False):
+            logger.debug("Warm spare switch already queued, waiting for execution")
+            return False  # Return false to prevent monitor restart
+            
+        # Check if we need DP-wide coordination
+        if self.dp_warm_spare_callback is not None:
+            # This is a DP setup - coordinate with all ranks
+            logger.info(f"Worker {failed_worker_idx} failed in DP setup - "
+                       f"initiating DP-wide warm spare switch across all ranks")
+            try:
+                # The callback now queues the switch and returns immediately
+                result = self.dp_warm_spare_callback()
+                if result:
+                    # Mark that switch is queued to prevent monitor restarts
+                    self._warm_spare_switch_queued = True
+                    logger.info("Warm spare switch queued for next sync point")
+                    # Return True to indicate recovery is in progress
+                    # Monitor won't restart because we removed that in monitor_workers
+                    return True
+                else:
+                    logger.error("Failed to queue warm spare switch")
+                    return False
+            except Exception as e:
+                logger.error(f"DP warm spare coordination failed: {e}")
+                # Fall back to local recovery if DP coordination fails
+                logger.info("Falling back to local warm spare recovery")
+                return self.execute_warm_spare_switch()
+        else:
+            # Non-DP case: proceed with local recovery immediately
+            logger.info(f"Worker {failed_worker_idx} failed (non-DP) - "
+                       f"switching ALL {len(self.workers)} workers to warm spares locally")
+            success = self.execute_warm_spare_switch()
+            if success:
+                # Restart monitor for non-DP case
+                self.start_worker_monitor()
+            return success
         
     def _switch_to_warm_spares_internal(self) -> bool:
         """Internal method to perform the warm spare switch.
@@ -373,6 +521,9 @@ class WarmSpareExecutor(MultiprocExecutor):
             self.warm_spare_workers = []
             self.warm_spares_initialized = False
             
+            # Keep the warm spare companion coordinator environment variable
+            # since we're reusing the primary coordinator and future warm spares may need it
+            
             # MessageQueue doesn't have a close method - cleanup happens on GC
             # Just let the old queue be garbage collected
             del old_rpc_mq
@@ -385,11 +536,35 @@ class WarmSpareExecutor(MultiprocExecutor):
             self.switching_to_warm_spare = False
             logger.info("Successfully switched to warm spare workers - engine can now serve")
             
+            # No need to reset port counter anymore - we use fixed ports:
+            # - Promoted workers now use base+1 for their phase 2
+            # - New warm spares will use base+100 for their phase 1
+            # The port allocation is handled by parallel_state.py based on process_type
+            
             # Create new warm spares in background - non-blocking
             # The engine continues serving while new warm spares are created
-            logger.info("Starting new warm spare creation in background")
+            # IMPORTANT: Ensure promoted workers have fully released their old ports
+            # before creating new warm spares that will use those same ports
+            def create_new_warm_spares_with_sync():
+                try:
+                    # Use barrier to ensure all promoted workers have completed cleanup
+                    # The promoted workers just destroyed their phase 1 distributed group
+                    logger.info("Ensuring promoted workers have released old ports...")
+                    
+                    # Call a synchronization method on promoted workers to ensure cleanup
+                    # This will block until all workers confirm they've released resources
+                    self.collective_rpc("synchronize_after_promotion", timeout=10)
+                    logger.info("All promoted workers confirmed port cleanup complete")
+                    
+                    logger.info("Creating new warm spare workers...")
+                    self._create_warm_spare_workers()
+                except Exception as e:
+                    logger.error(f"Failed to create new warm spares: {e}")
+                    logger.warning("Continuing without new warm spares - failover will not be available")
+            
+            logger.info("Starting new warm spare creation in background (with synchronization)")
             threading.Thread(
-                target=self._create_warm_spare_workers,
+                target=create_new_warm_spares_with_sync,
                 daemon=True,
                 name="WarmSpareCreator"
             ).start()
@@ -464,10 +639,15 @@ class WarmSpareExecutor(MultiprocExecutor):
         
         try:
             # Phase 4: Finalize two-phase init (switch to real distributed)
-            # This also calls recreate_persistent_buffers() to ensure fresh CPU/GPU
-            # buffers with correct initialization - critical for position encoding
+            # Promoted warm spares keep their process_type as "warm_spare_worker"
+            # but will use base+1 for phase 2 (detected by torch.distributed.is_initialized())
+            
             logger.info("Finalizing two-phase init for warm spares...")
-            self._collective_rpc_warm_spares("finalize_two_phase_init", timeout=60)
+            logger.info("Promoted warm spares will use base+1 for phase 2 (same as primary workers)")
+            self._collective_rpc_warm_spares(
+                "finalize_two_phase_init", 
+                timeout=60
+            )
             
             # Check if we should skip memory profiling for faster failover
             skip_memory_profiling = os.environ.get(
@@ -555,7 +735,7 @@ class WarmSpareExecutor(MultiprocExecutor):
                 non_block=non_block,
                 unique_reply_rank=unique_reply_rank
             )
-        except (TimeoutError, FutureTimeoutError) as e:
+        except (TimeoutError, FutureTimeoutError):
             logger.error(f"Collective RPC {method} timed out after {timeout}s")
             
             # Attempt to switch to warm spares
@@ -584,6 +764,9 @@ class WarmSpareExecutor(MultiprocExecutor):
         
         if hasattr(self, 'monitoring_enabled'):
             self.monitoring_enabled = False
+        
+        # No need to shutdown companion coordinator as warm spares reuse the primary one
+        # The primary executor handles companion coordinator lifecycle
         
         # Shutdown warm spare workers
         if hasattr(self, 'warm_spare_workers'):

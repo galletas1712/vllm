@@ -31,6 +31,7 @@ import vllm.envs as envs
 from vllm import version
 from vllm.config.cache import (BlockSize, CacheConfig, CacheDType,
                                PrefixCachingHashAlgo)
+from vllm.config.companion import CompanionConfig
 from vllm.config.compilation import (CompilationConfig, CompilationLevel,
                                      PassConfig)
 from vllm.config.parallel import DistributedExecutorBackend, ParallelConfig
@@ -1795,19 +1796,9 @@ class LoadConfig:
     in dictionary needs to be double quoted for json parsing. For more details,
     see original doc for `map_location` in https://pytorch.org/docs/stable/generated/torch.load.html
     """
-    enable_ipc_loading: bool = False
-    """Whether to enable loading model weights via IPC from a model server."""
-    ipc_server_address: str = "localhost"
-    """Address of the IPC model server."""
-    ipc_req_port: str = "5556"
-    """Port for REQ-REP socket of the IPC model server."""
-    ipc_sub_port: str = "5557"
-    """Port for PUB-SUB socket of the IPC model server."""
-    companion_master_port: int = 55700
-    """Master port for companion process CPU group initialization. Used when
-    enable_ipc_loading is True with MultiProc companion backend. Even though
-    companions use fake distributed for device ops, they need real CPU groups
-    (gloo backend) for node detection, which requires a network port."""
+    enable_companion_process: bool = False
+    """Whether to enable loading model weights via IPC using companion 
+    processes."""
     use_warm_spare: bool = False
     """Whether to use warm spare workers for resilience. Requires IPC loading
     to be enabled. Warm spare workers are partially initialized (model loaded
@@ -3294,6 +3285,8 @@ class VllmConfig:
     """Device configuration."""
     load_config: LoadConfig = field(default_factory=LoadConfig)
     """Load configuration."""
+    companion_config: CompanionConfig = field(default_factory=CompanionConfig)
+    """Companion process configuration."""
     lora_config: Optional[LoRAConfig] = None
     """LoRA configuration."""
     speculative_config: Optional[SpeculativeConfig] = None

@@ -219,7 +219,7 @@ class Worker(WorkerBase):
             # When using IPC loading, we don't need to allocate memory for model weights
             # as they are already loaded by the model server. Skip the strict check
             # since we'll do proper accounting after model loading.
-            if self.load_config.enable_ipc_loading:
+            if self.load_config.enable_companion_process:
                 logger.info(
                     "IPC loading enabled: Skipping initial memory check. "
                     "Free memory: %.2f GiB, Total: %.2f GiB, Requested: %.2f GiB",
@@ -242,15 +242,15 @@ class Worker(WorkerBase):
                 f"Not support device type: {self.device_config.device}")
         
         if use_two_phase:
-            # Initialize with NonDeviceGroupCoordinator
+            # Initialize with FakeGroupCoordinator
             logger.info(
-                "Init: creating non-device distributed groups "
+                "Init: creating fake distributed groups "
                 "(two-phase enabled)")
             init_worker_distributed_environment(
                 self.vllm_config, self.rank,
                 self.distributed_init_method,
                 self.local_rank,
-                backend=FAKE_DISTRIBUTED_BACKEND  # Use non-device backend
+                backend=FAKE_DISTRIBUTED_BACKEND  # Use fake backend
             )
             # Store flag to complete initialization later
             self._two_phase_init_pending = True
@@ -293,7 +293,7 @@ class Worker(WorkerBase):
             self.model_runner.reload_weights()
 
     def precompile_model(self) -> None:
-        """Pre-compile (torch.compile) in non-device env during two-phase.
+        """Pre-compile (torch.compile) in fake env during two-phase.
 
         Runs dummy forwards to trigger compilation for configured sizes only.
         Does not capture CUDA graphs or finalize distributed state.
@@ -376,7 +376,7 @@ class Worker(WorkerBase):
         # If we're in two-phase init mode, skip profiling for now
         # It will be done after compilation in compile_or_warm_up_model
         from vllm.distributed.parallel_state import IS_FAKE_DISTRIBUTED
-        assert not IS_FAKE_DISTRIBUTED(), "Memory profiling should not be called in non-device mode"
+        assert not IS_FAKE_DISTRIBUTED(), "Memory profiling should not be called in fake mode"
         
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -402,7 +402,7 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container.")
         # Calculate available memory for KV cache
-        if self.load_config.enable_ipc_loading:
+        if self.load_config.enable_companion_process:
             # With IPC loading, the model server has already allocated memory
             # for weights. We should only subtract the torch memory increase
             # from this process, not the non_torch_increase which includes
@@ -435,7 +435,7 @@ class Worker(WorkerBase):
             available_kv_cache_memory = self.requested_memory \
                 - profile_result.non_kv_cache_memory
 
-        if self.load_config.enable_ipc_loading:
+        if self.load_config.enable_companion_process:
             logger.debug(
                 "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
                 "using free memory * %.2f = %.2f GiB for KV cache calculation",
@@ -472,6 +472,68 @@ class Worker(WorkerBase):
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
+
+    def synchronize_after_promotion(self) -> None:
+        """Synchronize after being promoted from warm spare to primary.
+        
+        This ensures all promoted workers have completed their cleanup
+        (destroyed old distributed groups, released ports) before the
+        executor creates new warm spares that will use those same ports.
+        """
+        # Ensure distributed cleanup is complete  
+        if torch.distributed.is_initialized():
+            try:
+                # Barrier to ensure all promoted workers reach this point
+                torch.distributed.barrier()
+            except Exception as e:
+                logger.warning(f"Barrier failed during promotion sync: {e}")
+        
+        # Wait for the warm spare ports to be actually available
+        # Only rank 0 tests the port to avoid conflicts
+        import socket
+        import time
+        
+        if hasattr(self.vllm_config, 'parallel_config'):
+            base_port = self.vllm_config.parallel_config.data_parallel_master_port
+            warm_spare_offset = self.vllm_config.parallel_config.warm_spare_port_offset
+            warm_spare_port = base_port + warm_spare_offset  # Port that new warm spares will use
+            
+            # Only rank 0 checks port availability to avoid conflicts
+            if torch.distributed.get_rank() == 0:
+                # Check if warm spare phase 1 port (base+100) is available for new warm spares
+                # This port should be free after promoted workers switched to base+1 for phase 2
+                ports_to_check = [
+                    (warm_spare_port, "new warm spare phase 1"),
+                ]
+                
+                for port, description in ports_to_check:
+                    max_retries = 50  # 5 seconds max (100ms per retry)
+                    for retry in range(max_retries):
+                        try:
+                            # Try to bind to the port to check if it's free
+                            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                            test_socket.bind(('', port))
+                            test_socket.close()
+                            # Port is available!
+                            logger.info(f"Port {port} confirmed available for {description}")
+                            break
+                        except OSError as e:
+                            # Port still in use or TIME_WAIT, retry
+                            if retry == max_retries - 1:
+                                logger.warning(f"Port {port} still unavailable for {description}: {e}")
+                            else:
+                                time.sleep(0.1)  # Wait 100ms before retry
+            
+            # All ranks synchronize after port check
+            if torch.distributed.is_initialized():
+                try:
+                    torch.distributed.barrier()
+                except Exception as e:
+                    logger.warning(f"Post-port-check barrier failed: {e}")
+        
+        logger.info("Promotion synchronization complete")
+        
     def finalize_two_phase_init(
             self,
             new_distributed_init_method: Optional[str] = None) -> None:
@@ -487,6 +549,13 @@ class Worker(WorkerBase):
                     torch.distributed.barrier()
 
             logger.info("Init: switching to real distributed groups")
+            
+            # For warm spares doing phase 2, temporarily clear process_type
+            # so they use primary worker ports (base+1) instead of warm spare ports
+            original_process_type = self.vllm_config.parallel_config.process_type
+            if original_process_type == "warm_spare_worker":
+                logger.info("Warm spare phase 2: using primary worker port allocation")
+                self.vllm_config.parallel_config.process_type = None
 
             # Override init method if provided
             if new_distributed_init_method:
@@ -496,7 +565,7 @@ class Worker(WorkerBase):
             # Re-init under current vLLM config context
             from vllm.config import set_current_vllm_config
             with set_current_vllm_config(self.vllm_config):
-                # Destroy non-device groups
+                # Destroy fake groups
                 if model_parallel_is_initialized():
                     destroy_model_parallel()
                 destroy_distributed_environment()
@@ -512,6 +581,12 @@ class Worker(WorkerBase):
                 self._two_phase_init_pending = False
                 # Track that we did two-phase init
                 self._did_two_phase_init = True
+                
+                # Restore original process_type if we temporarily cleared it
+                if 'original_process_type' in locals() and original_process_type == "warm_spare_worker":
+                    self.vllm_config.parallel_config.process_type = original_process_type
+                    logger.info("Restored warm spare process type after phase 2")
+                
                 logger.info("Init: two-phase complete")
 
             # Ensure all ranks have re-initialized before proceeding
@@ -523,10 +598,14 @@ class Worker(WorkerBase):
             # invalid after recreating persistent buffers. It's safer to
             # disable it and fall back to NCCL for CUDA graph capture.
             from vllm.distributed.parallel_state import get_tp_group
-            assert get_tp_group().device_communicator.ca_comm is None, "Custom all-reduce should be disabled after two-phase init"
+            tp_group = get_tp_group()
+            if hasattr(tp_group, 'device_communicator') and tp_group.device_communicator:
+                # Force disable custom all-reduce
+                tp_group.device_communicator.ca_comm = None
+                logger.info("Disabled custom all-reduce after two-phase init")
             
             # Recreate persistent buffers that may have been corrupted
-            # during non-device mode operations
+            # during fake mode operations
             if hasattr(self, 'model_runner'):
                 self.model_runner.recreate_persistent_buffers()
 
@@ -845,7 +924,7 @@ def init_worker_distributed_environment(
 ) -> None:
     """Initialize the distributed environment.
     
-    If backend is FAKE_DISTRIBUTED_BACKEND, initializes with NonDeviceGroupCoordinator
+    If backend is FAKE_DISTRIBUTED_BACKEND, initializes with FakeGroupCoordinator
     for two-phase initialization support.
     """
     parallel_config = vllm_config.parallel_config

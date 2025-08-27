@@ -82,7 +82,7 @@ class EngineCore:
         # Setup Model.
         # Use WarmSpareExecutor if warm spare mode is enabled and IPC loading
         # is enabled
-        if self.use_warm_spare and vllm_config.load_config.enable_ipc_loading:
+        if self.use_warm_spare and vllm_config.load_config.enable_companion_process:
             from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
             # Override executor_class to use WarmSpareExecutor
             executor_class = WarmSpareExecutor
@@ -109,7 +109,7 @@ class EngineCore:
         logger.info("Init stage: load model weights")
         self.collective_rpc("load_model")
 
-        # 3) Pre-compile model in non-device (fake) distributed env
+        # 3) Pre-compile model in fake (fake) distributed env
         logger.info("Init stage: compile model (pre-NCCL)")
         self.collective_rpc("precompile_model")
 
@@ -310,22 +310,29 @@ class EngineCore:
         
         logger.info("Processing warm spare recovery - cleaning up pre-failover state")
         
+        # Clear any pending batches in the batch queue if pipeline parallelism is enabled
+        if self.batch_queue is not None:
+            # Drain the batch queue of any in-flight requests
+            drained_count = 0
+            while not self.batch_queue.empty():
+                try:
+                    self.batch_queue.get_nowait()
+                    self.batch_queue.task_done()
+                    drained_count += 1
+                except queue.Empty:
+                    break
+            if drained_count > 0:
+                logger.info(f"Drained {drained_count} pending batches from batch queue")
+        
         # Collect all pre-failover request IDs
         pre_failover_request_ids = []
         for request in self.scheduler.running:
             pre_failover_request_ids.append(request.request_id)
         
         # Check waiting queue for pre-failover requests
-        waiting_requests = []
-        while self.scheduler.waiting:
-            req = self.scheduler.waiting.pop_request()
-            waiting_requests.append(req)
-        
-        # All requests currently in queues existed before recovery
-        for req in waiting_requests:
+        # We iterate directly without modifying the queue to preserve ordering
+        for req in self.scheduler.waiting:
             pre_failover_request_ids.append(req.request_id)
-            # Put them back temporarily
-            self.scheduler.waiting.add_request(req)
         
         # Abort all pre-failover requests to clear their corrupted state
         if pre_failover_request_ids:
@@ -487,7 +494,28 @@ class EngineCore:
         return self.model_executor.is_sleeping
 
     def execute_dummy_batch(self):
-        self.model_executor.collective_rpc("execute_dummy_batch")
+        # Check for pending warm spare switch before trying to communicate with workers
+        if hasattr(self, 'dp_group') and self.dp_group and self.dp_group.has_pending_operations():
+            ops = self.dp_group.get_pending_operations()
+            for op in ops:
+                if op["operation"] == "warm_spare_switch":
+                    logger.warning(f"DP rank {getattr(self, '_dp_rank', 'unknown')}: "
+                                 "Skipping dummy batch due to pending warm spare switch")
+                    return
+        
+        try:
+            self.model_executor.collective_rpc("execute_dummy_batch")
+        except Exception as e:
+            # Check again if we have a pending warm spare switch
+            if hasattr(self, 'dp_group') and self.dp_group and self.dp_group.has_pending_operations():
+                ops = self.dp_group.get_pending_operations()
+                for op in ops:
+                    if op["operation"] == "warm_spare_switch":
+                        logger.warning(f"DP rank {getattr(self, '_dp_rank', 'unknown')}: "
+                                     f"Dummy batch failed with {e}, but warm spare switch pending")
+                        return
+            # Otherwise re-raise
+            raise
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)
@@ -520,7 +548,11 @@ class EngineCore:
                                                   kwargs)
     
     def switch_to_warm_spares(self) -> None:
-        """Switch from primary workers to warm spare workers."""
+        """Switch from primary workers to warm spare workers.
+        
+        For DP > 1, this needs to be coordinated across all DP ranks
+        to maintain synchronization.
+        """
         if self.use_warm_spare:
             from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
             if isinstance(self.model_executor, WarmSpareExecutor):
@@ -876,8 +908,20 @@ class EngineCoreProc(EngineCore):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
-            req = self.input_queue.get()
-            self._handle_client_request(*req)
+            
+            # Use a timeout to periodically check for pending warm spare switches
+            # This prevents deadlock when a worker dies while we're idle
+            from queue import Empty
+            try:
+                req = self.input_queue.get(timeout=0.5)  # 500ms timeout
+                self._handle_client_request(*req)
+            except Empty:
+                # Timeout occurred - this is expected when idle
+                # Check if we need warm spare switch (for DPEngineCoreProc)
+                if hasattr(self, '_check_global_warm_spare_needed'):
+                    if self._check_global_warm_spare_needed():
+                        # Exit input processing to let main loop handle the switch
+                        break
 
         if waited:
             logger.debug("EngineCore loop active.")
@@ -889,14 +933,36 @@ class EngineCoreProc(EngineCore):
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
+        
+        # Check for warm spare switch before trying to execute
+        # This prevents hanging on dead workers
+        if hasattr(self, 'dp_group') and self.dp_group and self.dp_group.has_pending_operations():
+            ops = self.dp_group.get_pending_operations()
+            for op in ops:
+                if op["operation"] == "warm_spare_switch":
+                    logger.warning(f"DP rank {self._dp_rank}: Detected pending warm spare switch "
+                                 "before engine step, skipping step")
+                    return False  # Don't execute, let main loop handle it
 
-        # Step the engine core.
-        outputs, model_executed = self.step_fn()
-        # Put EngineCoreOutputs into the output queue.
-        for output in (outputs.items() if outputs else ()):
-            self.output_queue.put_nowait(output)
-
-        return model_executed
+        try:
+            # Step the engine core.
+            outputs, model_executed = self.step_fn()
+            # Put EngineCoreOutputs into the output queue.
+            for output in (outputs.items() if outputs else ()):
+                self.output_queue.put_nowait(output)
+            return model_executed
+        except Exception as e:
+            # If we get an error during execution, it might be due to dead workers
+            # Check if we have a pending warm spare switch
+            if hasattr(self, 'dp_group') and self.dp_group and self.dp_group.has_pending_operations():
+                ops = self.dp_group.get_pending_operations()
+                for op in ops:
+                    if op["operation"] == "warm_spare_switch":
+                        logger.warning(f"DP rank {self._dp_rank}: Engine step failed with {e}, "
+                                     "but warm spare switch pending, returning False")
+                        return False
+            # Otherwise re-raise
+            raise
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
@@ -921,6 +987,25 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(
                 (client_idx, EngineCoreOutputs(utility_output=output)))
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
+            # For DP > 1, we need to coordinate warm spare recovery
+            # across all DP ranks
+            if hasattr(self, 'dp_rank') and self.use_warm_spare:
+                logger.error(f"Executor failed on DP rank {self.dp_rank}, "
+                            "initiating coordinated warm spare recovery")
+                # Notify coordinator of failure if we have one
+                if self.has_coordinator:
+                    self.output_queue.put_nowait(
+                        (-1, EngineCoreOutputs(executor_failed=True)))
+                # Attempt local warm spare recovery
+                try:
+                    self.switch_to_warm_spares()
+                    logger.info(f"DP rank {self.dp_rank} successfully switched "
+                               "to warm spares")
+                    # Don't raise - we recovered
+                    return
+                except Exception as e:
+                    logger.error(f"Warm spare recovery failed on DP rank "
+                                f"{self.dp_rank}: {e}")
             raise RuntimeError("Executor failed.")
         else:
             logger.error("Unrecognized input request type encountered: %s",
@@ -1097,12 +1182,26 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter = 0
         self.current_wave = 0
         self.last_counts = (0, 0)
+        
+        # Warm spare coordination state
+        self._warm_spare_switch_pending = False
+        self._warm_spare_switch_in_progress = False
+        self._dp_rank = vllm_config.parallel_config.data_parallel_rank
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         super().__init__(vllm_config, local_client, handshake_address,
                          executor_class, log_stats, client_handshake_address,
                          dp_rank)
+        
+        # Set up warm spare coordination callback if using WarmSpareExecutor
+        # This needs to be done after parent init creates the executor
+        from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
+        if isinstance(self.model_executor, WarmSpareExecutor):
+            self.model_executor.set_dp_warm_spare_callback(
+                self._coordinate_dp_warm_spare_switch
+            )
+            logger.info(f"DP rank {self._dp_rank}: Warm spare coordination callback registered")
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
 
@@ -1124,12 +1223,28 @@ class DPEngineCoreProc(EngineCoreProc):
                          vllm_config.kv_transfer_config.engine_id)
 
         self.dp_rank = dp_rank
-        self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
+        base_pg = vllm_config.parallel_config.stateless_init_dp_group()
+        
+        # Wrap in fault-tolerant process group for resilience
+        from vllm.distributed.fault_tolerant_group import FaultTolerantProcessGroup
+        self.dp_group = FaultTolerantProcessGroup(
+            base_pg, 
+            dp_rank,
+            vllm_config.parallel_config.data_parallel_size,
+            default_timeout=30.0
+        )
 
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
-            stateless_destroy_torch_distributed_process_group(dp_group)
+            # Destroy the fault-tolerant wrapper
+            if hasattr(dp_group, 'destroy'):
+                dp_group.destroy()
+            else:
+                # Fallback for non-wrapped process groups
+                from vllm.distributed.utils import (
+                    stateless_destroy_torch_distributed_process_group)
+                stateless_destroy_torch_distributed_process_group(dp_group)
 
     def add_request(self, request: Request, request_wave: int = 0):
         if self.has_coordinator and request_wave != self.current_wave:
@@ -1176,6 +1291,14 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
+            # 0) FIRST: Check if ANY rank needs warm spare switch
+            # This uses all-reduce to detect failures across all ranks
+            if self._check_global_warm_spare_needed():
+                logger.info(f"DP rank {self._dp_rank}: Global warm spare switch detected")
+                self._execute_deferred_warm_spare_switch()
+                # After switching, continue to next iteration
+                continue
+            
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 
@@ -1213,19 +1336,151 @@ class DPEngineCoreProc(EngineCoreProc):
                 self.current_wave += 1
                 self.step_counter = 0
 
+    def _coordinate_dp_warm_spare_switch(self) -> bool:
+        """
+        Queue a warm spare switch request to be handled at the next sync point.
+        This avoids deadlock from asynchronous worker failures.
+        """
+        logger.info(f"DP rank {self._dp_rank} detected worker failure, marking warm spare switch needed")
+        
+        # Mark that we have a pending warm spare switch
+        # This will be detected in the next _check_global_warm_spare_needed() call
+        self._warm_spare_switch_pending = True
+        
+        # Return True to indicate request was queued successfully
+        # Actual switch will happen at next sync point in run_busy_loop
+        return True
+    
+    def _check_global_warm_spare_needed(self) -> bool:
+        """
+        Check if any DP rank has detected a worker failure and needs warm spare switch.
+        Uses all-reduce with a short timeout to avoid hanging on dead workers.
+        """
+        # If we already know we need a switch, return immediately
+        if self._warm_spare_switch_pending:
+            return True
+            
+        # Check more frequently when idle
+        if not self.scheduler.has_unfinished_requests():
+            # When idle, check every iteration to detect failures quickly
+            pass
+        else:
+            # When busy, check periodically to avoid overhead
+            self.step_counter += 1
+            if self.step_counter % 8 != 0:  # Check more frequently
+                return False
+        
+        import torch
+        
+        # Create tensor with 1 if this rank needs warm spare switch, 0 otherwise
+        local_needs_switch = 1 if self._warm_spare_switch_pending else 0
+        tensor = torch.tensor([local_needs_switch], dtype=torch.int32, device="cpu")
+        
+        # Use MAX reduction to detect if ANY rank needs switch (1 > 0)
+        # Use short timeout to avoid hanging if workers are dead
+        success = self.dp_group.all_reduce(
+            tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            timeout=1.0  # Very short timeout for quick detection
+        )
+        
+        if not success:
+            # If all-reduce fails, it likely means a worker died
+            # Assume we need warm spare switch
+            logger.warning(f"DP rank {self._dp_rank}: All-reduce failed - assuming warm spare switch needed")
+            self._warm_spare_switch_pending = True
+            return True
+        
+        # If any rank needs switch (tensor > 0), all ranks should switch together
+        global_needs_switch = tensor.item() > 0
+        
+        if global_needs_switch and not self._warm_spare_switch_pending:
+            logger.info(f"DP rank {self._dp_rank}: Detected warm spare switch needed by another rank")
+            self._warm_spare_switch_pending = True
+        
+        return global_needs_switch
+    
+    def _execute_deferred_warm_spare_switch(self) -> bool:
+        """
+        Execute the warm spare switch with proper synchronization.
+        Called from the main busy loop at a natural sync point.
+        """
+        logger.info(f"DP rank {self._dp_rank}: Executing deferred warm spare switch")
+        
+        # NOTE: We cannot use barriers here because the dead workers can't participate!
+        # Each rank proceeds independently to switch to warm spares.
+        # The warm spare executor handles the actual switch internally.
+        
+        from vllm.v1.executor.warm_spare_executor import WarmSpareExecutor
+        if not isinstance(self.model_executor, WarmSpareExecutor):
+            logger.error(f"DP rank {self._dp_rank}: Not using WarmSpareExecutor, cannot switch")
+            self._warm_spare_switch_pending = False
+            return False
+            
+        try:
+            logger.info(f"DP rank {self._dp_rank}: Executing local warm spare switch")
+            success = self.model_executor.execute_warm_spare_switch()
+        except Exception as e:
+            logger.error(f"DP rank {self._dp_rank}: Failed to switch to warm spares: {e}")
+            success = False
+        
+        if success:
+            logger.info(f"DP rank {self._dp_rank}: Successfully switched to warm spares")
+            # Handle post-recovery tasks
+            if hasattr(self.model_executor, 'warm_spare_recovery_occurred'):
+                if self.model_executor.warm_spare_recovery_occurred:
+                    self._handle_warm_spare_recovery()
+                    
+            # The EngineCore's DP group remains valid after warm spare switch
+            # because the EngineCore processes themselves don't change - only
+            # the worker processes get swapped. The DP group is for EngineCore-to-EngineCore
+            # communication, not EngineCore-to-Worker communication (which uses RPC).
+            logger.info(f"DP rank {self._dp_rank}: DP group remains valid after warm spare switch")
+        else:
+            logger.error(f"DP rank {self._dp_rank}: Warm spare switch failed")
+        
+        # Clear the pending flag
+        self._warm_spare_switch_pending = False
+        
+        return success
+    
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-
         # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
         if self.step_counter % 32 != 0:
             return True
 
-        return ParallelConfig.has_unfinished_dp(self.dp_group,
-                                                local_unfinished)
+        # Use the underlying process group for the all-reduce
+        # The FaultTolerantProcessGroup wrapper handles timeouts
+        import torch
+        tensor = torch.tensor([local_unfinished], dtype=torch.int32, device="cpu")
+        
+        # Try all-reduce with timeout
+        success = self.dp_group.all_reduce(
+            tensor, 
+            op=torch.distributed.ReduceOp.MAX,
+            timeout=30.0
+        )
+        
+        if not success:
+            logger.warning(f"DP rank {self._dp_rank}: All-reduce timed out, assuming unfinished")
+            return True  # Conservative: assume there are unfinished requests
+            
+        return bool(tensor.item())
 
     def reinitialize_distributed(
             self, reconfig_request: ReconfigureDistributedRequest) -> None:
-        stateless_destroy_torch_distributed_process_group(self.dp_group)
+        # Destroy the fault-tolerant wrapper and underlying process group
+        if hasattr(self.dp_group, 'pg'):
+            # Get the underlying process group from the wrapper
+            from vllm.distributed.utils import (
+                stateless_destroy_torch_distributed_process_group)
+            stateless_destroy_torch_distributed_process_group(self.dp_group.pg)
+        else:
+            # Fallback for non-wrapped process groups
+            from vllm.distributed.utils import (
+                stateless_destroy_torch_distributed_process_group)
+            stateless_destroy_torch_distributed_process_group(self.dp_group)
         self.shutdown()
 
         parallel_config = self.vllm_config.parallel_config

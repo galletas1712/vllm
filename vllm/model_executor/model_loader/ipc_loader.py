@@ -69,9 +69,9 @@ class IPCModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
 
-        if not load_config.enable_ipc_loading:
+        if not load_config.enable_companion_process:
             raise ValueError(
-                "IPCModelLoader requires enable_ipc_loading=True in LoadConfig"
+                "IPCModelLoader requires enable_companion_process=True in LoadConfig"
             )
 
         self.client = None  # Will be initialized when we know the model
@@ -92,8 +92,12 @@ class IPCModelLoader(BaseModelLoader):
             if self.use_multiproc:
                 # Initialize MultiProc client
                 try:
-                    self.client = MultiProcCompanionClient()
-                    logger.info("MultiProc companion client initialized")
+                    if not self.vllm_config or not self.vllm_config.companion_config:
+                        raise ValueError("VllmConfig with CompanionConfig is required for IPC loading")
+                    
+                    self.client = MultiProcCompanionClient(self.vllm_config.companion_config)
+                    logger.info("MultiProc companion client initialized with coordinator at: %s",
+                               self.vllm_config.companion_config.coordinator_address)
                 except Exception as e:
                     logger.error(
                         "Error creating MultiProc companion client: %s", e)
