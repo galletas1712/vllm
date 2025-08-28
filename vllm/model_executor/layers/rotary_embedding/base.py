@@ -69,7 +69,13 @@ class RotaryEmbedding(CustomOp):
             positions = positions + offsets
         positions = positions.flatten()
         num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        # Ensure cache device/dtype matches inputs (important for Dynamo fake tensors)
+        cos_sin_cache = self.cos_sin_cache
+        if cos_sin_cache.device != positions.device or \
+                cos_sin_cache.dtype != query.dtype:
+            cos_sin_cache = cos_sin_cache.to(device=positions.device,
+                                             dtype=query.dtype)
+        cos_sin = cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape

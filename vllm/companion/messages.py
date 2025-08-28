@@ -61,6 +61,9 @@ class GetModelParametersRequest:
     local_rank: int
     global_rank: int
     world_size: int
+    # If True, acts as a lightweight health check: server should reply
+    # immediately without attempting model load. Used by IPC validation.
+    ping_only: bool = False
     
     def compute_hash(self) -> str:
         """Compute a hash for this request configuration."""

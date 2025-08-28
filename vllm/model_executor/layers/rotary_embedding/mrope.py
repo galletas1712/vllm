@@ -244,7 +244,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert key is not None
 
         num_tokens = positions.shape[-1]
-        cos_sin = self.cos_sin_cache[positions]
+        # Ensure cache device/dtype matches inputs for Dynamo fake tensor propagation
+        cos_sin_cache = self.cos_sin_cache
+        desired_dtype = query.dtype
+        if cos_sin_cache.device != positions.device or \
+                cos_sin_cache.dtype != desired_dtype:
+            cos_sin_cache = cos_sin_cache.to(device=positions.device,
+                                             dtype=desired_dtype)
+        cos_sin = cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if positions.ndim == 2:
             assert self.mrope_section

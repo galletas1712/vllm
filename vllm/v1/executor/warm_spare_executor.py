@@ -553,8 +553,24 @@ class WarmSpareExecutor(MultiprocExecutor):
                     
                     # Call a synchronization method on promoted workers to ensure cleanup
                     # This will block until all workers confirm they've released resources
-                    self.collective_rpc("synchronize_after_promotion", timeout=10)
+                    # Collect base ports from all promoted workers so we can
+                    # align the engine's base DP port before spawning new warm spares.
+                    base_ports = self.collective_rpc("synchronize_after_promotion", timeout=10)
                     logger.info("All promoted workers confirmed port cleanup complete")
+
+                    # Use the minimum base among ranks to avoid drift.
+                    # (All ranks should agree; min() is a safe convergence.)
+                    if base_ports and isinstance(base_ports, list):
+                        try:
+                            new_base = int(min(base_ports))
+                            old_base = self.vllm_config.parallel_config.data_parallel_master_port
+                            if new_base != old_base:
+                                self.vllm_config.parallel_config.data_parallel_master_port = new_base
+                                logger.info(
+                                    "Updated Engine DP base port from %s to %s before creating warm spares",
+                                    old_base, new_base)
+                        except Exception as e:
+                            logger.warning(f"Failed to reconcile DP base ports from workers: {e}")
                     
                     logger.info("Creating new warm spare workers...")
                     self._create_warm_spare_workers()

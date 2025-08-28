@@ -83,6 +83,90 @@ class IPCModelLoader(BaseModelLoader):
             "IPC model loader initialized with %s backend",
             "MultiProc" if self.use_multiproc else "Dynamo"
         )
+    
+    def _validate_companion_server_availability(self) -> None:
+        """Validate that a companion server exists for the computed physical device.
+        
+        Raises:
+            RuntimeError: If no companion server is available for the target device.
+        """
+        if not self.use_multiproc or not self.client:
+            return  # Skip validation for Dynamo backend
+        
+        # Get current logical device
+        logical_device = torch.cuda.current_device()
+        
+        # Compute physical device ID based on DP rank (same logic as in client)
+        physical_device = logical_device  # Default if no DP
+        if hasattr(self.vllm_config.parallel_config, 'data_parallel_rank'):
+            dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+            tp_pp_size = tp_size * pp_size
+            
+            # Calculate physical device ID
+            physical_device = dp_rank * tp_pp_size + logical_device
+            
+            logger.info(
+                "[IPC-LOADER] Computed physical device mapping: "
+                "logical device %d → physical device %d "
+                "(DP rank=%d, TP=%d, PP=%d)",
+                logical_device, physical_device, dp_rank, tp_size, pp_size
+            )
+        
+        # Check if physical device is valid
+        total_gpus = torch.cuda.device_count()
+        
+        # Note: torch.cuda.device_count() returns the number of *visible* GPUs
+        # after CUDA_VISIBLE_DEVICES is applied. For proper validation, we need
+        # to check against the total system GPUs. We'll use a heuristic here.
+        import os
+        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        if cuda_visible_devices:
+            # Worker has restricted GPU visibility, assume system has more GPUs
+            # We can't validate precisely, but we can warn if it looks wrong
+            visible_gpus = total_gpus
+            # Estimate total system GPUs based on DP configuration
+            estimated_total_gpus = self.vllm_config.parallel_config.data_parallel_size * tp_pp_size
+            logger.info(
+                "[IPC-LOADER] Worker has CUDA_VISIBLE_DEVICES=%s (sees %d GPU(s)). "
+                "Estimated system has %d total GPUs based on DP=%d, TP=%d, PP=%d",
+                cuda_visible_devices, visible_gpus, estimated_total_gpus,
+                self.vllm_config.parallel_config.data_parallel_size, tp_size, pp_size
+            )
+            
+            if physical_device >= estimated_total_gpus:
+                raise RuntimeError(
+                    f"Computed physical device {physical_device} exceeds estimated total GPUs ({estimated_total_gpus}). "
+                    f"This worker with DP rank {dp_rank} and logical device {logical_device} "
+                    f"cannot find a companion server. Check your DP/TP/PP configuration:\n"
+                    f"  - DP size: {self.vllm_config.parallel_config.data_parallel_size}\n"
+                    f"  - TP size: {tp_size}\n"
+                    f"  - PP size: {pp_size}\n"
+                    f"  - DP rank: {dp_rank}\n"
+                    f"  - Expected physical device: {physical_device}\n"
+                    f"  - CUDA_VISIBLE_DEVICES: {cuda_visible_devices}\n"
+                    f"  - Visible GPUs to this worker: {visible_gpus}"
+                )
+        else:
+            # No CUDA_VISIBLE_DEVICES restriction, we see all GPUs
+            if physical_device >= total_gpus:
+                raise RuntimeError(
+                    f"Computed physical device {physical_device} exceeds available GPUs ({total_gpus}). "
+                    f"This worker with DP rank {dp_rank} and logical device {logical_device} "
+                    f"cannot find a companion server. Check your DP/TP/PP configuration:\n"
+                    f"  - DP size: {self.vllm_config.parallel_config.data_parallel_size}\n"
+                    f"  - TP size: {tp_size}\n"
+                    f"  - PP size: {pp_size}\n"
+                    f"  - DP rank: {dp_rank}\n"
+                    f"  - Expected physical device: {physical_device}\n"
+                    f"  - Available GPUs: {total_gpus}"
+                )
+        
+        # Skip ping/healthcheck. Proceed directly; errors will surface on use.
+        logger.debug(
+            "[IPC-LOADER] Skipping companion ping; proceeding directly to model parameter requests"
+        )
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Connect to the model server and wait for model to be ready."""
@@ -98,6 +182,9 @@ class IPCModelLoader(BaseModelLoader):
                     self.client = MultiProcCompanionClient(self.vllm_config.companion_config)
                     logger.info("MultiProc companion client initialized with coordinator at: %s",
                                self.vllm_config.companion_config.coordinator_address)
+                    
+                    # Validate that companion server exists for our device
+                    self._validate_companion_server_availability()
                 except Exception as e:
                     logger.error(
                         "Error creating MultiProc companion client: %s", e)

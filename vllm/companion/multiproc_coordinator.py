@@ -14,6 +14,7 @@ import zmq
 import zmq.asyncio
 
 from vllm.companion.utils import get_free_port
+from vllm.companion.messages import ModelParametersResponse
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -46,9 +47,9 @@ class MultiProcCoordinator:
         self.router_socket: Optional[zmq.asyncio.Socket] = None
         
         # For coordinating distributed initialization
-        self.pending_init_requests: dict = {}  # device_id -> (client_id, message)
-        self.expected_companions = 0
         self.companions_ready = asyncio.Event()  # Set when all companions are ready
+        self.pending_init_requests: dict = {}  # (device_id, client_id) -> (client_id, message, needs_empty_delim)
+        self.distributed_initialized = False
         
         # Shutdown flags
         self.shutdown_event = asyncio.Event()
@@ -93,7 +94,60 @@ class MultiProcCoordinator:
         
         return companion
     
-    async def handle_client_request(self, client_id: bytes, message: bytes):
+    async def _wait_for_companions_ready(self) -> None:
+        """Wait for all companion servers to be ready."""
+        if not self.companions:
+            return
+        
+        max_wait = 30  # Maximum 30 seconds
+        check_interval = 0.1  # Check every 100ms
+        start_time = asyncio.get_event_loop().time()
+        
+        while asyncio.get_event_loop().time() - start_time < max_wait:
+            all_ready = True
+            for device_id, companion in self.companions.items():
+                if not companion.process.is_alive():
+                    logger.warning("Companion for GPU %d died during startup", device_id)
+                    # Restart it
+                    self.start_companion(device_id)
+                    all_ready = False
+                    continue
+                    
+                # Check if companion is responding to pings
+                try:
+                    req_socket = self.context.socket(zmq.REQ)
+                    req_socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout
+                    req_socket.connect(f"tcp://127.0.0.1:{companion.port}")
+                    
+                    # Send a minimal ping request
+                    import pickle
+                    from vllm.companion.messages import GetModelParametersRequest
+                    ping_request = GetModelParametersRequest(
+                        vllm_config=None,  # Will be handled as ping
+                        device_id=device_id,
+                        local_rank=0,
+                        global_rank=0,
+                        world_size=1,
+                        ping_only=True
+                    )
+                    await req_socket.send(pickle.dumps(ping_request))
+                    await req_socket.recv()  # Just check if we get a response
+                    req_socket.close()
+                except Exception:
+                    # Not ready yet
+                    all_ready = False
+                    req_socket.close()
+            
+            if all_ready:
+                logger.info("All companion servers are ready")
+                return
+                
+            await asyncio.sleep(check_interval)
+        
+        raise RuntimeError(f"Companion servers failed to start within {max_wait} seconds")
+    
+    async def handle_client_request(self, client_id: bytes, message: bytes,
+                                   needs_empty_delim: bool):
         """Route client request to appropriate companion.
 
         Note: For DP/EP, requests may carry a global world_size across DP to
@@ -105,56 +159,241 @@ class MultiProcCoordinator:
         """
         import pickle
         
-        # Decode the request to get device_id
-        request = pickle.loads(message)
-        device_id = request.device_id
+        try:
+            # Decode the request to get device_id
+            request = pickle.loads(message)
+            
+            # Handle ping/health check messages
+            if not hasattr(request, 'device_id'):
+                # This is a health check from an empty dict, just respond with success
+                response = pickle.dumps(ModelParametersResponse(
+                    success=True,
+                    model_parameters=None,
+                    error='ping: pong'
+                ))
+                if needs_empty_delim:
+                    await self.router_socket.send_multipart(
+                        [client_id, b"", response])
+                else:
+                    await self.router_socket.send_multipart(
+                        [client_id, response])
+                return
+            
+            # Check if this is a ping request (vllm_config is None and ping_only is True)
+            if hasattr(request, 'ping_only') and request.ping_only and request.vllm_config is None:
+                # This is a proper ping request, respond immediately
+                response = pickle.dumps(ModelParametersResponse(
+                    success=True,
+                    model_parameters=None,
+                    error='ping: pong'
+                ))
+                if needs_empty_delim:
+                    await self.router_socket.send_multipart(
+                        [client_id, b"", response])
+                else:
+                    await self.router_socket.send_multipart(
+                        [client_id, response])
+                return
+            
+            device_id = request.device_id
+        except Exception as e:
+            # Failed to decode request
+            logger.error("Failed to decode request: %s", e)
+            error_response = pickle.dumps(ModelParametersResponse(
+                success=False,
+                model_parameters=None,
+                error=f"Invalid request format: {e}"
+            ))
+            if needs_empty_delim:
+                await self.router_socket.send_multipart(
+                    [client_id, b"", error_response])
+            else:
+                await self.router_socket.send_multipart(
+                    [client_id, error_response])
+            return
         
-        # Always forward immediately. Global sync happens inside companions.
-        await self._forward_single_request(client_id, message, device_id)
-    
-    async def _broadcast_init_requests(self):
-        """Broadcast all pending init requests to companions simultaneously."""
-        tasks = []
-        for device_id, (client_id, message) in self.pending_init_requests.items():
-            task = asyncio.create_task(
-                self._forward_single_request(client_id, message, device_id)
+        # Check if this is a model load request (has vllm_config and not a ping)
+        if hasattr(request, 'vllm_config') and request.vllm_config is not None:
+            # If distributed not initialized yet, this is an init request
+            if not self.distributed_initialized:
+                # Collect init request for broadcast
+                request_key = (device_id, client_id)
+                self.pending_init_requests[request_key] = (client_id, message, needs_empty_delim)
+                
+                # Get unique devices we've collected so far
+                unique_devices = set(key[0] for key in self.pending_init_requests)
+                expected_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                
+                # When we have at least one request per device, broadcast init
+                if len(unique_devices) >= expected_count:
+                    logger.info("Broadcasting %d init requests to %d devices for GLOO rendezvous",
+                               len(self.pending_init_requests), len(unique_devices))
+                    await self._broadcast_init_requests()
+                    self.distributed_initialized = True
+                else:
+                    logger.debug("Collected init request for device %d (%d/%d devices covered)",
+                                device_id, len(unique_devices), expected_count)
+            else:
+                # Distributed already initialized, forward without blocking
+                asyncio.create_task(
+                    self._forward_single_request(client_id, message, device_id,
+                                                 needs_empty_delim)
+                )
+        else:
+            # Not a model load - forward without blocking (e.g., ping requests)
+            asyncio.create_task(
+                self._forward_single_request(client_id, message, device_id,
+                                             needs_empty_delim)
             )
-            tasks.append(task)
+    
+
+    async def _broadcast_init_requests(self):
+        """Broadcast all pending init requests simultaneously.
         
-        # Wait for all to complete
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        This ensures all companion servers enter GLOO rendezvous together
+        for distributed initialization.
+        """
+        if not self.pending_init_requests:
+            return
         
-        # Check if all succeeded
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error("Companion initialization failed: %s", result)
+        # Create all sockets and send tasks first, then await them together
+        # This ensures true simultaneous sending for GLOO rendezvous
+        sockets = []
+        client_infos = []
+        send_tasks = []
         
-        # Mark companions as ready after first successful broadcast
-        if not self.companions_ready.is_set():
-            self.companions_ready.set()
-            logger.info("All companions initialized and ready")
+        for (device_id, client_id), (cid, msg, needs_empty) in self.pending_init_requests.items():
+            companion = self.companions.get(device_id)
+            if not companion or not companion.process.is_alive():
+                # Send error response to client
+                import pickle
+                error_response = pickle.dumps(ModelParametersResponse(
+                    success=False,
+                    model_parameters=None,
+                    error=f"Companion for GPU {device_id} not available"
+                ))
+                if needs_empty:
+                    await self.router_socket.send_multipart(
+                        [cid, b"", error_response])
+                else:
+                    await self.router_socket.send_multipart(
+                        [cid, error_response])
+                continue
+            
+            # Use DEALER socket for async communication
+            dealer_socket = self.context.socket(zmq.DEALER)
+            dealer_socket.connect(f"tcp://127.0.0.1:{companion.port}")
+            
+            # Create send task but don't await yet
+            # DEALER sockets need empty delimiter frame for REP socket compatibility
+            send_task = dealer_socket.send_multipart([b"", msg])
+            
+            sockets.append(dealer_socket)
+            client_infos.append((cid, needs_empty, device_id))
+            send_tasks.append(send_task)
+        
+        # Now await all sends together - this ensures they happen simultaneously
+        await asyncio.gather(*send_tasks)
+        
+        # Now collect all responses using async polling
+        # This allows companions to respond in any order after GLOO completes
+        poller = zmq.asyncio.Poller()
+        for socket in sockets:
+            poller.register(socket, zmq.POLLIN)
+        
+        responses_received = 0
+        socket_to_info = dict(zip(sockets, client_infos))
+        
+        while responses_received < len(sockets):
+            # Poll with timeout to detect stuck companions
+            events = dict(await poller.poll(60000))  # 60 second timeout
+            
+            if not events:
+                logger.error("Timeout waiting for companion responses during init broadcast")
+                # Send error to remaining clients
+                for socket in sockets:
+                    if socket in socket_to_info:
+                        client_id, needs_empty_delim, device_id = socket_to_info[socket]
+                        import pickle
+                        error_response = pickle.dumps(ModelParametersResponse(
+                            success=False,
+                            model_parameters=None,
+                            error=f"Companion for GPU {device_id} timed out during init"
+                        ))
+                        if needs_empty_delim:
+                            await self.router_socket.send_multipart(
+                                [client_id, b"", error_response])
+                        else:
+                            await self.router_socket.send_multipart(
+                                [client_id, error_response])
+                break
+            
+            for socket in events:
+                if events[socket] == zmq.POLLIN:
+                    client_id, needs_empty_delim, device_id = socket_to_info.pop(socket)
+                    try:
+                        # DEALER receives [empty, response]
+                        frames = await socket.recv_multipart()
+                        response = frames[-1]  # Last frame is the actual response
+                        
+                        # Send response back to client
+                        if needs_empty_delim:
+                            await self.router_socket.send_multipart(
+                                [client_id, b"", response])
+                        else:
+                            await self.router_socket.send_multipart(
+                                [client_id, response])
+                    except Exception as e:
+                        logger.error("Failed to get response from companion %d: %s", device_id, e)
+                        # Send error to client
+                        import pickle
+                        error_response = pickle.dumps(ModelParametersResponse(
+                            success=False,
+                            model_parameters=None,
+                            error=str(e)
+                        ))
+                        if needs_empty_delim:
+                            await self.router_socket.send_multipart(
+                                [client_id, b"", error_response])
+                        else:
+                            await self.router_socket.send_multipart(
+                                [client_id, error_response])
+                    
+                    poller.unregister(socket)
+                    socket.close()
+                    responses_received += 1
+        
+        # Close any remaining sockets
+        for socket in sockets:
+            socket.close()
         
         # Clear pending requests
         self.pending_init_requests.clear()
+        logger.info("Distributed init broadcast complete")
     
-    async def _forward_single_request(self, client_id: bytes, message: bytes, device_id: int):
+    async def _forward_single_request(self, client_id: bytes, message: bytes,
+                                      device_id: int,
+                                      needs_empty_delim: bool):
         """Forward a single request to a companion."""
         # Ensure companion is running
         if device_id not in self.companions:
             self.start_companion(device_id)
-            await asyncio.sleep(0.5)  # Give it time to start
         
         companion = self.companions.get(device_id)
         if not companion or not companion.process.is_alive():
             # Send error response
             import pickle
-            error_response = pickle.dumps({
-                'success': False,
-                'error': f"Companion for GPU {device_id} not available"
-            })
-            await self.router_socket.send_multipart([
-                client_id, b"", error_response
-            ])
+            error_response = pickle.dumps(ModelParametersResponse(
+                success=False,
+                model_parameters=None,
+                error=f"Companion for GPU {device_id} not available"
+            ))
+            if needs_empty_delim:
+                await self.router_socket.send_multipart(
+                    [client_id, b"", error_response])
+            else:
+                await self.router_socket.send_multipart(
+                    [client_id, error_response])
             return
         
         # Forward to companion and get response
@@ -169,20 +408,27 @@ class MultiProcCoordinator:
             req_socket.close()
             
             # Send response back to client
-            await self.router_socket.send_multipart([
-                client_id, b"", response
-            ])
+            if needs_empty_delim:
+                await self.router_socket.send_multipart(
+                    [client_id, b"", response])
+            else:
+                await self.router_socket.send_multipart(
+                    [client_id, response])
             
         except Exception as e:
             logger.error("Failed to forward request: %s", e)
             import pickle
-            error_response = pickle.dumps({
-                'success': False,
-                'error': str(e)
-            })
-            await self.router_socket.send_multipart([
-                client_id, b"", error_response
-            ])
+            error_response = pickle.dumps(ModelParametersResponse(
+                success=False,
+                model_parameters=None,
+                error=str(e)
+            ))
+            if needs_empty_delim:
+                await self.router_socket.send_multipart(
+                    [client_id, b"", error_response])
+            else:
+                await self.router_socket.send_multipart(
+                    [client_id, error_response])
     
     async def start(self):
         """Start the coordinator service."""
@@ -198,16 +444,23 @@ class MultiProcCoordinator:
             for device_id in range(torch.cuda.device_count()):
                 self.start_companion(device_id)
         
-        logger.info("Coordinator ready on port %d", self.coordinator_port)
+        logger.info("Coordinator ready on port %d with %d companion servers", 
+                   self.coordinator_port, len(self.companions))
         
         # Main message loop
         while not self.shutdown_event.is_set():
             try:
                 if await self.router_socket.poll(timeout=1000):
                     frames = await self.router_socket.recv_multipart()
+                    # ROUTER can receive either:
+                    # - [identity, empty, payload] from DEALER-style clients
+                    # - [identity, payload] from REQ-style clients (our validation ping)
                     if len(frames) >= 3:
-                        # Handle request (will coordinate distributed init if needed)
-                        await self.handle_client_request(frames[0], frames[2])
+                        await self.handle_client_request(frames[0], frames[2],
+                                                         True)
+                    elif len(frames) == 2:
+                        await self.handle_client_request(frames[0], frames[1],
+                                                         False)
                 
                 # Check companion health periodically
                 for device_id, comp in list(self.companions.items()):

@@ -281,9 +281,65 @@ class Worker(WorkerBase):
         if getattr(self, '_two_phase_init_pending', False):
             logger.info("Init: loading model weights")
         
+        # Validate companion server availability if using IPC loading
+        if self.load_config.enable_companion_process:
+            self._validate_companion_configuration()
+        
         eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
+    
+    def _validate_companion_configuration(self) -> None:
+        """Validate that companion configuration is correct for this worker.
+        
+        This provides early validation and helpful error messages before
+        attempting to load the model via IPC.
+        """
+        import os
+        
+        # Get environment info
+        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        logical_device = torch.cuda.current_device()
+        
+        # Log configuration for debugging
+        logger.info(
+            "[GPU-WORKER] Companion configuration validation:\n"
+            "  CUDA_VISIBLE_DEVICES: %s\n"
+            "  Logical device (current): %d\n"
+            "  DP rank: %d, DP size: %d\n"
+            "  TP rank: %d, TP size: %d\n"
+            "  PP rank: %d, PP size: %d",
+            cuda_visible if cuda_visible else "(not set - all GPUs visible)",
+            logical_device,
+            self.parallel_config.data_parallel_rank if hasattr(self.parallel_config, 'data_parallel_rank') else 0,
+            self.parallel_config.data_parallel_size if hasattr(self.parallel_config, 'data_parallel_size') else 1,
+            self.parallel_config.rank % self.parallel_config.tensor_parallel_size,
+            self.parallel_config.tensor_parallel_size,
+            (self.parallel_config.rank // self.parallel_config.tensor_parallel_size) % self.parallel_config.pipeline_parallel_size,
+            self.parallel_config.pipeline_parallel_size
+        )
+        
+        # Warn if configuration looks problematic
+        if cuda_visible and self.parallel_config.data_parallel_size > 1:
+            visible_gpus = len(cuda_visible.split(','))
+            if visible_gpus != 1:
+                logger.warning(
+                    "[GPU-WORKER] Worker sees %d GPUs but expected 1 for DP. "
+                    "CUDA_VISIBLE_DEVICES=%s. This may cause companion routing issues.",
+                    visible_gpus, cuda_visible
+                )
+        
+        # Check if companion config is present
+        if not self.vllm_config.companion_config:
+            logger.warning(
+                "[GPU-WORKER] No companion config found but IPC loading is enabled. "
+                "This will likely fail during model loading."
+            )
+        elif not self.vllm_config.companion_config.coordinator_address:
+            logger.warning(
+                "[GPU-WORKER] Companion coordinator address not set. "
+                "IPC loading will fail."
+            )
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -473,12 +529,15 @@ class Worker(WorkerBase):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
 
-    def synchronize_after_promotion(self) -> None:
+    def synchronize_after_promotion(self) -> int:
         """Synchronize after being promoted from warm spare to primary.
         
         This ensures all promoted workers have completed their cleanup
         (destroyed old distributed groups, released ports) before the
         executor creates new warm spares that will use those same ports.
+
+        Returns:
+            int: The current DP base port used by primaries on this rank.
         """
         # Ensure distributed cleanup is complete  
         if torch.distributed.is_initialized():
@@ -493,10 +552,15 @@ class Worker(WorkerBase):
         import socket
         import time
         
+        # Default return value in case logic below is skipped
+        base_port_return = self.vllm_config.parallel_config.data_parallel_master_port
+
         if hasattr(self.vllm_config, 'parallel_config'):
             base_port = self.vllm_config.parallel_config.data_parallel_master_port
             warm_spare_offset = self.vllm_config.parallel_config.warm_spare_port_offset
             warm_spare_port = base_port + warm_spare_offset  # Port that new warm spares will use
+            # Record for return to executor
+            base_port_return = base_port
             
             # Only rank 0 checks port availability to avoid conflicts
             if torch.distributed.get_rank() == 0:
@@ -533,6 +597,8 @@ class Worker(WorkerBase):
                     logger.warning(f"Post-port-check barrier failed: {e}")
         
         logger.info("Promotion synchronization complete")
+        # Return the current base DP port so the executor can align its config
+        return base_port_return
         
     def finalize_two_phase_init(
             self,
@@ -602,12 +668,25 @@ class Worker(WorkerBase):
             if hasattr(tp_group, 'device_communicator') and tp_group.device_communicator:
                 # Force disable custom all-reduce
                 tp_group.device_communicator.ca_comm = None
-                logger.info("Disabled custom all-reduce after two-phase init")
+                logger.info("Disabled TP custom all-reduce after two-phase init")
             
+            # Disable custom all-reduce for DP
+            from vllm.distributed.parallel_state import get_ep_group
+            ep_group = get_ep_group()
+            if hasattr(ep_group, 'device_communicator') and ep_group.device_communicator:
+                # Force disable custom all-reduce
+                ep_group.device_communicator.ca_comm = None
+                logger.info("Disabled EP custom all-reduce after two-phase init")
+
             # Recreate persistent buffers that may have been corrupted
             # during fake mode operations
             if hasattr(self, 'model_runner'):
                 self.model_runner.recreate_persistent_buffers()
+            
+            # Prepare communication buffer for model
+            from vllm.distributed.parallel_state import prepare_communication_buffer_for_model
+            prepare_communication_buffer_for_model(self.model_runner.model)
+
 
     def compile_or_warm_up_model(self) -> None:
         """Capture CUDA graphs and runtime warmups only.

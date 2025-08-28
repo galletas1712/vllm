@@ -94,14 +94,24 @@ class ModelInstanceManager:
         assert self.vllm_config.load_config is not None
         assert self.vllm_config.load_config.enable_companion_process is False
         
+        # Log EP information before model loading
+        try:
+            from vllm.distributed.parallel_state import get_ep_group
+            ep_group = get_ep_group()
+            ep_info = f"EP rank={ep_group.rank_in_group}, EP size={ep_group.world_size}"
+        except Exception:
+            ep_info = "EP group not initialized"
+        
         logger.info(
             "[MODEL-LOAD] Creating DefaultModelLoader with load_config:\n"
             "  device=%s\n"
             "  load_format=%s\n"
-            "  download_dir=%s",
+            "  download_dir=%s\n"
+            "  %s",
             self.vllm_config.load_config.device,
             self.vllm_config.load_config.load_format,
             self.vllm_config.load_config.download_dir,
+            ep_info,
         )
         
         default_loader = DefaultModelLoader(self.vllm_config.load_config)
@@ -165,15 +175,54 @@ class ModelInstanceManager:
 
     def _initialize_fake_distributed_environment(self):
         """Initialize distributed environment in fake mode for correct weight loading."""
+        # CRITICAL: Determine DP rank based on device_id
+        # This assumes a standard mapping: GPU 0 → DP rank 0, GPU 1 → DP rank 1, etc.
+        # This is necessary because the companion serves a specific GPU and should
+        # load the experts corresponding to that GPU's DP rank for EP to work correctly
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        
+        # Calculate DP rank based on device_id
+        # Assuming TP*PP groups are on consecutive GPUs, and DP spreads across nodes/GPUs
+        # For example, with TP=2, PP=1, DP=2:
+        #   GPUs 0-1: DP rank 0 (TP ranks 0-1)
+        #   GPUs 2-3: DP rank 1 (TP ranks 0-1)
+        # With TP=1, PP=1, DP=2:
+        #   GPU 0: DP rank 0
+        #   GPU 1: DP rank 1
+        tp_pp_size = tp_size * pp_size
+        computed_dp_rank = self.device_id // tp_pp_size
+        
+        # Validate and use the computed DP rank
+        if computed_dp_rank >= dp_size:
+            logger.warning(
+                "[DIST-INIT] Computed DP rank %d exceeds DP size %d, using config value %d",
+                computed_dp_rank, dp_size, 
+                self.vllm_config.parallel_config.data_parallel_rank
+            )
+            computed_dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        else:
+            # Override the config's DP rank with the computed value
+            original_dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+            if original_dp_rank != computed_dp_rank:
+                logger.warning(
+                    "[DIST-INIT] Overriding config DP rank %d with computed value %d based on device_id %d",
+                    original_dp_rank, computed_dp_rank, self.device_id
+                )
+            self.vllm_config.parallel_config.data_parallel_rank = computed_dp_rank
+        
         logger.info(
             "[DIST-INIT] Starting companion shadow process initialization:\n"
+            "  Device ID: %d → Computed DP rank: %d\n"
             "  local_rank=%d, rank=%d (TP/PP), world_size=%d (TP/PP)\n"
-            "  TP=%d, PP=%d, DP=%d, Expert Parallel enabled=%s\n"
+            "  TP=%d, PP=%d, DP=%d, DP_rank=%d (computed from device_id)\n"
+            "  Expert Parallel enabled=%s\n"
             "  companion_master_port=%d",
+            self.device_id, computed_dp_rank,
             self.local_rank, self.global_rank, self.world_size,
-            self.vllm_config.parallel_config.tensor_parallel_size,
-            self.vllm_config.parallel_config.pipeline_parallel_size,
-            self.vllm_config.parallel_config.data_parallel_size,
+            tp_size, pp_size, dp_size,
+            self.vllm_config.parallel_config.data_parallel_rank,
             self.vllm_config.parallel_config.enable_expert_parallel,
             self.companion_master_port,
         )
@@ -183,12 +232,15 @@ class ModelInstanceManager:
             self.companion_master_port
         )
         
+        # IMPORTANT: Do NOT expand DP here. parallel_state.init_distributed_environment
+        # will expand (rank, world_size) across DP using the current vLLM config.
+        # We must pass TP*PP world_size and the TP/PP-local rank, identical to workers.
         logger.info(
             "[DIST-INIT] About to call parallel_state.init_distributed_environment:\n"
             "  init_method=%s\n"
             "  backend=%s (will use gloo for fake run)\n"
-            "  world_size=%d (TP*PP), rank=%d (TP/PP), local_rank=%d\n"
-            "  DP adjustment will be handled by parallel_state",
+            "  world_size=%d (TP*PP), rank=%d (TP/PP rank), local_rank=%d\n"
+            "  DP expansion will be applied inside init_distributed_environment",
             init_method,
             FAKE_DISTRIBUTED_BACKEND,
             self.world_size,
@@ -218,17 +270,30 @@ class ModelInstanceManager:
                 self.vllm_config.parallel_config.process_type = "primary_companion"
 
         # Set the current vLLM config so init_distributed_environment can access it
-        set_current_vllm_config(self.vllm_config)
-        
+        # Use context manager to ensure visibility for the duration of init calls
+        from vllm.config import set_current_vllm_config as _set_cfg
         logger.info("[DIST-INIT] Calling init_distributed_environment NOW...")
         
-        init_distributed_environment(
-            world_size=self.world_size,
-            rank=self.global_rank,
-            distributed_init_method=init_method,
-            local_rank=self.local_rank,
-            backend=FAKE_DISTRIBUTED_BACKEND,
-        )
+        # Set a timeout for gloo initialization to prevent hanging
+        import os
+        original_timeout = os.environ.get("GLOO_TIMEOUT_SECONDS")
+        os.environ["GLOO_TIMEOUT_SECONDS"] = "60"  # 60 seconds timeout
+        
+        try:
+            with _set_cfg(self.vllm_config):
+                init_distributed_environment(
+                    world_size=self.world_size,  # TP*PP only
+                    rank=self.global_rank,       # TP/PP rank only
+                    distributed_init_method=init_method,
+                    local_rank=self.local_rank,
+                    backend=FAKE_DISTRIBUTED_BACKEND,
+                )
+        finally:
+            # Restore original timeout
+            if original_timeout is not None:
+                os.environ["GLOO_TIMEOUT_SECONDS"] = original_timeout
+            else:
+                os.environ.pop("GLOO_TIMEOUT_SECONDS", None)
         
         logger.info(
             "[DIST-INIT] ✓ parallel_state.init_distributed_environment completed successfully!\n"
@@ -250,10 +315,11 @@ class ModelInstanceManager:
             tp_size, pp_size
         )
         
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=tp_size,
-            pipeline_model_parallel_size=pp_size,
-        )
+        with _set_cfg(self.vllm_config):
+            parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=tp_size,
+                pipeline_model_parallel_size=pp_size,
+            )
         
         logger.info("[DIST-INIT] ✓ parallel_state.initialize_model_parallel completed successfully!")
         
@@ -275,6 +341,31 @@ class ModelInstanceManager:
             ep_group = parallel_state.get_ep_group()
             ep_size = ep_group.world_size
             ep_rank = ep_group.rank_in_group
+            
+            # Calculate which experts this rank will load
+            num_experts = getattr(self.vllm_config.model_config, 'num_experts', 8)
+            experts_per_rank = num_experts // ep_size
+            start_expert = ep_rank * experts_per_rank
+            end_expert = start_expert + experts_per_rank
+            
+            # CRITICAL DEBUG: Log exact EP rank determination and expert assignment
+            logger.info(
+                "[EP-DEBUG] Companion EP rank determination:\n"
+                "  Device ID: %d → DP rank: %d (computed from device_id)\n"
+                "  EP group size: %d, EP rank in group: %d\n"
+                "  Total experts: %d, Experts per rank: %d\n"
+                "  This rank will load experts [%d-%d) out of %d total experts\n"
+                "  This determines which expert weights will be loaded!",
+                self.device_id,
+                self.vllm_config.parallel_config.data_parallel_rank,
+                ep_size,
+                ep_rank,
+                num_experts,
+                experts_per_rank,
+                start_expert,
+                end_expert,
+                num_experts
+            )
         except (AssertionError, AttributeError):
             # EP group may not be initialized
             ep_size = 1

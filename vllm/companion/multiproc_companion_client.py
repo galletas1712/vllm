@@ -45,9 +45,12 @@ class MultiProcCompanionClient:
         # ZMQ context and socket
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
+        # Set timeout for model loading (5 minutes should be enough for most models)
+        self.socket.setsockopt(zmq.RCVTIMEO, 300000)  # 5 minutes in milliseconds
+        self.socket.setsockopt(zmq.SNDTIMEO, 10000)   # 10 seconds for send
         self.socket.connect(self.coordinator_address)
         
-        logger.info("Companion client connected to %s",
+        logger.info("Companion client connected to %s (recv timeout: 5min)",
                    self.coordinator_address)
     
     def get_model_parameters(
@@ -65,6 +68,28 @@ class MultiProcCompanionClient:
         """
         if device_id is None:
             device_id = torch.cuda.current_device()
+        
+        # CRITICAL: For DP with EP, we need to map logical device to physical device
+        # Workers see their device as 0 due to CUDA_VISIBLE_DEVICES, but companion
+        # needs the physical device ID to route to the correct companion process
+        # Use DP rank as a proxy for physical device ID (assumes DP ranks map to consecutive GPUs)
+        if hasattr(vllm_config.parallel_config, 'data_parallel_rank'):
+            dp_rank = vllm_config.parallel_config.data_parallel_rank
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            pp_size = vllm_config.parallel_config.pipeline_parallel_size
+            tp_pp_size = tp_size * pp_size
+            
+            # Calculate physical device ID based on DP rank and TP/PP layout
+            # With TP=1, PP=1: DP rank 0 → GPU 0, DP rank 1 → GPU 1
+            # With TP=2, PP=1: DP rank 0 → GPUs 0-1, DP rank 1 → GPUs 2-3
+            physical_device_id = dp_rank * tp_pp_size + device_id
+            
+            logger.debug(
+                "[COMPANION-CLIENT] Mapping logical device %d → physical device %d "
+                "(DP rank=%d, TP=%d, PP=%d)",
+                device_id, physical_device_id, dp_rank, tp_size, pp_size
+            )
+            device_id = physical_device_id
         
         # Get rank information from the distributed environment
         # Send local TP/PP rank and let companion server handle DP adjustment
@@ -108,8 +133,26 @@ class MultiProcCompanionClient:
         )
         
         # Send request and get response
-        self.socket.send(pickle.dumps(request))
-        response: ModelParametersResponse = pickle.loads(self.socket.recv())
+        try:
+            self.socket.send(pickle.dumps(request))
+            response_data = self.socket.recv()
+        except zmq.error.Again as e:
+            raise RuntimeError(
+                f"Timeout waiting for companion server response after 5 minutes. "
+                f"The model may be too large or the companion server may be stuck. "
+                f"Device ID: {device_id}, Model: {vllm_config.model_config.model}"
+            ) from e
+        
+        response = pickle.loads(response_data)
+        
+        # Handle both dict and ModelParametersResponse object formats
+        if isinstance(response, dict):
+            # Legacy format or error from coordinator - convert to ModelParametersResponse
+            response = ModelParametersResponse(
+                success=response.get('success', False),
+                model_parameters=response.get('model_parameters'),
+                error=response.get('error')
+            )
         
         if not response.success:
             # Check if it's a hash mismatch error
