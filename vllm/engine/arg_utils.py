@@ -437,7 +437,6 @@ class EngineArgs:
     enable_prompt_adapter: bool = False
 
     enable_companion_process: bool = LoadConfig.enable_companion_process
-    use_warm_spare: bool = LoadConfig.use_warm_spare
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
@@ -569,8 +568,6 @@ class EngineArgs:
         load_group.add_argument("--enable-companion-process",
                                 dest="enable_companion_process",
                                 **load_kwargs["enable_companion_process"])
-        load_group.add_argument("--use-warm-spare",
-                                **load_kwargs["use_warm_spare"])
 
         # Guided decoding arguments
         guided_decoding_kwargs = get_kwargs(DecodingConfig)
@@ -971,7 +968,6 @@ class EngineArgs:
             use_tqdm_on_load=self.use_tqdm_on_load,
             pt_load_map_location=self.pt_load_map_location,
             enable_companion_process=self.enable_companion_process,
-            use_warm_spare=self.use_warm_spare,
         )
 
     def create_speculative_config(

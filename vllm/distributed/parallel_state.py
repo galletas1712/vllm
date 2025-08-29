@@ -27,7 +27,6 @@ import gc
 import pickle
 import weakref
 from collections import namedtuple
-import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from multiprocessing import shared_memory
@@ -1317,44 +1316,19 @@ def init_distributed_environment(
     else:
         set_fake_distributed_mode(False)
     
+    # NOTE: don't check for backend == FAKE_DISTRIBUTED_BACKEND anymore!
+    
     from vllm.config import get_current_vllm_config
     config = get_current_vllm_config()
     if config is not None and config.parallel_config.data_parallel_size > 1:
-        # Allow DP in both device and fake mode
-        # Adjust rank and world size for data parallelism
         parallel_config = config.parallel_config
-        # Offset the rank by DP rank and expand world size across DP.
+        # adjust to take into account data parallelism
+        # offset the rank by the data parallel rank
         rank = parallel_config.data_parallel_rank * world_size + rank
+        # adjust the world size to take into account data parallelism
         world_size = parallel_config.world_size_across_dp
-        
-        # Use the configured DP init method if explicitly provided,
-        # otherwise synthesize one
         ip = parallel_config.data_parallel_master_ip
-        process_type = parallel_config.process_type
-        
-        # Choose the appropriate port based on process type
-        # Port allocation strategy:
-        # - EngineCore DP group: base-1 (fixed, never changes)
-        # - Primary workers: base+0 for phase 1, base+1 for phase 2
-        # - Warm spare workers: base+100 for phase 1, base+1 for phase 2 (when promoted)
-        # - Companion processes: base+200, base+201, etc.
-        
-        if process_type == "warm_spare_worker":
-            # Warm spare workers use base+100 for phase 1
-            # For phase 2, the process_type is temporarily cleared in finalize_two_phase_init
-            # so they fall through to use primary worker ports (base+1)
-            offset = parallel_config.warm_spare_port_offset
-            port = parallel_config.data_parallel_master_port + offset
-            logger.info(f"Warm spare using phase 1 port: {port}")
-        elif process_type == "primary_companion":
-            # Companion processes use offset of 200 from base
-            # Both primary and warm spare workers share these companions
-            port = parallel_config.get_next_dp_init_port(offset=200)
-        else:
-            # Primary workers use no offset
-            # They will use base+0 for phase 1, base+1 for phase 2
-            port = parallel_config.get_next_dp_init_port()
-        
+        port = parallel_config.get_next_dp_init_port() if IS_FAKE_DISTRIBUTED() else parallel_config.get_next_fake_dp_init_port()
         distributed_init_method = get_distributed_init_method(ip, port)
         logger.info(
             "Adjusting world_size=%d rank=%d distributed_init_method=%s for DP",
@@ -1631,9 +1605,8 @@ def destroy_distributed_environment():
     _WORLD = None
     _NODE_COUNT = None
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
         torch.distributed.destroy_process_group()
-    # Reset non-device mode state
+    # Reset fake distributed mode state
     set_fake_distributed_mode(False)
 
 

@@ -1799,10 +1799,6 @@ class LoadConfig:
     enable_companion_process: bool = False
     """Whether to enable loading model weights via IPC using companion 
     processes."""
-    use_warm_spare: bool = False
-    """Whether to use warm spare workers for resilience. Requires IPC loading
-    to be enabled. Warm spare workers are partially initialized (model loaded
-    via IPC but no KV cache) and can quickly replace failed primary workers."""
 
     def compute_hash(self) -> str:
         """

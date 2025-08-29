@@ -66,6 +66,8 @@ class MultiprocExecutor(Executor):
         # Multiprocessing-based executor does not support multi-node setting.
         # Since it only works for single node, we can use the loopback address
         # get_loopback_ip() for communication.
+        fake_distributed_init_method = get_distributed_init_method(
+            get_loopback_ip(), get_open_port())
         distributed_init_method = get_distributed_init_method(
             get_loopback_ip(), get_open_port())
 
@@ -88,6 +90,7 @@ class MultiprocExecutor(Executor):
                         local_rank=rank,
                         rank=rank,
                         distributed_init_method=distributed_init_method,
+                        fake_distributed_init_method=fake_distributed_init_method,
                         input_shm_handle=scheduler_output_handle,
                     ))
 
@@ -132,8 +135,7 @@ class MultiprocExecutor(Executor):
         self_ref = weakref.ref(self)
 
         # Monitors worker process liveness. If any die unexpectedly,
-        # logs an error, shuts down the executor and invokes the failure
-        # callback to inform the engine.
+        # immediately kills all workers and invokes the failure callback.
         def monitor_workers():
             sentinels = [h.proc.sentinel for h in workers]
             died = multiprocessing.connection.wait(sentinels)
@@ -145,7 +147,13 @@ class MultiprocExecutor(Executor):
                              if h.proc.sentinel == died[0])
             logger.error(
                 "Worker proc %s died unexpectedly, "
-                "shutting down executor.", proc_name)
+                "immediately killing all workers.", proc_name)
+            
+            # Immediately kill all worker processes
+            for w in workers:
+                if w.proc.is_alive():
+                    w.proc.kill()
+            
             _self.shutdown()
             callback = _self.failure_callback
             if callback is not None:
@@ -359,6 +367,7 @@ class WorkerProc:
         local_rank: int,
         rank: int,
         distributed_init_method: str,
+        fake_distributed_init_method: str,
         input_shm_handle: Handle,
     ):
         self.rank = rank
@@ -374,6 +383,7 @@ class WorkerProc:
             "local_rank": local_rank,
             "rank": rank,
             "distributed_init_method": distributed_init_method,
+            "fake_distributed_init_method": fake_distributed_init_method,
             "is_driver_worker": is_driver_worker,
         }
         wrapper.init_worker(all_kwargs)
@@ -406,6 +416,7 @@ class WorkerProc:
             local_rank: int,
             rank: int,
             distributed_init_method: str,
+            fake_distributed_init_method: str,
             input_shm_handle,  # Receive SchedulerOutput
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
@@ -420,6 +431,7 @@ class WorkerProc:
             "local_rank": local_rank,
             "rank": rank,
             "distributed_init_method": distributed_init_method,
+            "fake_distributed_init_method": fake_distributed_init_method,
             "input_shm_handle": input_shm_handle,
             "ready_pipe": (reader, writer),
             "death_pipe": death_reader,
