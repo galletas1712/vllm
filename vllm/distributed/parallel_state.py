@@ -1328,7 +1328,7 @@ def init_distributed_environment(
         # adjust the world size to take into account data parallelism
         world_size = parallel_config.world_size_across_dp
         ip = parallel_config.data_parallel_master_ip
-        port = parallel_config.get_next_dp_init_port() if IS_FAKE_DISTRIBUTED() else parallel_config.get_next_fake_dp_init_port()
+        port = parallel_config.get_next_fake_dp_init_port() if IS_FAKE_DISTRIBUTED() else parallel_config.get_next_dp_init_port()
         distributed_init_method = get_distributed_init_method(ip, port)
         logger.info(
             "Adjusting world_size=%d rank=%d distributed_init_method=%s for DP",
