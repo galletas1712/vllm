@@ -6,7 +6,7 @@ from enum import Enum
 import gc
 import os
 from contextlib import AbstractContextManager, nullcontext
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 import torch
 import torch.distributed
@@ -21,12 +21,12 @@ from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     FAKE_DISTRIBUTED_BACKEND,
-    prepare_communication_buffer_for_model,
 )
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group, get_ep_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -38,6 +38,7 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm.device_allocator.cumem import CuMemAllocator
 
 logger = init_logger(__name__)
 
@@ -142,6 +143,9 @@ class Worker(WorkerBase):
             self.profiler = None
         
         self.init_phase = WorkerInitPhase.PHASE_1
+        # Record the original load format so we can defer real weights and
+        # switch back after phase 2 init if needed.
+        self._original_load_format: Optional[str] = self.load_config.load_format
     
     def phase_1_init(self) -> None:
         """
@@ -155,12 +159,29 @@ class Worker(WorkerBase):
         assert self.init_phase == WorkerInitPhase.PHASE_1, "Worker must be in phase 1"
         self.init_device(fake_distributed_env=True)
         self.init_model_runner()
+        # Defer real weights: load dummy weights in phase 1 so that we can
+        # precompile without committing real weight memory. We'll switch
+        # to the real loader and reload weights in phase 2.
+        if self._original_load_format != "dummy":
+            self.model_runner.update_config({
+                "load_config": {
+                    "load_format": "dummy",
+                }
+            })
         self.load_model()
         self.precompile_model()
+
+        self._phase_1_ep_size = get_ep_group().world_size
+        self._phase_1_ep_rank = get_ep_group().rank_in_group
+        logger.info(f"Phase 1 - EP size: {self._phase_1_ep_size}, EP rank: {self._phase_1_ep_rank}")
 
         # Clean up the model runner and the fake distributed environment
         self.model_runner.reset_input_batch_state()
         cleanup_dist_env_and_memory()
+
+        # Offload weight pool to free physical backing while retaining virtual
+        # mappings so phase 2 can measure GPU free memory without weights.
+        self.sleep(level=2)
 
         self.init_phase = WorkerInitPhase.PHASE_2
     
@@ -173,10 +194,46 @@ class Worker(WorkerBase):
         phase 2 and 3 need to be split.
         """
         assert self.init_phase == WorkerInitPhase.PHASE_2, "Worker must be in phase 2"
-        torch.cuda.synchronize()
-        self.init_device(fake_distributed_env=False)
+
+        self.wake_up(tags=("weights", ))
+        # This only reinitializes the distributed environment, but doesn't take a memory snapshot
+        # since we want to use the memory snapshot without weights loaded
+        self.reinit_device()
+        self.model_runner.reset_input_batch_state()
+       
+        # Switch back to the original loader and load real weights inplace.
+        # The weights are already mapped in GPU memory from wake_up.
+        if self._original_load_format and self._original_load_format != "dummy":
+            self.model_runner.update_config({
+                "load_config": {
+                    "load_format": self._original_load_format,
+                }
+            })
+
+            # NOTE: must update expert map before reloading weights to ensure expert_map is valid before loading
+            if self.vllm_config.parallel_config.enable_expert_parallel:
+                moe_modules = [
+                    module for module in self.model_runner.model.modules()
+                    if module.__class__.__name__ == "FusedMoE"
+                ]
+                for module in moe_modules:
+                    if hasattr(module, 'update_expert_map'):
+                        logger.debug(f"Updating expert map for module: {module}")
+                        module.update_expert_map()
+
+            # Allocate actual weights into the existing parameter storages.
+            logger.info("Reloading weights")
+            self.model_runner.reload_weights()  # NOTE: don't use self.reload_weights() since this wraps context with memory pool
+
+            if self.vllm_config.parallel_config.enable_expert_parallel:
+                current_ep_size = get_ep_group().world_size
+                current_ep_rank = get_ep_group().rank_in_group
+                assert current_ep_size == self._phase_1_ep_size, "EP size should be the same"
+                assert current_ep_rank == self._phase_1_ep_rank, "EP rank should be the same"
+                self._reconfigure_moe(old_ep_size=self._phase_1_ep_size, new_ep_size=current_ep_size)
+        
         self.model_runner.recreate_persistent_buffers()
-        prepare_communication_buffer_for_model(self.model_runner.model)
+
         available_memory = self.determine_available_memory()
         self.init_phase = WorkerInitPhase.INITIALIZING_CACHE
         return available_memory
@@ -189,6 +246,20 @@ class Worker(WorkerBase):
         assert self.init_phase == WorkerInitPhase.PHASE_3, "Worker must be in phase 3"
         self.compile_or_warm_up_model()
         self.init_phase = WorkerInitPhase.DONE
+    
+    def sleep_tensors(self, tensors: Iterable[torch.Tensor], offload: bool = False) -> None:
+        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+        from vllm.device_allocator.cumem import CuMemAllocator
+        allocator = CuMemAllocator.get_instance()
+        allocator.sleep_tensors(tensors)
+        free_bytes_after_sleep, total = torch.cuda.mem_get_info()
+        freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+        used_bytes = total - free_bytes_after_sleep
+        assert freed_bytes >= 0, "Memory usage increased after sleeping."
+        logger.info(
+            "Sleep mode freed %.2f GiB memory, "
+            "%.2f GiB memory is still in use.", freed_bytes / GiB_bytes,
+            used_bytes / GiB_bytes)
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -253,7 +324,42 @@ class Worker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
         self.init_phase = WorkerInitPhase.PHASE_3
+    
+    def _take_memory_snapshot(self):
+        gc.collect()
+        torch.cuda.empty_cache()
 
+        # take current memory snapshot
+        self.init_snapshot = MemorySnapshot()
+        self.requested_memory = (self.init_snapshot.total_memory *
+                                    self.cache_config.gpu_memory_utilization)
+        GiB = lambda b: round(b / GiB_bytes, 2)
+        
+        if self.init_snapshot.free_memory < self.requested_memory:
+            raise ValueError(
+                f"Free memory on device "
+                f"({GiB(self.init_snapshot.free_memory)}/"
+                f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
+                f"is less than desired GPU memory utilization "
+                f"({self.cache_config.gpu_memory_utilization}, "
+                f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
+                f"utilization or reduce GPU memory used by other processes."
+            )
+    
+    def _init_distributed_environment(self, fake_distributed_env: bool = False):
+        logger.info("Initializing worker distributed environment...")
+        with set_current_vllm_config(self.vllm_config):
+            init_worker_distributed_environment(
+                self.vllm_config, self.rank,
+                self.fake_distributed_init_method if fake_distributed_env else self.distributed_init_method,
+                self.local_rank,
+                backend=(
+                    FAKE_DISTRIBUTED_BACKEND if fake_distributed_env
+                    else current_platform.dist_backend
+                )
+            )
+        logger.info("Worker distributed environment initialized")
+    
     def init_device(self, fake_distributed_env: bool = False):
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
@@ -272,51 +378,13 @@ class Worker(WorkerBase):
             _check_if_gpu_supports_dtype(self.model_config.dtype)
             gc.collect()
             torch.cuda.empty_cache()
-
-            # take current memory snapshot
-            self.init_snapshot = MemorySnapshot()
-            self.requested_memory = (self.init_snapshot.total_memory *
-                                     self.cache_config.gpu_memory_utilization)
-            GiB = lambda b: round(b / GiB_bytes, 2)
-            
-            # When using IPC loading, we don't need to allocate memory for model weights
-            # as they are already loaded by the model server. Skip the strict check
-            # since we'll do proper accounting after model loading.
-            if self.load_config.enable_companion_process:
-                logger.info(
-                    "IPC loading enabled: Skipping initial memory check. "
-                    "Free memory: %.2f GiB, Total: %.2f GiB, Requested: %.2f GiB",
-                    GiB(self.init_snapshot.free_memory), 
-                    GiB(self.init_snapshot.total_memory), 
-                    GiB(self.requested_memory)
-                )
-            elif self.init_snapshot.free_memory < self.requested_memory:
-                raise ValueError(
-                    f"Free memory on device "
-                    f"({GiB(self.init_snapshot.free_memory)}/"
-                    f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
-                    f"is less than desired GPU memory utilization "
-                    f"({self.cache_config.gpu_memory_utilization}, "
-                    f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
-                    f"utilization or reduce GPU memory used by other processes."
-                )
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
         
-        logger.info("Initializing worker distributed environment...")
-        with set_current_vllm_config(self.vllm_config):
-            init_worker_distributed_environment(
-                self.vllm_config, self.rank,
-                self.fake_distributed_init_method if fake_distributed_env else self.distributed_init_method,
-                self.local_rank,
-                backend=(
-                    FAKE_DISTRIBUTED_BACKEND if fake_distributed_env
-                    else current_platform.dist_backend
-                )
-            )
-        logger.info("Worker distributed environment initialized")
-
+        self._take_memory_snapshot()
+        self._init_distributed_environment(fake_distributed_env)
+        
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
@@ -325,7 +393,17 @@ class Worker(WorkerBase):
             report_usage_stats(self.vllm_config)
         
         logger.info("Worker init_device has completed")
-
+    
+    def reinit_device(self):
+        logger.info("Reinitializing device and distributed environment...")
+        torch.cuda.synchronize()
+        self._init_distributed_environment(fake_distributed_env=False)
+        set_random_seed(self.model_config.seed)
+        
+        if self.rank == 0:
+            report_usage_stats(self.vllm_config)
+        logger.info("Worker reinit_device has completed")
+    
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self) -> None:
@@ -396,10 +474,11 @@ class Worker(WorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
+        # NOTE: since our initial memory snapshot was taken prior to weights loaded, we need to pass the weights size to the profiler
+        weights_bytes = get_model_weights_size_bytes(self.model_runner.model)
         with memory_profiling(
                 self.init_snapshot,
-                weights_memory=int(
-                    self.model_runner.model_memory_usage)) as profile_result:
+                weights_memory=weights_bytes) as profile_result:
             self.model_runner.profile_run()
 
         free_gpu_memory = profile_result.after_profile.free_memory
@@ -414,52 +493,14 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container.")
         # Calculate available memory for KV cache
-        if self.load_config.enable_companion_process:
-            # With IPC loading, the model server has already allocated memory
-            # for weights. We should only subtract the torch memory increase
-            # from this process, not the non_torch_increase which includes
-            # the model server's memory.
-            weights_bytes = get_model_weights_size_bytes(self.model_runner.model)
-            logger.info(
-                "IPC loading enabled: Model weights (%.2f GiB) are managed by "
-                "model server process", 
-                weights_bytes / GiB_bytes
-            )
-            logger.info(
-                "Memory profiling details:\n"
-                "- Free GPU memory: %.2f GiB\n"
-                "- GPU utilization: %.2f\n"
-                "- torch_peak_increase: %.2f GiB\n"
-                "- non_torch_increase: %.2f GiB (includes model server memory)\n"
-                "- weights_memory: %.2f GiB",
-                free_gpu_memory / GiB_bytes,
-                self.cache_config.gpu_memory_utilization,
-                profile_result.torch_peak_increase / GiB_bytes,
-                profile_result.non_torch_increase / GiB_bytes,
-                profile_result.weights_memory / GiB_bytes
-            )
-            # Only subtract PyTorch memory from this process
-            available_kv_cache_memory = int(free_gpu_memory * 
-                                          self.cache_config.gpu_memory_utilization) \
-                - profile_result.torch_peak_increase
-        else:
-            # Normal loading: use standard calculation
-            available_kv_cache_memory = self.requested_memory \
-                - profile_result.non_kv_cache_memory
+        available_kv_cache_memory = self.requested_memory \
+            - profile_result.non_kv_cache_memory
 
-        if self.load_config.enable_companion_process:
-            logger.debug(
-                "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
-                "using free memory * %.2f = %.2f GiB for KV cache calculation",
-                GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
-                self.cache_config.gpu_memory_utilization,
-                GiB(free_gpu_memory * self.cache_config.gpu_memory_utilization))
-        else:
-            logger.debug(
-                "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
-                "requested GPU memory: %.2f GiB",
-                GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
-                GiB(self.requested_memory))
+        logger.debug(
+            "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
+            "requested GPU memory: %.2f GiB",
+            GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
+            GiB(self.requested_memory))
         logger.debug(profile_result)
         logger.info("Available KV cache memory: %.2f GiB",
                     GiB(available_kv_cache_memory))
@@ -483,153 +524,6 @@ class Worker(WorkerBase):
             context = nullcontext()
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
-
-    # def synchronize_after_promotion(self) -> int:
-    #     """Synchronize after being promoted from warm spare to primary.
-        
-    #     This ensures all promoted workers have completed their cleanup
-    #     (destroyed old distributed groups, released ports) before the
-    #     executor creates new warm spares that will use those same ports.
-
-    #     Returns:
-    #         int: The current DP base port used by primaries on this rank.
-    #     """
-    #     # Avoid global barrier here; EngineCore coordinates switch.
-    #     # Just ensure local CUDA work is flushed.
-    #     torch.cuda.synchronize()
-        
-    #     # Wait for the warm spare ports to be actually available
-    #     # Only rank 0 tests the port to avoid conflicts
-    #     import socket
-    #     import time
-        
-    #     # Default return value in case logic below is skipped
-    #     base_port_return = self.vllm_config.parallel_config.data_parallel_master_port
-
-    #     if hasattr(self.vllm_config, 'parallel_config'):
-    #         base_port = self.vllm_config.parallel_config.data_parallel_master_port
-    #         warm_spare_offset = self.vllm_config.parallel_config.warm_spare_port_offset
-    #         warm_spare_port = base_port + warm_spare_offset  # Port that new warm spares will use
-    #         # Record for return to executor
-    #         base_port_return = base_port
-            
-    #         # Only rank 0 checks port availability to avoid conflicts
-    #         if torch.distributed.get_rank() == 0:
-    #             # Check if warm spare phase 1 port (base+100) is available for new warm spares
-    #             # This port should be free after promoted workers switched to base+1 for phase 2
-    #             ports_to_check = [
-    #                 (warm_spare_port, "new warm spare phase 1"),
-    #             ]
-                
-    #             for port, description in ports_to_check:
-    #                 max_retries = 50  # 5 seconds max (100ms per retry)
-    #                 for retry in range(max_retries):
-    #                     try:
-    #                         # Try to bind to the port to check if it's free
-    #                         test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    #                         test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    #                         test_socket.bind(('', port))
-    #                         test_socket.close()
-    #                         # Port is available!
-    #                         logger.info(f"Port {port} confirmed available for {description}")
-    #                         break
-    #                     except OSError as e:
-    #                         # Port still in use or TIME_WAIT, retry
-    #                         if retry == max_retries - 1:
-    #                             logger.warning(f"Port {port} still unavailable for {description}: {e}")
-    #                         else:
-    #                             time.sleep(0.1)  # Wait 100ms before retry
-            
-    #         # Do not use a global barrier here; proceed independently.
-        
-    #     logger.info("Promotion synchronization complete")
-    #     # Return the current base DP port so the executor can align its config
-    #     return base_port_return
-        
-    # def finalize_two_phase_init(
-    #         self,
-    #         new_distributed_init_method: Optional[str] = None) -> None:
-    #     """Finalize two-phase by switching to real distributed groups.
-    #     EngineCore will handle memory profiling afterwards.
-    #     Optionally overrides the distributed_init_method.
-    #     """
-    #     if getattr(self, '_two_phase_init_pending', False):
-    #         # Avoid global barrier here; peers may be in different phases
-    #         # during failover. Proceed locally.
-
-    #         logger.info("Init: switching to real distributed groups")
-            
-    #         # For warm spares doing phase 2, temporarily clear process_type
-    #         # so they use primary worker ports (base+1) instead of warm spare ports
-    #         original_process_type = self.vllm_config.parallel_config.process_type
-    #         if original_process_type == "warm_spare_worker":
-    #             logger.info("Warm spare phase 2: using primary worker port allocation")
-    #             self.vllm_config.parallel_config.process_type = None
-
-    #         # Override init method if provided
-    #         if new_distributed_init_method:
-    #             self.distributed_init_method = (
-    #                 new_distributed_init_method)
-
-    #         # Re-init under current vLLM config context
-    #         from vllm.config import set_current_vllm_config
-    #         with set_current_vllm_config(self.vllm_config):
-    #             # Destroy fake groups
-    #             if model_parallel_is_initialized():
-    #                 destroy_model_parallel()
-    #             destroy_distributed_environment()
-                
-    #             # Re-initialize with actual backend
-    #             init_worker_distributed_environment(
-    #                 self.vllm_config, self.rank,
-    #                 self.distributed_init_method,
-    #                 self.local_rank,
-    #                 current_platform.dist_backend
-    #             )
-                
-    #             self._two_phase_init_pending = False
-    #             # Track that we did two-phase init
-    #             self._did_two_phase_init = True
-                
-    #             # Restore original process_type if we temporarily cleared it
-    #             if 'original_process_type' in locals() and original_process_type == "warm_spare_worker":
-    #                 self.vllm_config.parallel_config.process_type = original_process_type
-    #                 logger.info("Restored warm spare process type after phase 2")
-                
-    #             logger.info("Init: two-phase complete")
-
-    #         # Ensure all ranks have re-initialized before proceeding
-    #         if torch.distributed.is_initialized():
-    #             torch.distributed.barrier()
-
-    #         # Disable custom all-reduce after two-phase init
-    #         # The custom all-reduce has cached buffer addresses that become
-    #         # invalid after recreating persistent buffers. It's safer to
-    #         # disable it and fall back to NCCL for CUDA graph capture.
-    #         from vllm.distributed.parallel_state import get_tp_group
-    #         tp_group = get_tp_group()
-    #         if hasattr(tp_group, 'device_communicator') and tp_group.device_communicator:
-    #             # Force disable custom all-reduce
-    #             tp_group.device_communicator.ca_comm = None
-    #             logger.info("Disabled TP custom all-reduce after two-phase init")
-            
-    #         # Disable custom all-reduce for DP
-    #         from vllm.distributed.parallel_state import get_ep_group
-    #         ep_group = get_ep_group()
-    #         if hasattr(ep_group, 'device_communicator') and ep_group.device_communicator:
-    #             # Force disable custom all-reduce
-    #             ep_group.device_communicator.ca_comm = None
-    #             logger.info("Disabled EP custom all-reduce after two-phase init")
-
-    #         # Recreate persistent buffers that may have been corrupted
-    #         # during fake mode operations
-    #         if hasattr(self, 'model_runner'):
-    #             self.model_runner.recreate_persistent_buffers()
-            
-    #         # Prepare communication buffer for model
-    #         from vllm.distributed.parallel_state import prepare_communication_buffer_for_model
-    #         prepare_communication_buffer_for_model(self.model_runner.model)
-
 
     def compile_or_warm_up_model(self) -> None:
         """Capture CUDA graphs and runtime warmups only.
@@ -849,6 +743,10 @@ class Worker(WorkerBase):
                 vllm_parallel_config=parallel_config,
             )
             module.moe_config.moe_parallel_config = module.moe_parallel_config
+            # Reinitialize MoE kernel after updating expert_map
+            if hasattr(module.quant_method, 'init_prepare_finalize'):
+                module.quant_method.init_prepare_finalize(module.moe_config)
+        global_expert_load = None
         if new_ep_size < old_ep_size:
             num_local_physical_experts = num_local_experts
             assert self.model_runner.eplb_state is not None
@@ -867,11 +765,11 @@ class Worker(WorkerBase):
                                         group_src=0)
             num_local_physical_experts = num_local_physical_experts.item()
             new_physical_experts = num_local_physical_experts * new_ep_size
-            assert self.model_runner.eplb_state is not None
-            global_expert_load = self.model_runner.eplb_state.rearrange(
-                self.model_runner.model, execute_shuffle=False)
-            parallel_config.num_redundant_experts = (
-                new_physical_experts - global_expert_load.shape[1])
+            if self.model_runner.eplb_state is not None:
+                global_expert_load = self.model_runner.eplb_state.rearrange(
+                    self.model_runner.model, execute_shuffle=False)
+                parallel_config.num_redundant_experts = (
+                    new_physical_experts - global_expert_load.shape[1])
         prepare_communication_buffer_for_model(self.model_runner.model)
         self.model_runner.model.update_physical_experts_metadata(
             num_physical_experts=new_physical_experts,

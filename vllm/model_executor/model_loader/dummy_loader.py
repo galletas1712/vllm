@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import torch
 import torch.nn as nn
 
 from vllm.config import LoadConfig, ModelConfig
@@ -24,4 +25,5 @@ class DummyModelLoader(BaseModelLoader):
                      model_config: ModelConfig) -> None:
         # NOTE(woosuk): For accurate performance evaluation, we assign
         # random values to the weights.
-        initialize_dummy_weights(model)
+        with torch.no_grad():
+            initialize_dummy_weights(model)

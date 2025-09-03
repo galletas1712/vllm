@@ -87,9 +87,7 @@ class EngineCore:
         available_gpu_memory = self.collective_rpc("phase_2_init")
         logger.info("Init stage: KV cache config initialization")
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
-            self._initialize_kv_caches(vllm_config,
-                                       precomputed_available_gpu_memory=
-                                       available_gpu_memory)
+            self._initialize_kv_caches(vllm_config, available_gpu_memory)
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
@@ -150,7 +148,7 @@ class EngineCore:
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig,
-            precomputed_available_gpu_memory: Optional[list[int]] = None
+            precomputed_available_gpu_memory: list[int]
             ) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
 
@@ -171,11 +169,7 @@ class EngineCore:
                 # Determine how much memory can be allocated for kv cache.
                 # Use precomputed values when provided to avoid double
                 # profiling.
-                if precomputed_available_gpu_memory is None:
-                    available_gpu_memory = (
-                        self.model_executor.determine_available_memory())
-                else:
-                    available_gpu_memory = precomputed_available_gpu_memory
+                available_gpu_memory = precomputed_available_gpu_memory
                 self.available_gpu_memory_for_kv_cache = \
                     available_gpu_memory[0]
         else:
