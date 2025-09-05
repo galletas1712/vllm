@@ -9,7 +9,7 @@ from pydantic.dataclasses import dataclass
 
 from vllm.config.utils import config
 
-InitMode = Literal["checkpoint", "normal"]
+InitMode = Literal["checkpoint", "resume", "normal"]
 
 
 @config
@@ -20,7 +20,8 @@ class LaunchConfig:
     init_mode: InitMode = "normal"
     """Initialization mode:
     - 'normal': Normal initialization (default)
-    - 'checkpoint': Initialize workers (phase 1) and save checkpoint. Requires `resume_init` API to complete initialization.
+    - 'checkpoint': Initialize workers (phase 1) and save checkpoint. Process will pause after checkpointing.
+    - 'resume': Resume from a paused checkpoint process. Completes initialization phases 2 and 3.
     """
 
     def compute_hash(self) -> str:

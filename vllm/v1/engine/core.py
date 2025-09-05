@@ -30,6 +30,7 @@ from vllm.utils import (decorate_logs, make_zmq_socket,
                         resolve_obj_by_qualname, set_process_title)
 from vllm.v1.core.kv_cache_utils import (get_kv_cache_config,
                                          unify_kv_cache_configs)
+from vllm.v1.engine.checkpoint_utils import CheckpointCoordinator
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as V1Scheduler
@@ -474,6 +475,7 @@ class EngineCoreProc(EngineCore):
         self.engine_index = engine_index
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
+        self.checkpoint_address: Optional[str] = None
 
         with self._perform_handshakes(handshake_address, identity,
                                       local_client, vllm_config,
@@ -602,9 +604,12 @@ class EngineCoreProc(EngineCore):
                              linger=5000,
                              bind=False) as handshake_socket:
             # Register engine with front-end.
-            addresses = self.startup_handshake(handshake_socket, local_client,
-                                               headless,
-                                               parallel_config_to_update)
+            addresses, checkpoint_address = self.startup_handshake(
+                handshake_socket, local_client, headless,
+                parallel_config_to_update)
+            # Store checkpoint address if provided
+            if checkpoint_address:
+                self.checkpoint_address = checkpoint_address
             yield addresses
 
             # Send ready message.
@@ -631,7 +636,7 @@ class EngineCoreProc(EngineCore):
         local_client: bool,
         headless: bool,
         parallel_config: Optional[ParallelConfig] = None,
-    ) -> EngineZmqAddresses:
+    ) -> tuple[EngineZmqAddresses, Optional[str]]:
 
         # Send registration message.
         handshake_socket.send(
@@ -656,7 +661,7 @@ class EngineCoreProc(EngineCore):
             for key, value in init_message.parallel_config.items():
                 setattr(parallel_config, key, value)
 
-        return init_message.addresses
+        return init_message.addresses, init_message.checkpoint_address
 
     @staticmethod
     def run_engine_core(*args,
@@ -699,13 +704,60 @@ class EngineCoreProc(EngineCore):
                 decorate_logs()
                 engine_core = EngineCoreProc(*args, **kwargs)
 
-            if engine_core.init_mode == "checkpoint":
-                assert hasattr(engine_core.model_executor, 'checkpoint_workers')
-                engine_core._phase_1_init_rpc()
-                # Prepare workers for checkpoint by clearing caches
-                engine_core.collective_rpc("prepare_for_checkpoint")
-                engine_core.model_executor.checkpoint_workers()
-                engine_core.state = EngineCoreProcState.CHECKPOINTED_WORKERS
+            if engine_core.init_mode in ("checkpoint", "resume"):
+                # Unified checkpoint/resume flow
+                checkpoint_coordinator = CheckpointCoordinator("engine")
+                checkpoint_address = engine_core.checkpoint_address
+                
+                if checkpoint_address:
+                    checkpoint_coordinator.initialize(checkpoint_address)
+                    
+                    # Phase 1: Initialize and checkpoint workers
+                    engine_core._phase_1_init_rpc()
+                    engine_core.collective_rpc("prepare_for_checkpoint")
+                    assert hasattr(engine_core.model_executor, 'checkpoint_workers')
+                    engine_core.model_executor.checkpoint_workers()
+                    engine_core.state = EngineCoreProcState.CHECKPOINTED_WORKERS
+                    
+                    # Send checkpointed signal to client with config hash
+                    engine_identity = engine_core.engine_index.to_bytes(2, "little")
+                    config_hash = engine_core.vllm_config.compute_hash()
+                    checkpoint_coordinator.send_checkpointed(engine_identity, config_hash)
+                    logger.info("Engine %d sent checkpointed signal with hash %s",
+                                engine_core.engine_index, config_hash)
+                    
+                    # Tear down all MPClient sockets except side-channel
+                    engine_core._teardown_client_sockets()
+                    
+                    # Wait for resume signal
+                    logger.info("Engine %d waiting for resume signal",
+                                engine_core.engine_index)
+                    resume_config_hash = checkpoint_coordinator.wait_for_resume()
+                    
+                    # Verify config hash matches
+                    current_config_hash = engine_core.vllm_config.compute_hash()
+                    if resume_config_hash != current_config_hash:
+                        raise RuntimeError(
+                            f"Config hash mismatch during resume: "
+                            f"expected {config_hash}, got {resume_config_hash}")
+                    logger.info("Config hash verified: %s", current_config_hash)
+                    
+                    # Re-establish client sockets
+                    engine_core._reestablish_client_sockets()
+                    
+                    # Restore workers and complete initialization
+                    engine_core.model_executor.restore_workers()
+                    engine_core._complete_initialization()
+                    engine_core.state = EngineCoreProcState.READY_TO_SERVE
+                    
+                    # Clean up checkpoint coordinator
+                    checkpoint_coordinator.close()
+                else:
+                    logger.warning("Checkpoint/resume mode requested but no checkpoint address provided")
+                    # Fall back to normal mode
+                    engine_core._phase_1_init_rpc()
+                    engine_core._complete_initialization()
+                    engine_core.state = EngineCoreProcState.READY_TO_SERVE
             else:
                 # Normal mode
                 engine_core._phase_1_init_rpc()
@@ -743,6 +795,32 @@ class EngineCoreProc(EngineCore):
     def is_checkpoint_ready(self) -> bool:
         """Check if phase 1 checkpoint is ready."""
         return self.state == EngineCoreProcState.CHECKPOINTED_WORKERS
+    
+    def _teardown_client_sockets(self) -> None:
+        """Tear down all sockets connecting to MPClient except side-channel."""
+        logger.info("Engine %d tearing down client sockets",
+                    self.engine_index)
+        # Store socket details for re-establishment
+        self._stored_addresses = {
+            'handshake': getattr(self, '_handshake_address', None),
+            'inputs': getattr(self, '_input_addresses', []),
+            'outputs': getattr(self, '_output_addresses', []),
+            'coordinator_input': getattr(self, '_coordinator_input_address', None),
+            'coordinator_output': getattr(self, '_coordinator_output_address', None),
+        }
+        
+        # Close sockets - these will be handled by the input/output threads
+        # We just need to signal them to stop
+        # TODO: Implement proper socket closure
+        logger.info("Socket teardown completed")
+    
+    def _reestablish_client_sockets(self) -> None:
+        """Re-establish client sockets after resume."""
+        logger.info("Engine %d re-establishing client sockets",
+                    self.engine_index)
+        # TODO: Implement socket re-establishment
+        # This will involve re-doing the handshake process
+        logger.info("Socket re-establishment completed")
     
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""

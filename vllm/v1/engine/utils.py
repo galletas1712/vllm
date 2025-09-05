@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.utils import get_mp_context, get_open_zmq_ipc_path, zmq_socket_ctx
+from vllm.v1.engine.checkpoint_utils import CheckpointCoordinator
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
@@ -72,6 +73,7 @@ class EngineHandshakeMetadata:
     """
     addresses: EngineZmqAddresses
     parallel_config: dict[str, Union[int, str]]
+    checkpoint_address: Optional[str] = None  # Side-channel for checkpoint/resume
 
 
 class CoreEngineProcManager:
@@ -603,7 +605,7 @@ def _wait_for_companion_coordinator_ready(coordinator_address: str,
             socket.send(pickle.dumps(ping_request))
             
             # Try to receive response
-            response = socket.recv()
+            socket.recv()  # Any response means coordinator is ready
             # If we got any response, coordinator is ready
             socket.close()
             context.term()
@@ -781,6 +783,15 @@ def launch_core_engines(
         local_handshake_address = handshake_address
         client_handshake_address = None
 
+    # Set up checkpoint coordinator if in checkpoint/resume mode
+    checkpoint_coordinator = None
+    checkpoint_address = None
+    if vllm_config.launch_config.init_mode in ("checkpoint", "resume"):
+        checkpoint_coordinator = CheckpointCoordinator("client")
+        checkpoint_address = checkpoint_coordinator.initialize()
+        logger.info("Checkpoint coordinator initialized at %s",
+                    checkpoint_address)
+
     with zmq_socket_ctx(local_handshake_address, zmq.ROUTER,
                         bind=True) as handshake_socket:
 
@@ -815,7 +826,27 @@ def launch_core_engines(
             vllm_config.cache_config,
             local_engine_manager,
             coordinator.proc if coordinator else None,
+            checkpoint_address,
         )
+        
+        # Handle checkpoint/resume coordination
+        if checkpoint_coordinator and local_engine_manager:
+            # Back-to-back checkpoint/resume for phase 1
+            config_hash = vllm_config.compute_hash()
+            for engine in engines_to_handshake:
+                if engine.local:
+                    # Wait for checkpointed signal and get config hash
+                    engine_config_hash = checkpoint_coordinator.wait_for_checkpointed(
+                        engine.identity)
+                    # Verify config hash matches
+                    if engine_config_hash != config_hash:
+                        raise RuntimeError(
+                            f"Config hash mismatch from engine "
+                            f"{int.from_bytes(engine.identity, 'little')}: "
+                            f"expected {config_hash}, got {engine_config_hash}")
+                    # Immediately send resume signal with config hash (no SIGSTOP/SIGCONT yet)
+                    checkpoint_coordinator.send_resume(engine.identity, config_hash)
+            checkpoint_coordinator.close()
 
 
 def wait_for_engine_startup(
@@ -826,6 +857,7 @@ def wait_for_engine_startup(
     cache_config: CacheConfig,
     proc_manager: Optional[CoreEngineProcManager],
     coord_process: Optional[Process],
+    checkpoint_address: Optional[str] = None,
 ):
     # Wait for engine core process(es) to send ready messages.
     local_count = parallel_config.data_parallel_size_local
@@ -904,7 +936,8 @@ def wait_for_engine_startup(
                         parallel_config.data_parallel_master_port,
                         "data_parallel_size":
                         parallel_config.data_parallel_size,
-                    }))
+                    },
+                    checkpoint_address=checkpoint_address))
             handshake_socket.send_multipart((eng_identity, init_message),
                                             copy=False)
             conn_pending[0 if local else 1] -= 1
