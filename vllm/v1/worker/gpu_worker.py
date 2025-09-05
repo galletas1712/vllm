@@ -652,6 +652,35 @@ class Worker(WorkerBase):
         # worker will always be healthy as long as it's running.
         return
 
+    def prepare_for_checkpoint(self) -> None:
+        """Prepare worker for checkpointing by clearing caches and memory.
+        
+        This reduces the checkpoint image size by ensuring unnecessary memory
+        allocations are freed before the checkpoint is taken.
+        """
+        logger.info("Preparing worker for checkpoint: clearing caches...")
+        
+        # Clear Python garbage first
+        gc.collect()
+        
+        # Clear CUDA cache to free GPU memory
+        torch.cuda.empty_cache()
+        
+        # Force synchronization to ensure all operations are complete
+        torch.cuda.synchronize()
+        
+        # Run gc again after CUDA operations
+        gc.collect()
+        
+        # Log memory status
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        logger.info(
+            "Worker checkpoint preparation complete. "
+            "Free GPU memory: %.2f GiB / Total: %.2f GiB",
+            free_memory / GiB_bytes,
+            total_memory / GiB_bytes
+        )
+
     def _eplb_before_scale_down(self, old_ep_size: int,
                                 new_ep_size: int) -> None:
         from vllm.distributed.parallel_state import get_ep_group

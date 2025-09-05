@@ -702,6 +702,8 @@ class EngineCoreProc(EngineCore):
             if engine_core.init_mode == "checkpoint":
                 assert hasattr(engine_core.model_executor, 'checkpoint_workers')
                 engine_core._phase_1_init_rpc()
+                # Prepare workers for checkpoint by clearing caches
+                engine_core.collective_rpc("prepare_for_checkpoint")
                 engine_core.model_executor.checkpoint_workers()
                 engine_core.state = EngineCoreProcState.CHECKPOINTED_WORKERS
             else:
