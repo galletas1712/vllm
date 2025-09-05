@@ -96,7 +96,7 @@ class MultiprocExecutor(Executor):
 
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
-            self.workers = WorkerProc.wait_for_ready(unready_workers)
+            self.workers, self.worker_pids = WorkerProc.wait_for_ready(unready_workers)
 
             # Ensure message queues are ready. Will deadlock if re-ordered
             # Must be kept consistent with the WorkerProc.
@@ -104,7 +104,9 @@ class MultiprocExecutor(Executor):
             for w in self.workers:
                 w.worker_response_mq.wait_until_ready()
 
-            self.start_worker_monitor()
+            if not self.vllm_config.launch_config.init_mode:
+                self.start_worker_monitor()
+
             success = True
         finally:
             if not success:
@@ -129,6 +131,19 @@ class MultiprocExecutor(Executor):
         self.has_connector = self.vllm_config.kv_transfer_config is not None
         self.kv_output_aggregator = KVOutputAggregator(
             self.parallel_config.world_size)
+    
+    def checkpoint_workers(self):
+        from vllm.v1.executor.checkpoint_utils import checkpoint_cuda_process
+        for pid in self.worker_pids:
+            checkpoint_cuda_process(pid)
+
+    def restore_workers(self):
+        from vllm.v1.executor.checkpoint_utils import restore_cuda_process
+        for pid in self.worker_pids:
+            restore_cuda_process(pid)
+
+        # Didn't start worker monitor in __init__, so we start it here
+        self.start_worker_monitor()
 
     def start_worker_monitor(self):
         workers = self.workers
@@ -451,7 +466,7 @@ class WorkerProc:
     @staticmethod
     def wait_for_ready(
         unready_proc_handles: list[UnreadyWorkerProcHandle]
-    ) -> list[WorkerProcHandle]:
+    ) -> tuple[list[WorkerProcHandle], list[Optional[int]]]:
 
         e = Exception("WorkerProc initialization failed due to "
                       "an exception in a background process. "
@@ -460,6 +475,7 @@ class WorkerProc:
         pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
         ready_proc_handles: list[Optional[WorkerProcHandle]] = (
             [None] * len(unready_proc_handles))
+        pids: list[Optional[int]] = [None] * len(unready_proc_handles)
         while pipes:
             ready = multiprocessing.connection.wait(pipes.keys())
             for pipe in ready:
@@ -474,6 +490,7 @@ class WorkerProc:
                     # Extract the message queue handle.
                     worker_response_mq = MessageQueue.create_from_handle(
                         response["handle"], 0)
+                    pids[unready_proc_handle.rank] = response["pid"]
                     ready_proc_handles[unready_proc_handle.rank] = (
                         WorkerProcHandle.from_unready_handle(
                             unready_proc_handle, worker_response_mq))
@@ -486,8 +503,8 @@ class WorkerProc:
                     # Close connection.
                     pipe.close()
 
-        return cast(list[WorkerProcHandle], ready_proc_handles)
-
+        return cast(list[WorkerProcHandle], ready_proc_handles), pids
+    
     def shutdown(self):
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
@@ -549,6 +566,7 @@ class WorkerProc:
                 WorkerProc.READY_STR,
                 "handle":
                 worker.worker_response_mq.export_handle(),
+                "pid": os.getpid(),
             })
 
             # Ensure message queues are ready. Will deadlock if re-ordered.

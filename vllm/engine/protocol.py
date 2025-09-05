@@ -328,3 +328,10 @@ class EngineClient(ABC):
                                drain_timeout: int = 300) -> None:
         """Scale the engine"""
         raise NotImplementedError
+    
+    async def resume_init(self) -> None:
+        """Resume initialization from phase 1 checkpoint (complete phase 2 and 3).
+        
+        This can only be called when the engine was initialized with init_mode='checkpoint'.
+        """
+        raise NotImplementedError

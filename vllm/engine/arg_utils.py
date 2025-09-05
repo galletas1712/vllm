@@ -25,14 +25,14 @@ from vllm.config import (BlockSize, CacheConfig, CacheDType, CompilationConfig,
                          ConfigFormat, ConfigType, ConvertOption,
                          DecodingConfig, DetailedTraceModules, Device,
                          DeviceConfig, DistributedExecutorBackend,
-                         GuidedDecodingBackend, HfOverrides, KVEventsConfig,
-                         KVTransferConfig, LoadConfig, LogprobsMode,
-                         LoRAConfig, ModelConfig, ModelDType, ModelImpl,
-                         MultiModalConfig, ObservabilityConfig, ParallelConfig,
-                         PoolerConfig, PrefixCachingHashAlgo, RunnerOption,
-                         SchedulerConfig, SchedulerPolicy, SpeculativeConfig,
-                         TaskOption, TokenizerMode, VllmConfig, get_attr_docs,
-                         get_field)
+                         GuidedDecodingBackend, HfOverrides, InitMode,
+                         KVEventsConfig, KVTransferConfig, LaunchConfig,
+                         LoadConfig, LogprobsMode, LoRAConfig, ModelConfig,
+                         ModelDType, ModelImpl, MultiModalConfig,
+                         ObservabilityConfig, ParallelConfig, PoolerConfig,
+                         PrefixCachingHashAlgo, RunnerOption, SchedulerConfig,
+                         SchedulerPolicy, SpeculativeConfig, TaskOption,
+                         TokenizerMode, VllmConfig, get_attr_docs, get_field)
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
@@ -331,6 +331,7 @@ class EngineArgs:
     disable_log_stats: bool = False
     revision: Optional[str] = ModelConfig.revision
     code_revision: Optional[str] = ModelConfig.code_revision
+    init_mode: Optional[InitMode] = LaunchConfig.init_mode
     rope_scaling: dict[str, Any] = get_field(ModelConfig, "rope_scaling")
     rope_theta: Optional[float] = ModelConfig.rope_theta
     hf_token: Optional[Union[bool, str]] = ModelConfig.hf_token
@@ -428,6 +429,9 @@ class EngineArgs:
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
+    
+    # Launch configuration
+    init_mode: Optional[str] = LaunchConfig.init_mode
 
     enable_multimodal_encoder_data_parallel: bool = \
         ParallelConfig.enable_multimodal_encoder_data_parallel
@@ -568,6 +572,15 @@ class EngineArgs:
         load_group.add_argument("--enable-companion-process",
                                 dest="enable_companion_process",
                                 **load_kwargs["enable_companion_process"])
+
+        # Launch configuration arguments
+        launch_kwargs = get_kwargs(LaunchConfig)
+        launch_group = parser.add_argument_group(
+            title="LaunchConfig",
+            description=LaunchConfig.__doc__,
+        )
+        launch_group.add_argument("--init-mode",
+                                  **launch_kwargs["init_mode"])
 
         # Guided decoding arguments
         guided_decoding_kwargs = get_kwargs(DecodingConfig)
@@ -1328,6 +1341,7 @@ class EngineArgs:
         from vllm.config import CompanionConfig
         
         companion_config = CompanionConfig()
+        launch_config = LaunchConfig(init_mode=self.init_mode)
         
         config = VllmConfig(
             model_config=model_config,
@@ -1338,6 +1352,7 @@ class EngineArgs:
             lora_config=lora_config,
             speculative_config=speculative_config,
             load_config=load_config,
+            launch_config=launch_config,
             companion_config=companion_config,
             decoding_config=decoding_config,
             observability_config=observability_config,

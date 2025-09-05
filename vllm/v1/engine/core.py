@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from enum import Enum
 import os
 import queue
 import signal
@@ -73,6 +74,9 @@ class EngineCore:
                     VLLM_VERSION, vllm_config)
 
         self.log_stats = log_stats
+        
+        # Checkpoint support - get init mode from launch_config
+        self.init_mode = vllm_config.launch_config.init_mode
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -80,9 +84,31 @@ class EngineCore:
             self.model_executor.register_failure_callback(
                 executor_fail_callback)
 
-        self.available_gpu_memory_for_kv_cache = -1
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
+
+        self.mm_input_cache_server = MultiModalInputCacheServer(
+            vllm_config.model_config, MULTIMODAL_REGISTRY)
+
+        # Setup batch queue for pipeline parallelism.
+        # Batch queue for scheduled batches. This enables us to asynchronously
+        # schedule and execute batches, and is required by pipeline parallelism
+        # to eliminate pipeline bubbles.
+        self.batch_queue_size = self.model_executor.max_concurrent_batches
+        self.batch_queue: Optional[queue.Queue[tuple[Future[ModelRunnerOutput],
+                                                     SchedulerOutput]]] = None
+        if self.batch_queue_size > 1:
+            logger.info("Batch queue is enabled with size %d",
+                        self.batch_queue_size)
+            self.batch_queue = queue.Queue(self.batch_queue_size)
+
+
+    def _phase_1_init_rpc(self) -> None:
         logger.info("Init stage: phase 1")
         self.collective_rpc("phase_1_init")
+    
+    def _complete_initialization(self) -> None:
+        vllm_config = self.vllm_config
+
         logger.info("Init stage: phase 2")
         available_gpu_memory = self.collective_rpc("phase_2_init")
         logger.info("Init stage: KV cache config initialization")
@@ -96,8 +122,6 @@ class EngineCore:
 
         logger.info("Init stage: phase 3")
         self.collective_rpc("phase_3_init")
-
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
         if isinstance(vllm_config.scheduler_config.scheduler_cls, str):
@@ -130,21 +154,6 @@ class EngineCore:
             > 1,
             log_stats=self.log_stats,
         )
-
-        self.mm_input_cache_server = MultiModalInputCacheServer(
-            vllm_config.model_config, MULTIMODAL_REGISTRY)
-
-        # Setup batch queue for pipeline parallelism.
-        # Batch queue for scheduled batches. This enables us to asynchronously
-        # schedule and execute batches, and is required by pipeline parallelism
-        # to eliminate pipeline bubbles.
-        self.batch_queue_size = self.model_executor.max_concurrent_batches
-        self.batch_queue: Optional[queue.Queue[tuple[Future[ModelRunnerOutput],
-                                                     SchedulerOutput]]] = None
-        if self.batch_queue_size > 1:
-            logger.info("Batch queue is enabled with size %d",
-                        self.batch_queue_size)
-            self.batch_queue = queue.Queue(self.batch_queue_size)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig,
@@ -401,7 +410,6 @@ class EngineCore:
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args,
                                                   kwargs)
-
     def save_tensorized_model(
         self,
         tensorizer_config,
@@ -436,6 +444,11 @@ class EngineCore:
         return req, request.current_wave
 
 
+class EngineCoreProcState(Enum):
+    UNINITIALIZED = "uninitialized"
+    CHECKPOINTED_WORKERS = "checkpointed_workers"
+    READY_TO_SERVE = "ready_to_serve"
+
 class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
@@ -451,6 +464,7 @@ class EngineCoreProc(EngineCore):
         client_handshake_address: Optional[str] = None,
         engine_index: int = 0,
     ):
+        self.state = EngineCoreProcState.UNINITIALIZED
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs],
                                               bytes]]()
@@ -594,7 +608,10 @@ class EngineCoreProc(EngineCore):
             yield addresses
 
             # Send ready message.
-            num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
+            # In checkpoint mode, num_gpu_blocks is not calculated yet.
+            num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks or 0
+            # TODO (schwinns): move this information out of handshake - do this somewhere else so we actually get valid info?
+
             # We pass back the coordinator stats update address here for the
             # external LB case for our colocated front-end to use (coordinator
             # only runs with rank 0).
@@ -682,6 +699,17 @@ class EngineCoreProc(EngineCore):
                 decorate_logs()
                 engine_core = EngineCoreProc(*args, **kwargs)
 
+            if engine_core.init_mode == "checkpoint":
+                assert hasattr(engine_core.model_executor, 'checkpoint_workers')
+                engine_core._phase_1_init_rpc()
+                engine_core.model_executor.checkpoint_workers()
+                engine_core.state = EngineCoreProcState.CHECKPOINTED_WORKERS
+            else:
+                # Normal mode
+                engine_core._phase_1_init_rpc()
+                engine_core._complete_initialization()
+                engine_core.state = EngineCoreProcState.READY_TO_SERVE
+
             engine_core.run_busy_loop()
 
         except SystemExit:
@@ -697,6 +725,15 @@ class EngineCoreProc(EngineCore):
         finally:
             if engine_core is not None:
                 engine_core.shutdown()
+    
+    def resume_init(self):
+        if self.state != EngineCoreProcState.CHECKPOINTED_WORKERS:
+            raise RuntimeError(f"Cannot resume from state {self.state}. "
+                            "Expected CHECKPOINTED_WORKERS.")
+        self.model_executor.restore_workers()
+        self._complete_initialization()
+        self.state = EngineCoreProcState.READY_TO_SERVE
+        logger.info("Resume initialization completed")
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
@@ -709,13 +746,14 @@ class EngineCoreProc(EngineCore):
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
-            self._process_engine_step()
+            if self.state == EngineCoreProcState.READY_TO_SERVE:
+                self._process_engine_step()
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
         waited = False
-        while not self.engines_running and not self.scheduler.has_requests():
+        while not self.engines_running and (not hasattr(self, 'scheduler') or not self.scheduler.has_requests()):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
@@ -746,6 +784,9 @@ class EngineCoreProc(EngineCore):
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.ADD:
+            if self.state != EngineCoreProcState.READY_TO_SERVE:
+                logger.error("Received ADD request before initialization complete")
+                return
             req, request_wave = request
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:

@@ -230,6 +230,9 @@ class EngineCoreClient(ABC):
             kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         raise NotImplementedError
 
+    async def resume_init_async(self) -> None:
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -258,6 +261,10 @@ class InprocClient(EngineCoreClient):
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
+
+    def resume_init(self) -> None:
+        """Resume initialization from checkpoint."""
+        self.engine_core.resume_init()
 
     def shutdown(self) -> None:
         self.engine_core.shutdown()
@@ -956,6 +963,9 @@ class AsyncMPClient(MPClient):
             kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return await self.call_utility_async("collective_rpc", method, timeout,
                                              args, kwargs)
+
+    async def resume_init_async(self) -> None:
+        await self.call_utility_async("resume_init")
 
 
 class DPAsyncMPClient(AsyncMPClient):
