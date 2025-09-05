@@ -583,3 +583,18 @@ class MessageQueue:
             buffer_io = MessageQueue.create_from_handle(handle, group_rank)
         buffer_io.wait_until_ready()
         return buffer_io
+
+    def close(self):
+        """Close ZMQ sockets and context."""
+        if hasattr(self, 'local_socket') and self.local_socket:
+            self.local_socket.close()
+            self.local_socket = None
+        if hasattr(self, 'remote_socket') and self.remote_socket:
+            self.remote_socket.close()
+            self.remote_socket = None
+        if hasattr(self, 'context') and self.context:
+            self.context.term()
+            self.context = None
+
+    def __del__(self):
+        self.close()

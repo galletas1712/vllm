@@ -34,6 +34,7 @@ from vllm.config.cache import (BlockSize, CacheConfig, CacheDType,
 from vllm.config.companion import CompanionConfig
 from vllm.config.compilation import (CompilationConfig, CompilationLevel,
                                      PassConfig)
+from vllm.config.launch import InitMode, LaunchConfig
 from vllm.config.parallel import DistributedExecutorBackend, ParallelConfig
 from vllm.config.scheduler import SchedulerConfig, SchedulerPolicy
 from vllm.config.utils import ConfigType, config
@@ -3281,6 +3282,8 @@ class VllmConfig:
     """Device configuration."""
     load_config: LoadConfig = field(default_factory=LoadConfig)
     """Load configuration."""
+    launch_config: LaunchConfig = field(default_factory=LaunchConfig)
+    """Launch configuration."""
     companion_config: CompanionConfig = field(default_factory=CompanionConfig)
     """Companion process configuration."""
     lora_config: Optional[LoRAConfig] = None
@@ -3364,6 +3367,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.load_config:
             vllm_factors.append(self.load_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.launch_config:
+            vllm_factors.append(self.launch_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.lora_config:

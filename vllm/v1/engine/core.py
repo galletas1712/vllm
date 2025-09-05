@@ -73,16 +73,43 @@ class EngineCore:
                     VLLM_VERSION, vllm_config)
 
         self.log_stats = log_stats
+        
+        # Checkpoint support - get init mode from launch_config
+        self.init_mode = vllm_config.launch_config.init_mode
 
         # Setup Model.
+        # NOTE: if in load_checkpoint or resume_checkpoint mode, workers are
+        # already restored in self.model_executor__init__
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(
                 executor_fail_callback)
 
-        self.available_gpu_memory_for_kv_cache = -1
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
+
+        self.mm_input_cache_server = MultiModalInputCacheServer(
+            vllm_config.model_config, MULTIMODAL_REGISTRY)
+
+        # Setup batch queue for pipeline parallelism.
+        # Batch queue for scheduled batches. This enables us to asynchronously
+        # schedule and execute batches, and is required by pipeline parallelism
+        # to eliminate pipeline bubbles.
+        self.batch_queue_size = self.model_executor.max_concurrent_batches
+        self.batch_queue: Optional[queue.Queue[tuple[Future[ModelRunnerOutput],
+                                                     SchedulerOutput]]] = None
+        if self.batch_queue_size > 1:
+            logger.info("Batch queue is enabled with size %d",
+                        self.batch_queue_size)
+            self.batch_queue = queue.Queue(self.batch_queue_size)
+
+
+    def _phase_1_init_rpc(self) -> None:
         logger.info("Init stage: phase 1")
         self.collective_rpc("phase_1_init")
+    
+    def _complete_initialization(self) -> None:
+        vllm_config = self.vllm_config
+
         logger.info("Init stage: phase 2")
         available_gpu_memory = self.collective_rpc("phase_2_init")
         logger.info("Init stage: KV cache config initialization")
@@ -96,8 +123,6 @@ class EngineCore:
 
         logger.info("Init stage: phase 3")
         self.collective_rpc("phase_3_init")
-
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
         if isinstance(vllm_config.scheduler_config.scheduler_cls, str):
@@ -130,21 +155,6 @@ class EngineCore:
             > 1,
             log_stats=self.log_stats,
         )
-
-        self.mm_input_cache_server = MultiModalInputCacheServer(
-            vllm_config.model_config, MULTIMODAL_REGISTRY)
-
-        # Setup batch queue for pipeline parallelism.
-        # Batch queue for scheduled batches. This enables us to asynchronously
-        # schedule and execute batches, and is required by pipeline parallelism
-        # to eliminate pipeline bubbles.
-        self.batch_queue_size = self.model_executor.max_concurrent_batches
-        self.batch_queue: Optional[queue.Queue[tuple[Future[ModelRunnerOutput],
-                                                     SchedulerOutput]]] = None
-        if self.batch_queue_size > 1:
-            logger.info("Batch queue is enabled with size %d",
-                        self.batch_queue_size)
-            self.batch_queue = queue.Queue(self.batch_queue_size)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig,
@@ -339,10 +349,13 @@ class EngineCore:
         return engine_core_outputs, scheduled_batch
 
     def shutdown(self):
-        self.structured_output_manager.clear_backend()
-        if self.model_executor:
+        # In save_checkpoint mode, many components are not initialized.
+        if hasattr(self, "structured_output_manager") and \
+                self.structured_output_manager is not None:
+            self.structured_output_manager.clear_backend()
+        if hasattr(self, "model_executor") and self.model_executor:
             self.model_executor.shutdown()
-        if self.scheduler:
+        if hasattr(self, "scheduler") and self.scheduler:
             self.scheduler.shutdown()
 
     def profile(self, is_start: bool = True):
@@ -401,6 +414,12 @@ class EngineCore:
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args,
                                                   kwargs)
+    
+    def resume_init(self) -> None:
+        """Resume initialization from phase 1 checkpoint (complete phase 2 and 3)."""
+        if self.init_mode != "load_checkpoint":
+            raise ValueError("resume_init can only be called when init_mode is 'load_checkpoint'")
+        self._complete_initialization()
 
     def save_tensorized_model(
         self,
@@ -594,7 +613,10 @@ class EngineCoreProc(EngineCore):
             yield addresses
 
             # Send ready message.
-            num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
+            # In save_checkpoint mode, num_gpu_blocks is not calculated yet.
+            num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks or 0
+            # TODO (schwinns): move this information out of handshake - do this somewhere else so we actually get valid info?
+
             # We pass back the coordinator stats update address here for the
             # external LB case for our colocated front-end to use (coordinator
             # only runs with rank 0).
@@ -682,7 +704,21 @@ class EngineCoreProc(EngineCore):
                 decorate_logs()
                 engine_core = EngineCoreProc(*args, **kwargs)
 
-            engine_core.run_busy_loop()
+            if engine_core.init_mode == "save_checkpoint":
+                assert hasattr(engine_core.model_executor, 'checkpoint_workers')
+                engine_core._phase_1_init_rpc()
+                engine_core.model_executor.checkpoint_workers()
+            elif engine_core.init_mode == "load_checkpoint":
+                # For load_checkpoint mode, just start the busy loop without further initialization
+                engine_core.run_busy_loop()
+            elif engine_core.init_mode == "resume_checkpoint":
+                engine_core._complete_initialization()
+                engine_core.run_busy_loop()
+            else:
+                # Normal mode or resume_checkpoint mode
+                engine_core._phase_1_init_rpc()
+                engine_core._complete_initialization()
+                engine_core.run_busy_loop()
 
         except SystemExit:
             logger.debug("EngineCore exiting.")

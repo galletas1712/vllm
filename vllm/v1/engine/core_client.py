@@ -443,6 +443,9 @@ class MPClient(EngineCoreClient):
         try:
             # State used for data parallel.
             self.engines_running = False
+            # Initialize utility_results early to avoid AttributeError
+            # if shutdown is called before full initialization
+            self.utility_results: dict[int, AnyFuture] = {}
 
             self.stats_update_address: Optional[str] = None
             if client_addresses is not None:
@@ -453,13 +456,33 @@ class MPClient(EngineCoreClient):
                     "stats_update_address")
             else:
                 # Engines are managed by this client.
-                with launch_core_engines(vllm_config, executor_class,
-                                         log_stats) as engine_context:
+                checkpoint_mode = (vllm_config.launch_config.init_mode == 
+                                   'save_checkpoint')
+                with launch_core_engines(
+                        vllm_config,
+                        executor_class,
+                        log_stats,
+                        checkpoint_mode=checkpoint_mode) as engine_context:
                     (engine_manager, coordinator, addresses,
                      companion_coordinator) = engine_context
                     self.resources.coordinator = coordinator
                     self.resources.engine_manager = engine_manager
                     self.resources.companion_coordinator = companion_coordinator
+                
+                if checkpoint_mode:
+                    logger.info("Checkpoint mode detected. Waiting for engine "
+                                "processes to complete checkpointing and exit.")
+                    # Wait for all engine processes to finish
+                    if engine_manager and hasattr(engine_manager, 'processes'):
+                        for proc in engine_manager.processes:
+                            proc.join()
+                    if coordinator and coordinator.proc:
+                        coordinator.proc.join()
+
+                    logger.info("All engine processes have exited. "
+                                "Bypassing server startup.")
+                    self.shutdown()
+                    return
 
                 (input_address, ) = addresses.inputs
                 (output_address, ) = addresses.outputs
@@ -508,7 +531,6 @@ class MPClient(EngineCoreClient):
                 identities.remove(identity)
 
             self.core_engine: EngineIdentity = self.core_engines[0]
-            self.utility_results: dict[int, AnyFuture] = {}
 
             # Request objects which may contain pytorch-allocated tensors
             # that we need to keep references to until zmq is done with the
@@ -777,15 +799,20 @@ class AsyncMPClient(MPClient):
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[Union[EngineCoreOutputs,
                                                  Exception]]()
-        try:
-            # If we are running in an asyncio event loop, start the queue task.
-            # Otherwise, it will be started lazily. If it is not started here,
-            # we could miss EXECUTOR_FAILED messages from engine core if they
-            # occur prior to any requests being sent.
-            asyncio.get_running_loop()
-            self._ensure_output_queue_task()
-        except RuntimeError:
-            pass
+        
+        # Skip output queue task in checkpoint mode since we'll exit early
+        checkpoint_mode = (vllm_config.launch_config.init_mode == 
+                           'save_checkpoint')
+        if not checkpoint_mode:
+            try:
+                # If we are running in an asyncio event loop, start the queue
+                # task. Otherwise, it will be started lazily. If it is not
+                # started here, we could miss EXECUTOR_FAILED messages from
+                # engine core if they occur prior to any requests being sent.
+                asyncio.get_running_loop()
+                self._ensure_output_queue_task()
+            except RuntimeError:
+                pass
 
     def _ensure_output_queue_task(self):
         resources = self.resources

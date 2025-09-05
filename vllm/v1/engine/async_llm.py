@@ -59,6 +59,7 @@ class AsyncLLM(EngineClient):
         client_addresses: Optional[dict[str, str]] = None,
         client_count: int = 1,
         client_index: int = 0,
+        checkpoint_after_phase1: bool = False,
     ) -> None:
         """
         Create an AsyncLLM.
@@ -94,6 +95,8 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.log_requests = log_requests
         self.log_stats = log_stats
+        self._checkpoint_mode = (vllm_config.launch_config.init_mode == 
+                                 'save_checkpoint')
 
         if self.model_config.skip_tokenizer_init:
             self.tokenizer = None
@@ -115,6 +118,9 @@ class AsyncLLM(EngineClient):
         self.output_processor = OutputProcessor(self.tokenizer,
                                                 log_stats=self.log_stats)
 
+        # Initialize output_handler early to avoid AttributeError in __del__
+        self.output_handler: Optional[asyncio.Task] = None
+
         # EngineCore (starts the engine in background process).
         self.engine_core = EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,
@@ -124,6 +130,20 @@ class AsyncLLM(EngineClient):
             client_count=client_count,
             client_index=client_index,
         )
+
+        if self._checkpoint_mode:
+            # In save_checkpoint mode, the engine core client already handles
+            # waiting for workers to complete checkpointing and exits
+            # gracefully. No need to call shutdown() again as it's already
+            # been done.
+            logger.info("AsyncLLM initialization completed in "
+                        "save_checkpoint mode.")
+            # Set flag to indicate checkpoint mode completed
+            self._checkpoint_completed = True
+            return
+        
+        # Initialize for normal mode
+        self._checkpoint_completed = False
 
         # Loggers.
         self.logger_manager: Optional[StatLoggerManager] = None
@@ -135,7 +155,6 @@ class AsyncLLM(EngineClient):
             )
             self.logger_manager.log_engine_initialized()
 
-        self.output_handler: Optional[asyncio.Task] = None
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -222,6 +241,10 @@ class AsyncLLM(EngineClient):
         cancel_task_threadsafe(getattr(self, "output_handler", None))
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        if getattr(self, '_checkpoint_completed', False):
+            raise RuntimeError(
+                "AsyncLLM is in checkpoint mode and has completed. "
+                "No operations are available.")
         return await self.engine_core.get_supported_tasks_async()
 
     async def add_request(
@@ -558,6 +581,11 @@ class AsyncLLM(EngineClient):
         if self.errored:
             raise self.dead_error
 
+    @property
+    def checkpoint_mode(self) -> bool:
+        """Returns True if engine is in checkpoint mode."""
+        return getattr(self, '_checkpoint_mode', False)
+
     async def start_profile(self) -> None:
         await self.engine_core.profile_async(True)
 
@@ -611,6 +639,14 @@ class AsyncLLM(EngineClient):
         """
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs)
+    
+    async def resume_init(self) -> None:
+        """Resume initialization from phase 1 checkpoint.
+        
+        Complete phase 2 and 3. This can only be called when the engine
+        was initialized with init_mode='load_checkpoint'.
+        """
+        await self.engine_core.collective_rpc_async("resume_init")
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""

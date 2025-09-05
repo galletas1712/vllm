@@ -634,6 +634,7 @@ def launch_core_engines(
     executor_class: type[Executor],
     log_stats: bool,
     num_api_servers: int = 1,
+    checkpoint_mode: bool = False,
 ) -> Iterator[tuple[
         Optional[Union[CoreEngineProcManager, CoreEngineActorManager]],
         Optional[DPCoordinator],
@@ -815,6 +816,7 @@ def launch_core_engines(
             vllm_config.cache_config,
             local_engine_manager,
             coordinator.proc if coordinator else None,
+            checkpoint_mode=checkpoint_mode,
         )
 
 
@@ -826,6 +828,7 @@ def wait_for_engine_startup(
     cache_config: CacheConfig,
     proc_manager: Optional[CoreEngineProcManager],
     coord_process: Optional[Process],
+    checkpoint_mode: bool = False,
 ):
     # Wait for engine core process(es) to send ready messages.
     local_count = parallel_config.data_parallel_size_local
@@ -927,6 +930,11 @@ def wait_for_engine_startup(
 
             start_pending[0 if local else 1] -= 1
             engine.state = CoreEngineState.READY
+
+            # In checkpoint mode, we don't wait for the engine to stay running.
+            if checkpoint_mode:
+                poller.unregister(handshake_socket)
+
         else:
             raise RuntimeError(f"Unexpected {status} message for "
                                f"{'local' if local else 'remote'} engine "

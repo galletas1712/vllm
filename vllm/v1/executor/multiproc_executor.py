@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
+import json
 import multiprocessing
 import os
 import pickle
@@ -8,6 +10,7 @@ import threading
 import time
 import traceback
 import weakref
+from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -35,6 +38,7 @@ from vllm.utils import (decorate_logs, get_distributed_init_method,
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.v1.checkpoint_utils import CheckpointManager, compute_checkpoint_hash
 
 logger = init_logger(__name__)
 
@@ -51,6 +55,32 @@ class MultiprocExecutor(Executor):
         self.shutdown_event = threading.Event()
         self.failure_callback: Optional[FailureCallback] = None
         self.io_thread_pool: Optional[ThreadPoolExecutor] = None
+
+        # Checkpoint support - get init mode from launch_config
+        self.init_mode = self.vllm_config.launch_config.init_mode
+        
+        # Compute config hash for checkpoint directory
+        self.config_hash = compute_checkpoint_hash(self.vllm_config)
+        self.checkpoint_base_dir = "/tmp/vllm_checkpoints"
+        self.checkpoint_manager = None
+        
+        # If load_checkpoint or resume_checkpoint requested, check for existing checkpoint
+        if self.init_mode in ["load_checkpoint", "resume_checkpoint"]:
+            manager = CheckpointManager.find_checkpoint(
+                base_dir=self.checkpoint_base_dir, 
+                config_hash=self.config_hash, 
+                dp_rank=self.parallel_config.data_parallel_rank
+            )
+            if not manager:
+                raise RuntimeError(f"No checkpoint found for config hash {self.config_hash} with dp_rank {self.parallel_config.data_parallel_rank}")
+            self.checkpoint_manager = manager
+        elif self.init_mode == "save_checkpoint":
+            # Create checkpoint manager for saving
+            self.checkpoint_manager = CheckpointManager(
+                base_dir=self.checkpoint_base_dir, 
+                config_hash=self.config_hash, 
+                dp_rank=self.parallel_config.data_parallel_rank
+            )
 
         self.world_size = self.parallel_config.world_size
         tensor_parallel_size = self.parallel_config.tensor_parallel_size
@@ -74,47 +104,64 @@ class MultiprocExecutor(Executor):
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
+        # Avoid creating local shared memory segments during checkpoint save
+        # to prevent /dev/shm artifacts that CRIU struggles with.
+        broadcast_local_readers = (0 if self.init_mode == "save_checkpoint"
+                                   else self.world_size)
         self.rpc_broadcast_mq = MessageQueue(self.world_size,
-                                             self.world_size,
+                                             broadcast_local_readers,
                                              max_chunk_bytes=max_chunk_bytes)
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
 
-        # Create workers
-        unready_workers: list[UnreadyWorkerProcHandle] = []
-        success = False
-        try:
+        # Create workers or reconnect to restored workers
+        if self.init_mode in ["load_checkpoint", "resume_checkpoint"]:
+            assert self.checkpoint_manager is not None
+            # First restore the worker processes
+            logger.info("Restoring workers from checkpoint with hash %s", self.config_hash)
             for rank in range(self.world_size):
-                unready_workers.append(
-                    WorkerProc.make_worker_process(
-                        vllm_config=self.vllm_config,
-                        local_rank=rank,
-                        rank=rank,
-                        distributed_init_method=distributed_init_method,
-                        fake_distributed_init_method=fake_distributed_init_method,
-                        input_shm_handle=scheduler_output_handle,
-                    ))
+                pid = self.checkpoint_manager.restore_worker(rank)
+                logger.info("Restored worker %d with PID %d", rank, pid)
+            
+            # Then reconnect to them
+            self.workers = self._reconnect_to_restored_workers(scheduler_output_handle)
+        else:
+            # Normal worker creation
+            unready_workers: list[UnreadyWorkerProcHandle] = []
+            success = False
+            try:
+                for rank in range(self.world_size):
+                    unready_workers.append(
+                        WorkerProc.make_worker_process(
+                            vllm_config=self.vllm_config,
+                            local_rank=rank,
+                            rank=rank,
+                            distributed_init_method=distributed_init_method,
+                            fake_distributed_init_method=fake_distributed_init_method,
+                            input_shm_handle=scheduler_output_handle,
+                        ))
 
-            # Workers must be created before wait_for_ready to avoid
-            # deadlock, since worker.init_device() does a device sync.
-            self.workers = WorkerProc.wait_for_ready(unready_workers)
+                # Workers must be created before wait_for_ready to avoid
+                # deadlock, since worker.init_device() does a device sync.
+                self.workers = WorkerProc.wait_for_ready(unready_workers)
+                success = True
+            finally:
+                if not success:
+                    # Clean up the worker procs if there was a failure.
+                    # Close death_writers first to signal workers to exit
+                    for uw in unready_workers:
+                        if uw.death_writer is not None:
+                            uw.death_writer.close()
+                    self._ensure_worker_termination(
+                        [uw.proc for uw in unready_workers])
 
-            # Ensure message queues are ready. Will deadlock if re-ordered
-            # Must be kept consistent with the WorkerProc.
-            self.rpc_broadcast_mq.wait_until_ready()
-            for w in self.workers:
-                w.worker_response_mq.wait_until_ready()
+        # Ensure message queues are ready. Will deadlock if re-ordered
+        # Must be kept consistent with the WorkerProc.
+        self.rpc_broadcast_mq.wait_until_ready()
+        for w in self.workers:
+            w.worker_response_mq.wait_until_ready()
 
+        if self.init_mode != "save_checkpoint":
             self.start_worker_monitor()
-            success = True
-        finally:
-            if not success:
-                # Clean up the worker procs if there was a failure.
-                # Close death_writers first to signal workers to exit
-                for uw in unready_workers:
-                    if uw.death_writer is not None:
-                        uw.death_writer.close()
-                self._ensure_worker_termination(
-                    [uw.proc for uw in unready_workers])
 
         # For pipeline parallel, we use a thread pool for asynchronous
         # execute_model.
@@ -129,6 +176,55 @@ class MultiprocExecutor(Executor):
         self.has_connector = self.vllm_config.kv_transfer_config is not None
         self.kv_output_aggregator = KVOutputAggregator(
             self.parallel_config.world_size)
+        
+    def _reconnect_to_restored_workers(self, scheduler_output_handle: "Handle") -> list["WorkerProcHandle"]:
+        """Reconnect to workers that were restored from checkpoint."""
+        import socket
+        workers = []
+        
+        for rank in range(self.world_size):
+            # Wait for worker to write its reconnection socket path
+            socket_path_file = Path(f"/tmp/vllm_worker_{self.config_hash}_{rank}_dp{self.parallel_config.data_parallel_rank}_socket_path.txt")
+            # Wait for up to 30 seconds for the file to appear
+            for _ in range(300):
+                if socket_path_file.exists():
+                    break
+                time.sleep(0.1)
+            else:
+                raise RuntimeError(f"Worker {rank} did not create a socket path file in time.")
+            
+            with open(socket_path_file) as f:
+                socket_path = f.read().strip()
+            
+            # Connect to worker via Unix domain socket
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(socket_path)
+            
+            # Create new message queue for this worker. During resume/load
+            # we can resume normal local shared memory since the new executor
+            # is a fresh process (no CRIU dump here).
+            worker_response_mq = MessageQueue(1, 1)
+            
+            # Send reconnection info
+            reconnect_info = {
+                "input_handle": scheduler_output_handle.to_bytes(),
+                "output_handle": worker_response_mq.export_handle().to_bytes(),
+            }
+            sock.send(json.dumps(reconnect_info).encode())
+            sock.close()
+            
+            # Create worker handle
+            handle = WorkerProcHandle(
+                proc=None,  # Process already running
+                rank=rank,
+                worker_response_mq=worker_response_mq,
+                death_writer=None
+            )
+            workers.append(handle)
+            
+            logger.info("Reconnected to worker %d", rank)
+        
+        return workers
 
     def start_worker_monitor(self):
         workers = self.workers
@@ -326,6 +422,95 @@ class MultiprocExecutor(Executor):
         # 24-31, PP rank 3
         # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
         return self.world_size - self.parallel_config.tensor_parallel_size
+    
+    def checkpoint_workers(self) -> None:
+        """Checkpoint all workers after phase 1 initialization."""
+        if not self.checkpoint_manager:
+            raise RuntimeError("Checkpoint manager not initialized")
+        
+        logger.info("Starting worker checkpoint process with config hash %s", self.config_hash)
+        
+        import socket
+        
+        # First, set up all listening sockets
+        sockets = {}
+        for rank in range(self.world_size):
+            socket_path = f"/tmp/vllm_ckpt_ready_{self.config_hash}_{rank}_dp{self.parallel_config.data_parallel_rank}.sock"
+            
+            # Clean up if exists
+            if os.path.exists(socket_path):
+                os.remove(socket_path)
+            
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(socket_path)
+            sock.listen(1)
+            sock.settimeout(30.0)  # 30 second timeout
+            
+            sockets[rank] = (sock, socket_path)
+        
+        logger.info("Created checkpoint ready sockets, triggering worker preparation...")
+        
+        # Now trigger all workers to prepare for checkpoint
+        # They will connect to the sockets we just created
+        self.collective_rpc("prepare_for_checkpoint_save")
+        
+        # Wait for all workers to signal readiness
+        logger.info("Waiting for workers to signal checkpoint readiness...")
+        worker_infos = {}
+        
+        for rank, (sock, socket_path) in sockets.items():
+            try:
+                logger.info("Waiting for worker %d to connect on %s", rank, socket_path)
+                conn, _ = sock.accept()
+                data = conn.recv(1024)
+                worker_info = json.loads(data.decode())
+                worker_infos[rank] = worker_info
+                conn.close()
+                logger.info("Worker %d signaled checkpoint readiness (PID: %d)", rank, worker_info["pid"])
+            except socket.timeout as e:
+                raise RuntimeError(f"Worker {rank} did not signal checkpoint readiness in time") from e
+            finally:
+                sock.close()
+                # Clean up socket file
+                if os.path.exists(socket_path):
+                    os.remove(socket_path)
+        
+        # Now checkpoint all workers
+        for rank, info in worker_infos.items():
+            logger.info("Checkpointing CUDA state for worker %d", rank)
+            self.checkpoint_manager.cuda_checkpoint_worker(info, rank)
+        
+        pids = [info["pid"] for info in worker_infos.values()]
+        self.checkpoint_manager.criu_dump_all_workers(pids)
+
+        logger.info("Worker checkpoint completed at %s", self.checkpoint_manager.checkpoint_dir)
+    
+    @classmethod
+    def restore_from_checkpoint(cls, checkpoint_dir: str = "/tmp/vllm_checkpoints",
+                                config_hash: str = None, 
+                                world_size: int = None) -> None:
+        """Restore workers from checkpoint for use by new executor.
+        
+        This method just restores the worker processes. The actual executor
+        will be created by the normal initialization flow.
+        """
+        # Set environment variable to indicate restoration
+        os.environ["VLLM_RESTORED_FROM_CHECKPOINT"] = "1"
+        
+        if not config_hash or not world_size:
+            raise ValueError("config_hash and world_size must be provided")
+        
+        # Restore workers from checkpoint
+        checkpoint_manager = CheckpointManager(checkpoint_dir, config_hash=config_hash)
+        
+        logger.info("Restoring %d workers from checkpoint", world_size)
+        
+        # Restore each worker process
+        for rank in range(world_size):
+            pid = checkpoint_manager.restore_worker(rank)
+            logger.info("Restored worker %d with PID %d", rank, pid)
+        
+        logger.info("All workers restored from checkpoint")
 
 
 @dataclass
@@ -370,7 +555,14 @@ class WorkerProc:
         fake_distributed_init_method: str,
         input_shm_handle: Handle,
     ):
+        # Checkpoint support - get init mode from launch_config
+        self.init_mode = vllm_config.launch_config.init_mode
+        assert (self.init_mode != "load_checkpoint" and 
+                self.init_mode != "resume_checkpoint")
+
         self.rank = rank
+        self.config_hash = compute_checkpoint_hash(vllm_config)
+        self.parallel_config = vllm_config.parallel_config
         wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -405,10 +597,104 @@ class WorkerProc:
             input_shm_handle, self.worker.rank)
 
         # Initializes a message queue for sending the model output
-        self.worker_response_mq = MessageQueue(1, 1)
+        # Avoid using local shared memory (which creates /dev/shm artifacts)
+        # when we are preparing to save a checkpoint. Use TCP-based MQ instead.
+        n_local_reader = 0 if self.init_mode == "save_checkpoint" else 1
+        self.worker_response_mq = MessageQueue(1, n_local_reader)
 
         # Do not initialize device or load model here. EngineCore orchestrates
         # initialization by dispatching ordered RPCs to workers.
+        
+    def _wait_for_ipc_reconnection(self):
+        """Wait for IPC reconnection after being restored from checkpoint."""
+        logger.info("Worker %s waiting for IPC reconnection after checkpoint restore", self.rank)
+        
+        # Create a Unix domain socket to receive reconnection info
+        import socket
+        socket_path = f"/tmp/vllm_worker_{self.config_hash}_{self.rank}_dp{self.parallel_config.data_parallel_rank}_reconnect.sock"
+        # Ensure the socket does not already exist
+        if os.path.exists(socket_path):
+            os.remove(socket_path)
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(socket_path)
+        
+        # Write our socket path to a known location for discovery
+        socket_path_file = Path(f"/tmp/vllm_worker_{self.config_hash}_{self.rank}_dp{self.parallel_config.data_parallel_rank}_socket_path.txt")
+        with open(socket_path_file, "w") as f:
+            f.write(socket_path)
+        
+        sock.listen(1)
+        logger.info("Worker %s listening on Unix socket %s for reconnection", self.rank, socket_path)
+
+        # This is the exit point!
+        self._prepare_for_checkpoint_save()
+        
+        # Wait for connection from new executor
+        conn, addr = sock.accept()
+        data = conn.recv(4096)
+        reconnect_info = json.loads(data.decode())
+        conn.close()
+        sock.close()
+        
+        # Clean up socket and path files
+        try:
+            socket_path_file.unlink()
+            os.remove(socket_path)
+        except FileNotFoundError:
+            pass
+        
+        logger.info("Worker %s received reconnection info, reconnecting to new executor", self.rank)
+        
+        # Reconnect message queues with new handles
+        # Import Handle here to avoid circular imports
+        from vllm.distributed.device_communicators.shm_broadcast import Handle
+        self.rpc_broadcast_mq = MessageQueue.create_from_handle(
+            Handle.from_bytes(reconnect_info["input_handle"]), self.rank)
+        self.worker_response_mq = MessageQueue.create_from_handle(
+            Handle.from_bytes(reconnect_info["output_handle"]), 0)
+        
+        logger.info("Worker %s IPC reconnection complete", self.rank)
+
+    def cleanup_ipc(self):
+        """Clean up IPC resources, including shared memory."""
+        logger.info("Worker %s cleaning up IPC resources.", self.rank)
+        
+        # Clean up message queues and their shared memory buffers
+        if self.rpc_broadcast_mq:
+            # Force cleanup of the shared memory buffer
+            if hasattr(self.rpc_broadcast_mq, 'buffer') and self.rpc_broadcast_mq.buffer:
+                try:
+                    # Manually trigger the cleanup
+                    buffer = self.rpc_broadcast_mq.buffer
+                    if hasattr(buffer, 'shared_memory'):
+                        buffer.shared_memory.close()
+                        if buffer.is_creator:
+                            buffer.shared_memory.unlink()
+                except Exception as e:
+                    logger.warning("Failed to cleanup rpc_broadcast_mq buffer: %s", e)
+            
+            self.rpc_broadcast_mq.close()
+            self.rpc_broadcast_mq = None
+            
+        if self.worker_response_mq:
+            # Force cleanup of the shared memory buffer
+            if hasattr(self.worker_response_mq, 'buffer') and self.worker_response_mq.buffer:
+                try:
+                    # Manually trigger the cleanup
+                    buffer = self.worker_response_mq.buffer
+                    if hasattr(buffer, 'shared_memory'):
+                        buffer.shared_memory.close()
+                        if buffer.is_creator:
+                            buffer.shared_memory.unlink()
+                except Exception as e:
+                    logger.warning("Failed to cleanup worker_response_mq buffer: %s", e)
+                    
+            self.worker_response_mq.close()
+            self.worker_response_mq = None
+        
+        # Force garbage collection to clean up any remaining references
+        gc.collect()
 
     @staticmethod
     def make_worker_process(
@@ -423,8 +709,14 @@ class WorkerProc:
         # (reader, writer)
         reader, writer = context.Pipe(duplex=False)
 
-        # Create death pipe to detect parent process exit
-        death_reader, death_writer = context.Pipe(duplex=False)
+        init_mode = vllm_config.launch_config.init_mode
+        death_pipe = None
+        if init_mode != "save_checkpoint":
+            # Create death pipe to detect parent process exit
+            death_reader, death_writer = context.Pipe(duplex=False)
+            death_pipe = death_reader
+        else:
+            death_writer = None
 
         process_kwargs = {
             "vllm_config": vllm_config,
@@ -434,7 +726,7 @@ class WorkerProc:
             "fake_distributed_init_method": fake_distributed_init_method,
             "input_shm_handle": input_shm_handle,
             "ready_pipe": (reader, writer),
-            "death_pipe": death_reader,
+            "death_pipe": death_pipe,
         }
         # Run EngineCore busy loop in background process.
         proc = context.Process(target=WorkerProc.worker_main,
@@ -485,6 +777,11 @@ class WorkerProc:
                 finally:
                     # Close connection.
                     pipe.close()
+
+        # Clean up any remaining unready handles and their pipes
+        for handle in unready_proc_handles:
+            if handle.ready_pipe in pipes:
+                handle.ready_pipe.close()
 
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
@@ -588,11 +885,71 @@ class WorkerProc:
     class ResponseStatus(Enum):
         SUCCESS = auto()
         FAILURE = auto()
+    
+    def _prepare_for_checkpoint_save(self):
+        """RPC handler for checkpoint preparation."""
+        # Only proceed if we're in save_checkpoint mode
+        if self.init_mode != "save_checkpoint":
+            return "Not in checkpoint save mode"
+        
+        # First prepare the GPU worker for checkpoint (CUDA cleanup)
+        self.worker.prepare_for_checkpoint()
+        
+        # Signal checkpoint readiness via Unix domain socket
+        checkpoint_info = {
+            "pid": os.getpid(),
+            "rank": self.rank
+        }
 
+        # Connect to executor's checkpoint ready socket (should already exist)
+        import socket
+        socket_path = f"/tmp/vllm_ckpt_ready_{self.config_hash}_{self.rank}_dp{self.parallel_config.data_parallel_rank}.sock"
+        
+        # Socket should already exist since executor creates it first
+        if not os.path.exists(socket_path):
+            raise RuntimeError(f"Checkpoint ready socket not found: {socket_path}")
+        
+        # Connect and send our info
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(socket_path)
+            sock.send(json.dumps(checkpoint_info).encode())
+            sock.close()
+            logger.info("Worker %d signaled checkpoint readiness to executor", self.rank)
+        except Exception as e:
+            logger.error("Failed to signal checkpoint readiness: %s", e)
+            raise
+        
+        # The worker process is now ready to be checkpointed.
+        # It will be frozen by CRIU. Upon restoration, it will
+        # re-enter this loop, detect that message queues are None,
+        # and wait for reconnection.
+        assert self.rpc_broadcast_mq is None
+        self.init_mode = None  # Clear init_mode upon startup
+
+        # Final aggressive cleanup
+        gc.collect()
+        gc.collect()
+        gc.collect()
+    
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         while True:
+            if self.rpc_broadcast_mq is None:
+                self._wait_for_ipc_reconnection()
+
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue()
+
+            if method == "prepare_for_checkpoint_save":
+                if output_rank is None or self.rank == output_rank:
+                    self.worker_response_mq.enqueue(
+                        (WorkerProc.ResponseStatus.SUCCESS, "Preparing for checkpoint"))
+                # This will force the worker_busy_loop to go into _wait_for_ipc_reconnection
+                # which will then call _prepare_for_checkpoint_save
+                self.cleanup_ipc()
+                gc.collect()
+                continue
+
 
             try:
                 if isinstance(method, str):
@@ -607,7 +964,7 @@ class WorkerProc:
                 logger.exception("WorkerProc hit an exception.")
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
-                if output_rank is None or self.rank == output_rank:
+                if output_rank is None or self.rank == output_rank:  # TODO: (schwinns): what's output_rank?
                     self.worker_response_mq.enqueue(
                         (WorkerProc.ResponseStatus.FAILURE, str(e)))
                 continue

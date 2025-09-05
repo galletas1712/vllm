@@ -5,6 +5,7 @@ import copy
 from enum import Enum
 import gc
 import os
+import time
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
@@ -26,7 +27,6 @@ from vllm.distributed.parallel_state import get_pp_group, get_tp_group, get_ep_g
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
-from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -38,7 +38,6 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
-from vllm.device_allocator.cumem import CuMemAllocator
 
 logger = init_logger(__name__)
 
@@ -113,6 +112,13 @@ class Worker(WorkerBase):
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        
+        # Checkpoint support
+        self.init_mode = vllm_config.launch_config.init_mode
+        self.checkpoint_after_phase1 = (self.init_mode == "save_checkpoint")
+        self.is_restored_from_checkpoint = (self.init_mode in 
+                                            ["load_checkpoint", 
+                                             "resume_checkpoint"])
 
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
@@ -173,7 +179,7 @@ class Worker(WorkerBase):
 
         self._phase_1_ep_size = get_ep_group().world_size
         self._phase_1_ep_rank = get_ep_group().rank_in_group
-        logger.info(f"Phase 1 - EP size: {self._phase_1_ep_size}, EP rank: {self._phase_1_ep_rank}")
+        logger.info("Phase 1 - EP size: %s, EP rank: %s", self._phase_1_ep_size, self._phase_1_ep_rank)
 
         # Clean up the model runner and the fake distributed environment
         self.model_runner.reset_input_batch_state()
@@ -218,7 +224,7 @@ class Worker(WorkerBase):
                 ]
                 for module in moe_modules:
                     if hasattr(module, 'update_expert_map'):
-                        logger.debug(f"Updating expert map for module: {module}")
+                        logger.debug("Updating expert map for module: %s", module)
                         module.update_expert_map()
 
             # Allocate actual weights into the existing parameter storages.
@@ -578,6 +584,26 @@ class Worker(WorkerBase):
         # Dummy runs during initialization leave stale num_computed_tokens
         # values that cause position encoding corruption for warm spares
         self.model_runner.reset_input_batch_state()
+    
+    def prepare_for_checkpoint(self) -> None:
+        """Prepare worker for checkpointing by cleaning up IPC state."""
+        logger.info("Preparing worker for checkpoint")
+
+        # Clear all CUDA caches
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect() # TODO (schwinns): check if this would break companion process
+        
+        # Synchronize CUDA to ensure all operations are complete
+        torch.cuda.synchronize()
+        
+        # Force garbage collection multiple times to clean up semaphores
+        for _ in range(3):
+            gc.collect()
+        
+        # Small delay to ensure cleanup is complete
+        time.sleep(0.5)
+        
+        logger.info("Worker ready for checkpoint")
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

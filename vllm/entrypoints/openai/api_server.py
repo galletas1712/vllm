@@ -227,7 +227,11 @@ async def build_async_engine_client_from_engine_args(
                 client_index=client_index)
 
             # Don't keep the dummy data in memory
-            await async_llm.reset_mm_cache()
+            # Skip reset_mm_cache in checkpoint mode since engine is shut down
+            checkpoint_mode = (vllm_config.launch_config.init_mode == 
+                               'save_checkpoint')
+            if not checkpoint_mode:
+                await async_llm.reset_mm_cache()
 
             yield async_llm
         finally:
@@ -1112,6 +1116,37 @@ async def is_scaling_elastic_ep(raw_request: Request):
     return JSONResponse({"is_scaling_elastic_ep": _scaling_elastic_ep})
 
 
+@router.post("/resume_init", 
+             responses={
+                 HTTPStatus.OK.value: {
+                     "model": dict
+                 },
+                 HTTPStatus.BAD_REQUEST.value: {
+                     "model": ErrorResponse
+                 },
+                 HTTPStatus.INTERNAL_SERVER_ERROR.value: {
+                     "model": ErrorResponse
+                 },
+             })
+async def resume_init(raw_request: Request):
+    """Resume initialization from phase 1 checkpoint.
+    
+    This endpoint completes phase 2 and 3 initialization after the engine
+    was initialized with init_mode='load_checkpoint'.
+    """
+    try:
+        client = engine_client(raw_request)
+        await client.resume_init()
+        return JSONResponse({
+            "message": "Initialization resumed successfully from checkpoint"
+        })
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.error("Resume init failed: %s", e)
+        raise HTTPException(status_code=500, detail="Resume init failed") from e
+
+
 # TODO: RequestType = TypeForm[BaseModel] when recognized by type checkers
 # (requires typing_extensions >= 4.13)
 RequestType = Any
@@ -1871,6 +1906,12 @@ async def run_server_worker(listen_address,
             args,
             client_config=client_config,
     ) as engine_client:
+        # Check if we're in checkpoint mode
+        if (hasattr(engine_client, 'checkpoint_mode') and
+                engine_client.checkpoint_mode):
+            logger.info("Engine is in checkpoint mode. Exiting.")
+            return
+        
         maybe_register_tokenizer_info_endpoint(args)
         app = build_app(args)
 
