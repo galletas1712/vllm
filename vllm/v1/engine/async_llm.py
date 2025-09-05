@@ -35,6 +35,7 @@ from vllm.v1.engine.output_processor import (OutputProcessor,
                                              RequestOutputCollector)
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.processor import Processor
+from vllm.v1.engine.utils import ResumeSideChannel
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.prometheus import shutdown_prometheus
@@ -117,6 +118,9 @@ class AsyncLLM(EngineClient):
 
         # Initialize output_handler early to avoid AttributeError in __del__
         self.output_handler: Optional[asyncio.Task] = None
+        
+        # Initialize resume side channel
+        self._resume_side_channel: Optional[ResumeSideChannel] = None
 
         # EngineCore (starts the engine in background process).
         self.engine_core = EngineCoreClient.make_async_mp_client(
@@ -136,6 +140,11 @@ class AsyncLLM(EngineClient):
             logger.info("AsyncLLM initialization completed in checkpoint mode.")
             # Set flag - we're in checkpoint mode with suspended init
             self._in_checkpoint_mode = True
+            
+            # Create TCP side channel for resume signal
+            self._resume_side_channel = ResumeSideChannel(
+                port=self.vllm_config.launch_config.resume_port,
+                resume_callback=self.resume_init)
             return
         
         # Initialize for normal mode
@@ -230,6 +239,11 @@ class AsyncLLM(EngineClient):
         """Shutdown, cleaning up the background proc and IPC."""
 
         shutdown_prometheus()
+        
+        # Clean up resume side channel if it exists
+        if self._resume_side_channel:
+            self._resume_side_channel.cleanup()
+            self._resume_side_channel = None
 
         if engine_core := getattr(self, "engine_core", None):
             engine_core.shutdown()
@@ -392,6 +406,8 @@ class AsyncLLM(EngineClient):
 
         if self.output_handler is not None:
             return
+
+        assert not self._in_checkpoint_mode
 
         # Ensure that the task doesn't have a circular ref back to the AsyncLLM
         # object, or else it won't be garbage collected and cleaned up properly.
@@ -660,6 +676,9 @@ class AsyncLLM(EngineClient):
         
         # Clear the checkpoint mode flag so the engine can be used normally
         self._in_checkpoint_mode = False
+
+        # No need to cleanup resume side channel - it's cleaned up by the ResumeSideChannel class
+        self._resume_side_channel = None
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import contextlib
 import os
+import socket
 import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -603,7 +605,7 @@ def _wait_for_companion_coordinator_ready(coordinator_address: str,
             socket.send(pickle.dumps(ping_request))
             
             # Try to receive response
-            response = socket.recv()
+            _ = socket.recv()
             # If we got any response, coordinator is ready
             socket.close()
             context.term()
@@ -724,7 +726,8 @@ def launch_core_engines(
                 logger.info("Started companion coordinator on port %d",
                            coordinator_port)
             else:
-                logger.info("Using companion coordinator at %s (started by rank 0)",
+                logger.info("Using companion coordinator at %s "
+                           "(started by rank 0)",
                            vllm_config.companion_config.coordinator_address)
 
     if parallel_config.data_parallel_backend == "ray":
@@ -934,3 +937,126 @@ def wait_for_engine_startup(
 
         logger.debug("%s from %s core engine process %s.", status,
                      "local" if local else "remote", eng_index)
+
+
+class ResumeSideChannel:
+    """
+    TCP side channel for receiving resume signals in checkpoint mode.
+    
+    This class handles creation, listening, and cleanup of a TCP socket that
+    external processes can connect to in order to trigger resume.
+    """
+    
+    def __init__(self, 
+                 port: int,
+                 resume_callback: Callable[[], asyncio.Awaitable[None]]):
+        """
+        Initialize the resume side channel.
+        
+        Args:
+            port: Port to bind to.
+            resume_callback: Async function to call when resume signal 
+                is received
+        """
+        self.port = port
+        self.resume_callback = resume_callback
+        self._resume_socket: Optional[socket.socket] = None
+        self._resume_listener_task: Optional[asyncio.Task] = None
+        self._in_checkpoint_mode = True
+
+        self._setup()
+        
+    def _setup(self) -> None:
+        """Setup TCP side channel for receiving resume signal."""
+        try:
+            # Create a TCP socket
+            self._resume_socket = socket.socket(socket.AF_INET, 
+                                                socket.SOCK_STREAM)
+            self._resume_socket.setsockopt(socket.SOL_SOCKET, 
+                                           socket.SO_REUSEADDR, 1)
+            
+            # Bind to specified port or any available port
+            self._resume_socket.bind(('0.0.0.0', self.port))
+            self._resume_socket.listen(1)
+            
+            # Get the actual port that was assigned
+            _, actual_port = self._resume_socket.getsockname()
+            logger.info("Resume side channel listening on port %d", actual_port)
+            
+            assert actual_port == self.port, "Actual port does not match specified port"
+            
+            # Try to start the listener task if we're in an event loop
+            self.start_listener()
+            
+        except Exception as e:
+            logger.error("Failed to setup resume side channel: %s", e)
+            self.cleanup()
+            raise
+    
+    def start_listener(self) -> None:
+        """Start the async listener task if not already running."""
+        if self._resume_listener_task is not None:
+            return
+            
+        async def listen_for_resume():
+            try:
+                loop = asyncio.get_running_loop()
+                # Set socket to non-blocking for async operation
+                self._resume_socket.setblocking(False)
+                
+                while self._in_checkpoint_mode:
+                    try:
+                        # Wait for connection with timeout
+                        conn, addr = await asyncio.wait_for(
+                            loop.sock_accept(self._resume_socket),
+                            timeout=1.0
+                        )
+                        
+                        logger.info("Received resume signal from %s", addr)
+                        
+                        # Close the client connection immediately
+                        with contextlib.suppress(Exception):
+                            conn.close()
+                        
+                        # Call the resume callback
+                        await self.resume_callback()
+                        
+                        # Mark as no longer in checkpoint mode
+                        self._in_checkpoint_mode = False
+                        
+                        # Close the socket after resuming
+                        self.cleanup()
+                        break
+                        
+                    except asyncio.TimeoutError:
+                        # Continue waiting
+                        continue
+                    except Exception as e:
+                        if self._in_checkpoint_mode:
+                            logger.error("Error in resume listener: %s", e)
+                        break
+                        
+            except Exception as e:
+                logger.error("Fatal error in resume listener: %s", e)
+            finally:
+                # Ensure cleanup happens
+                self.cleanup()
+        
+        try:
+            # Create the listener task
+            loop = asyncio.get_running_loop()
+            self._resume_listener_task = loop.create_task(listen_for_resume())
+        except RuntimeError:
+            # Not in an event loop yet, will try again later
+            logger.debug("No event loop available yet for resume listener")
+    
+    def cleanup(self) -> None:
+        """Clean up the resume side channel socket and task."""
+        if self._resume_socket:
+            with contextlib.suppress(Exception):
+                self._resume_socket.close()
+            self._resume_socket = None
+            
+        if self._resume_listener_task and not self._resume_listener_task.done():
+            self._resume_listener_task.cancel()
+            self._resume_listener_task = None
