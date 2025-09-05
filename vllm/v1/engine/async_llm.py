@@ -133,9 +133,8 @@ class AsyncLLM(EngineClient):
             # waiting for workers to complete checkpointing and exits
             # gracefully. No need to call shutdown() again as it's already
             # been done.
-            logger.info("AsyncLLM initialization completed in "
-                        "checkpoint mode.")
-            # Set flag to indicate we're in checkpoint mode with suspended initialization
+            logger.info("AsyncLLM initialization completed in checkpoint mode.")
+            # Set flag - we're in checkpoint mode with suspended init
             self._in_checkpoint_mode = True
             return
         
@@ -631,6 +630,15 @@ class AsyncLLM(EngineClient):
         """
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs)
+    
+    async def wait_until_checkpoint_ready(self) -> None:
+        """Wait until phase 1 checkpoint initialization is complete.
+        
+        This should be called after creating the AsyncLLM with 
+        init_mode='checkpoint' to ensure phase 1 initialization and worker 
+        checkpointing is complete before calling resume_init().
+        """
+        await self.engine_core.wait_until_checkpoint_ready()
     
     async def resume_init(self) -> None:
         """Resume initialization from phase 1 checkpoint.

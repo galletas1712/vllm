@@ -966,6 +966,20 @@ class AsyncMPClient(MPClient):
 
     async def resume_init_async(self) -> None:
         await self.call_utility_async("resume_init")
+    
+    async def wait_until_checkpoint_ready(self) -> None:
+        """Wait until phase 1 checkpoint initialization is complete."""
+        if self.vllm_config.launch_config.init_mode != 'checkpoint':
+            # Not in checkpoint mode
+            return
+        # Ensure the output processing task is running
+        self._ensure_output_queue_task()
+        # Poll until checkpoint is ready
+        while True:
+            is_ready = await self.call_utility_async("is_checkpoint_ready")
+            if is_ready:
+                break
+            await asyncio.sleep(0.1)
 
 
 class DPAsyncMPClient(AsyncMPClient):

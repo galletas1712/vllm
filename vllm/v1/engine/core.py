@@ -738,6 +738,10 @@ class EngineCoreProc(EngineCore):
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
 
+    def is_checkpoint_ready(self) -> bool:
+        """Check if phase 1 checkpoint is ready."""
+        return self.state == EngineCoreProcState.CHECKPOINTED_WORKERS
+    
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
 
@@ -753,7 +757,9 @@ class EngineCoreProc(EngineCore):
         """Exits when an engine step needs to be performed."""
 
         waited = False
-        while not self.engines_running and (not hasattr(self, 'scheduler') or not self.scheduler.has_requests()):
+        while (not self.engines_running and 
+               (not hasattr(self, 'scheduler') or 
+                not self.scheduler.has_requests())):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
