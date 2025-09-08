@@ -381,7 +381,15 @@ class CheckpointedMultiprocExecutor(MultiprocExecutor):
     
     def __init__(self, vllm_config: VllmConfig) -> None:
         self.checkpoint_mode = vllm_config.launch_config.init_mode in ["save_checkpoint", "resume_checkpoint"]
-        self.checkpoint_dir = "/tmpfs_mnt/vllm_checkpoint"  # Default checkpoint directory
+        self.checkpoint_dir = os.path.join(
+            vllm_config.launch_config.checkpoint_dir_root,
+            (
+                vllm_config.compute_hash() + 
+                "_dp_" + str(vllm_config.parallel_config.data_parallel_rank)
+            )
+        )
+        logger.info(f"Checkpoint directory: {self.checkpoint_dir}")
+
         # Store these before calling super().__init__
         self.distributed_init_method = None
         self.fake_distributed_init_method = None

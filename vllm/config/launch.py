@@ -30,6 +30,9 @@ class LaunchConfig:
       save_checkpoint instead).
     """
 
+    checkpoint_dir_root: str = "/tmp"
+    """Root directory for CRIU dump files."""
+
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs

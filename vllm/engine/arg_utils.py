@@ -332,6 +332,7 @@ class EngineArgs:
     revision: Optional[str] = ModelConfig.revision
     code_revision: Optional[str] = ModelConfig.code_revision
     init_mode: Optional[InitMode] = LaunchConfig.init_mode
+    checkpoint_dir_root: str = LaunchConfig.checkpoint_dir_root
     rope_scaling: dict[str, Any] = get_field(ModelConfig, "rope_scaling")
     rope_theta: Optional[float] = ModelConfig.rope_theta
     hf_token: Optional[Union[bool, str]] = ModelConfig.hf_token
@@ -432,6 +433,7 @@ class EngineArgs:
     
     # Launch configuration
     init_mode: Optional[str] = LaunchConfig.init_mode
+    checkpoint_dir_root: str = LaunchConfig.checkpoint_dir_root
 
     enable_multimodal_encoder_data_parallel: bool = \
         ParallelConfig.enable_multimodal_encoder_data_parallel
@@ -581,6 +583,8 @@ class EngineArgs:
         )
         launch_group.add_argument("--init-mode",
                                   **launch_kwargs["init_mode"])
+        launch_group.add_argument("--checkpoint-dir-root",
+                                  **launch_kwargs["checkpoint_dir_root"])
 
         # Guided decoding arguments
         guided_decoding_kwargs = get_kwargs(DecodingConfig)
@@ -1341,7 +1345,10 @@ class EngineArgs:
         from vllm.config import CompanionConfig
         
         companion_config = CompanionConfig()
-        launch_config = LaunchConfig(init_mode=self.init_mode)
+        launch_config = LaunchConfig(
+            init_mode=self.init_mode,
+            checkpoint_dir_root=self.checkpoint_dir_root
+        )
         
         config = VllmConfig(
             model_config=model_config,
