@@ -42,8 +42,13 @@ class Executor(ExecutorBase):
                 RayDistributedExecutor)
             executor_class = RayDistributedExecutor
         elif distributed_executor_backend == "mp":
-            from vllm.v1.executor.multiproc_executor import MultiprocExecutor
-            executor_class = MultiprocExecutor
+            # Use checkpointed executor for checkpoint modes
+            if vllm_config.launch_config.init_mode in ["save_checkpoint", "resume_checkpoint"]:
+                from vllm.v1.executor.checkpointed_multiproc_executor import CheckpointedMultiprocExecutor
+                executor_class = CheckpointedMultiprocExecutor
+            else:
+                from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+                executor_class = MultiprocExecutor
         elif distributed_executor_backend == "uni":
             executor_class = UniProcExecutor
         elif distributed_executor_backend == "external_launcher":

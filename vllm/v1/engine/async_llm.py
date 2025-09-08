@@ -640,13 +640,17 @@ class AsyncLLM(EngineClient):
         """
         await self.engine_core.wait_until_checkpoint_ready()
     
-    async def resume_init(self) -> None:
+    async def resume_init(self, after_criu_restore: bool = False) -> None:
         """Resume initialization from phase 1 checkpoint.
         
         Complete phase 2 and 3. This can only be called when the engine
         was initialized with init_mode='checkpoint'.
+        
+        Args:
+            after_criu_restore: If True, we're resuming after CRIU restore,
+                                so CUDA has already been restored by CRIU.
         """
-        await self.engine_core.resume_init_async()
+        await self.engine_core.resume_init_async(after_criu_restore=after_criu_restore)
         
         # Initialize components that were skipped in checkpoint mode
         self.logger_manager: Optional[StatLoggerManager] = None

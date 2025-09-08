@@ -2,14 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import hashlib
-from dataclasses import field
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from pydantic.dataclasses import dataclass
 
 from vllm.config.utils import config
 
-InitMode = Literal["checkpoint", "normal"]
+InitMode = Literal[
+    "normal", "save_checkpoint", "resume_checkpoint", "checkpoint"
+]
 
 
 @config
@@ -20,7 +21,13 @@ class LaunchConfig:
     init_mode: InitMode = "normal"
     """Initialization mode:
     - 'normal': Normal initialization (default)
-    - 'checkpoint': Initialize workers (phase 1) and save checkpoint. Requires `resume_init` API to complete initialization.
+    - 'save_checkpoint': Initialize workers (phase 1), save CRIU checkpoint,
+      and exit gracefully
+    - 'resume_checkpoint': Restore workers from CRIU checkpoint and complete
+      initialization
+    - 'checkpoint': Initialize workers (phase 1) and save checkpoint. Requires
+      `resume_init` API to complete initialization (deprecated, use
+      save_checkpoint instead).
     """
 
     def compute_hash(self) -> str:
@@ -28,7 +35,8 @@ class LaunchConfig:
         Provide a hash that uniquely identifies all the configs
         that affect the structure of the computation graph.
 
-        We don't include init_mode in the hash because it only affects launch behavior, not the computation graph structure.
+        We don't include init_mode in the hash because it only affects
+        launch behavior, not the computation graph structure.
         """
         # No factors to consider - init_mode doesn't affect computation graph
         factors: list[Any] = []

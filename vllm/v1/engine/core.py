@@ -464,7 +464,11 @@ class EngineCoreProc(EngineCore):
         client_handshake_address: Optional[str] = None,
         engine_index: int = 0,
     ):
-        self.state = EngineCoreProcState.UNINITIALIZED
+        self.state = (
+            EngineCoreProcState.UNINITIALIZED
+            if vllm_config.launch_config.init_mode != "resume_checkpoint"
+            else EngineCoreProcState.CHECKPOINTED_WORKERS
+        )
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs],
                                               bytes]]()
@@ -699,13 +703,22 @@ class EngineCoreProc(EngineCore):
                 decorate_logs()
                 engine_core = EngineCoreProc(*args, **kwargs)
 
-            if engine_core.init_mode == "checkpoint":
-                assert hasattr(engine_core.model_executor, 'checkpoint_workers')
+            if engine_core.init_mode in ["checkpoint", "save_checkpoint"]:
+                assert hasattr(engine_core.model_executor,
+                              'checkpoint_workers')
                 engine_core._phase_1_init_rpc()
                 # Prepare workers for checkpoint by clearing caches
                 engine_core.collective_rpc("prepare_for_checkpoint")
                 engine_core.model_executor.checkpoint_workers()
                 engine_core.state = EngineCoreProcState.CHECKPOINTED_WORKERS
+                
+                # For save_checkpoint mode, exit gracefully after checkpoint
+                if engine_core.init_mode == "save_checkpoint":
+                    logger.info("Checkpoint saved. Exiting gracefully.")
+                    return
+            elif engine_core.init_mode == "resume_checkpoint":
+                # Resume from checkpoint
+                engine_core.resume_init(after_criu_restore=True)
             else:
                 # Normal mode
                 engine_core._phase_1_init_rpc()
@@ -728,11 +741,17 @@ class EngineCoreProc(EngineCore):
             if engine_core is not None:
                 engine_core.shutdown()
     
-    def resume_init(self):
+    def resume_init(self, after_criu_restore: bool = False):
+        """Resume initialization after checkpoint.
+        
+        Args:
+            after_criu_restore: If True, we're resuming after CRIU restore,
+                                so CUDA has already been restored by CRIU.
+        """
         if self.state != EngineCoreProcState.CHECKPOINTED_WORKERS:
             raise RuntimeError(f"Cannot resume from state {self.state}. "
                             "Expected CHECKPOINTED_WORKERS.")
-        self.model_executor.restore_workers()
+        self.model_executor.restore_workers(after_criu_restore=after_criu_restore)
         self._complete_initialization()
         self.state = EngineCoreProcState.READY_TO_SERVE
         logger.info("Resume initialization completed")

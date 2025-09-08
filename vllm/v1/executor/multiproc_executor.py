@@ -137,10 +137,20 @@ class MultiprocExecutor(Executor):
         for pid in self.worker_pids:
             checkpoint_cuda_process(pid)
 
-    def restore_workers(self):
-        from vllm.v1.executor.checkpoint_utils import restore_cuda_process
-        for pid in self.worker_pids:
-            restore_cuda_process(pid)
+    def restore_workers(self, after_criu_restore: bool = False):
+        """Restore workers after checkpoint.
+        
+        Args:
+            after_criu_restore: If True, CUDA has already been restored by CRIU's
+                                CUDA plugin, so we should NOT call restore_cuda_process.
+                                If False, we need to manually restore CUDA.
+        """
+        if not after_criu_restore:
+            # Only restore CUDA if we're not coming from CRIU
+            # (CRIU's CUDA plugin handles it automatically)
+            from vllm.v1.executor.checkpoint_utils import restore_cuda_process
+            for pid in self.worker_pids:
+                restore_cuda_process(pid)
 
         # Didn't start worker monitor in __init__, so we start it here
         self.start_worker_monitor()
@@ -385,6 +395,33 @@ class WorkerProc:
         fake_distributed_init_method: str,
         input_shm_handle: Handle,
     ):
+        self.init_worker_proc(
+            vllm_config,
+            local_rank,
+            rank,
+            distributed_init_method,
+            fake_distributed_init_method,
+        )
+        self.decorate_logs(vllm_config, rank)
+
+        # Initialize MessageQueue for receiving SchedulerOutput
+        self.rpc_broadcast_mq = MessageQueue.create_from_handle(
+            input_shm_handle, self.worker.rank)
+
+        # Initializes a message queue for sending the model output
+        self.worker_response_mq = MessageQueue(1, 1)
+
+        # Do not initialize device or load model here. EngineCore orchestrates
+        # initialization by dispatching ordered RPCs to workers.
+
+    def init_worker_proc(
+        self,
+        vllm_config: VllmConfig,
+        local_rank: int,
+        rank: int,
+        distributed_init_method: str,
+        fake_distributed_init_method: str,
+    ):
         self.rank = rank
         wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
@@ -403,7 +440,10 @@ class WorkerProc:
         }
         wrapper.init_worker(all_kwargs)
         self.worker = wrapper
-
+    
+    @staticmethod
+    def decorate_logs(vllm_config: VllmConfig, rank: int):
+        """Decorate logs for the worker process."""
         pp_size = vllm_config.parallel_config.pipeline_parallel_size
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         pp_str = f"PP{rank // tp_size}" if pp_size > 1 else ""
@@ -414,16 +454,6 @@ class WorkerProc:
             set_process_title(suffix, append=True)
             process_name = f"{process_name} {suffix}"
         decorate_logs(process_name)
-
-        # Initialize MessageQueue for receiving SchedulerOutput
-        self.rpc_broadcast_mq = MessageQueue.create_from_handle(
-            input_shm_handle, self.worker.rank)
-
-        # Initializes a message queue for sending the model output
-        self.worker_response_mq = MessageQueue(1, 1)
-
-        # Do not initialize device or load model here. EngineCore orchestrates
-        # initialization by dispatching ordered RPCs to workers.
 
     @staticmethod
     def make_worker_process(

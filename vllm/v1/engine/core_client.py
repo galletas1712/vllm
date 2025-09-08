@@ -230,7 +230,7 @@ class EngineCoreClient(ABC):
             kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         raise NotImplementedError
 
-    async def resume_init_async(self) -> None:
+    async def resume_init_async(self, after_criu_restore: bool = False) -> None:
         raise NotImplementedError
 
 
@@ -262,9 +262,9 @@ class InprocClient(EngineCoreClient):
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
 
-    def resume_init(self) -> None:
+    def resume_init(self, after_criu_restore: bool = False) -> None:
         """Resume initialization from checkpoint."""
-        self.engine_core.resume_init()
+        self.engine_core.resume_init(after_criu_restore=after_criu_restore)
 
     def shutdown(self) -> None:
         self.engine_core.shutdown()
@@ -964,8 +964,8 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async("collective_rpc", method, timeout,
                                              args, kwargs)
 
-    async def resume_init_async(self) -> None:
-        await self.call_utility_async("resume_init")
+    async def resume_init_async(self, after_criu_restore: bool = False) -> None:
+        await self.call_utility_async("resume_init", after_criu_restore)
     
     async def wait_until_checkpoint_ready(self) -> None:
         """Wait until phase 1 checkpoint initialization is complete."""

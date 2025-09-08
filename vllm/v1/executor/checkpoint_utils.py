@@ -38,7 +38,11 @@ def checkpoint_cuda_process(pid: int) -> None:
 
 
 def restore_cuda_process(pid: int) -> None:
-    """Restore and unlock a CUDA process using the CUDA checkpoint API."""
+    """Restore and unlock a CUDA process using the CUDA checkpoint API.
+    
+    NOTE: This function should *not* be called when using CRIU, which means
+    it's mostly just an artifact for debugging purposes.
+    """
     if not cuda_available:
         raise RuntimeError("cuda-python package not available")
     
