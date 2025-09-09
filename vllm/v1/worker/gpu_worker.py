@@ -6,7 +6,7 @@ from enum import Enum
 import gc
 import os
 from contextlib import AbstractContextManager, nullcontext
-from typing import TYPE_CHECKING, Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
 
 import torch
 import torch.distributed
@@ -34,43 +34,14 @@ from vllm.tasks import SupportedTask
 from vllm.utils import GiB_bytes, MemorySnapshot, memory_profiling
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
+                             DraftTokenIds, ModelRunnerOutput)
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import WorkerBase, get_model_weights_size_bytes
 from vllm.device_allocator.cumem import CuMemAllocator
 
 logger = init_logger(__name__)
-
-def get_model_weights_size_bytes(model: torch.nn.Module) -> int:
-    """Calculate total unique bytes of all parameters & buffers on CUDA.
-    
-    This accounts for tied weights by tracking unique storage pointers.
-    """
-    seen_storages: set[int] = set()
-    total = 0
-    
-    # Count parameters
-    for param in model.parameters():
-        if not param.is_cuda:
-            continue
-        data_ptr = param.storage().data_ptr()
-        if data_ptr in seen_storages:
-            continue  # Skip tied weights / shared storage
-        seen_storages.add(data_ptr)
-        total += param.storage().nbytes()
-    
-    # Count buffers (e.g., layer norm weights)
-    for buffer in model.buffers():
-        if not buffer.is_cuda:
-            continue
-        data_ptr = buffer.storage().data_ptr()
-        if data_ptr in seen_storages:
-            continue
-        seen_storages.add(data_ptr)
-        total += buffer.storage().nbytes()
-    
-    return total
 
 
 if TYPE_CHECKING:
@@ -146,18 +117,19 @@ class Worker(WorkerBase):
         # Record the original load format so we can defer real weights and
         # switch back after phase 2 init if needed.
         self._original_load_format: Optional[str] = self.load_config.load_format
+
+        self.init_device(fake_distributed_env=True)
     
     def phase_1_init(self) -> None:
         """
         Initialize the common worker components that can be reused and don't depend on the real distributed environment:
-        1. init_device (device + fake distributed setup)
+        1. init_device (device + fake distributed setup, already done in __init__)
         2. init_model_runner (which includes buffers)
         3. load_model (model weights)
         4. precompile_model (pre-compile model)
         5. shut down the fake distributed environment
         """
         assert self.init_phase == WorkerInitPhase.PHASE_1, "Worker must be in phase 1"
-        self.init_device(fake_distributed_env=True)
         self.init_model_runner()
         # Defer real weights: load dummy weights in phase 1 so that we can
         # precompile without committing real weight memory. We'll switch
@@ -223,7 +195,7 @@ class Worker(WorkerBase):
 
             # Allocate actual weights into the existing parameter storages.
             logger.info("Reloading weights")
-            self.model_runner.reload_weights()  # NOTE: don't use self.reload_weights() since this wraps context with memory pool
+            self.reload_weights()
 
             if self.vllm_config.parallel_config.enable_expert_parallel:
                 current_ep_size = get_ep_group().world_size
@@ -375,7 +347,7 @@ class Worker(WorkerBase):
             self.device = torch.device(f"cuda:{self.local_rank}")
             current_platform.set_device(self.device)
 
-            _check_if_gpu_supports_dtype(self.model_config.dtype)
+            current_platform.check_if_supports_dtype(self.model_config.dtype)
             gc.collect()
             torch.cuda.empty_cache()
         else:
@@ -415,8 +387,7 @@ class Worker(WorkerBase):
         self.model_runner.update_config(overrides)
 
     def reload_weights(self) -> None:
-        with self._maybe_get_memory_pool_context(tag="weights"):
-            self.model_runner.reload_weights()
+        self.model_runner.reload_weights()
 
     def precompile_model(self) -> None:
         """Pre-compile (torch.compile) in fake distributed environment..
@@ -424,33 +395,28 @@ class Worker(WorkerBase):
         Runs dummy forwards to trigger compilation for configured sizes only.
         Does not capture CUDA graphs or finalize distributed state.
         """
-        compile_cfg = self.vllm_config.compilation_config
 
-        # Collect sizes to compile: explicit compile sizes plus cudagraph
-        # capture sizes (to avoid recompile later) when not forcing eager.
-        sizes: set[int] = set()
-        for s in getattr(compile_cfg, "compile_sizes", []) or []:
-            if isinstance(s, int) and s > 0:
-                sizes.add(int(s))
+         # warm up sizes that are not in cudagraph capture sizes,
+        # but users still want to compile for better performance,
+        # e.g. for the max-num-batched token size in chunked prefill.
+        warmup_sizes = self.vllm_config.compilation_config.compile_sizes.copy()
         if not self.model_config.enforce_eager:
-            for s in getattr(compile_cfg, "cudagraph_capture_sizes", []) or []:
-                if isinstance(s, int) and s > 0:
-                    sizes.add(int(s))
+            warmup_sizes = [
+                x for x in warmup_sizes if x not in
+                self.vllm_config.compilation_config.cudagraph_capture_sizes
+            ]
+        # We skip EPLB here since we don't want to record dummy metrics
+        for size in sorted(warmup_sizes, reverse=True):
+            logger.info("Compile and warming up model for size %d", size)
+            self.model_runner._dummy_run(size,
+                                         skip_eplb=True,
+                                         remove_lora=False)
+        self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
-        max_tokens = self.scheduler_config.max_num_batched_tokens
-        bounded = sorted([s for s in sizes if s <= max_tokens], reverse=True)
-        if not bounded:
-            # Fallback: compile at a reasonable default size to ensure graph
-            # exists before finalize.
-            fallback = min(getattr(compile_cfg, "max_capture_size",
-                                   max_tokens) or max_tokens, max_tokens)
-            fallback = int(fallback) if fallback and fallback > 0 else 1
-            bounded = [fallback]
-
-        logger.info("Init: precompile model (sizes=%s)", bounded)
-        for size in bounded:
-            # Ensure this only triggers compile; no CUDA graph capture here.
-            self.model_runner._dummy_run(size, skip_eplb=True)
+        # Warmup and tune the kernels used during model execution before
+        # cuda graph capture.
+        self.model_runner.reset_input_batch_state()
+        kernel_warmup(self)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -458,7 +424,7 @@ class Worker(WorkerBase):
         memory can be used for KV cache without OOMs.
 
         The engine will first conduct a profiling of the existing memory usage.
-        Then, it calculate the free memory that can be used for KV cache in
+        Then, it calculates the free memory that can be used for KV cache in
         bytes.
 
         Tip:
@@ -492,7 +458,6 @@ class Worker(WorkerBase):
             "release GPU memory while vLLM is profiling during initialization. "
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container.")
-        # Calculate available memory for KV cache
         available_kv_cache_memory = self.requested_memory \
             - profile_result.non_kv_cache_memory
 
@@ -520,14 +485,13 @@ class Worker(WorkerBase):
             allocator = CuMemAllocator.get_instance()
             context = allocator.use_memory_pool(tag="kv_cache")
         else:
-            from contextlib import nullcontext
             context = nullcontext()
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> None:
         """Capture CUDA graphs and runtime warmups only.
-        No torch.compile or finalize here.
+        NOTE: this is actually only capturing CUDA graph
         
         Note: Persistent buffers were recreated to avoid illegal memory access errors during CUDA graph capture.
         """
@@ -542,39 +506,23 @@ class Worker(WorkerBase):
         if get_pp_group().is_last_rank:
             max_num_reqs = min(self.scheduler_config.max_num_seqs,
                                self.scheduler_config.max_num_batched_tokens)
-            # activate building attn_metadata for this dummy run to avoid
-            # potential illegal memory access for full cudagraph relay.
-            attn_cudagraph = self.compilation_config.full_cuda_graph and\
-                not self.model_config.enforce_eager
 
             # We skip EPLB here since we don't want to record dummy metrics
             hidden_states, last_hidden_states = \
                 self.model_runner._dummy_run(
                     num_tokens=max_num_reqs,
-                    capture_attn_cudagraph=attn_cudagraph,
                     skip_eplb=True,
                 )
-            
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(
                     hidden_states=last_hidden_states)
-            
-            # CRITICAL: Reset InputBatch state after ALL dummy runs!
-            # These dummy runs happen during warm spare activation and leave
-            # stale num_computed_tokens values that cause position corruption
-            # Must be after _dummy_run AND _dummy_sampler_run/_dummy_pooler_run
-            self.model_runner.reset_input_batch_state()
-
-        # Warmup kernels used during model execution
-        kernel_warmup(self)
-
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
         
-        # CRITICAL: Reset InputBatch state after dummy runs
+        # Reset InputBatch state after dummy runs
         # Dummy runs during initialization leave stale num_computed_tokens
         # values that cause position encoding corruption for warm spares
         self.model_runner.reset_input_batch_state()
@@ -589,39 +537,43 @@ class Worker(WorkerBase):
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> Optional[ModelRunnerOutput]:
+    ) -> Optional[Union[ModelRunnerOutput, AsyncModelRunnerOutput]]:
         intermediate_tensors = None
-        if not get_pp_group().is_first_rank:
+        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        if forward_pass and not get_pp_group().is_first_rank:
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(
                     all_gather_group=get_tp_group()))
 
         output = self.model_runner.execute_model(scheduler_output,
                                                  intermediate_tensors)
-
-        parallel_config = self.vllm_config.parallel_config
-        if parallel_config.distributed_executor_backend != "external_launcher" \
-            and not get_pp_group().is_last_rank:
-            assert isinstance(output, IntermediateTensors)
-            get_pp_group().send_tensor_dict(output.tensors,
-                                            all_gather_group=get_tp_group())
-
-            kv_connector_output = output.kv_connector_output
-            if not kv_connector_output:
-                return None
-
-            # In case of PP with kv transfer, we need to pass through the
-            # kv_connector_output
-            if (not kv_connector_output.finished_sending
-                    and not kv_connector_output.finished_recving):
-                return EMPTY_MODEL_RUNNER_OUTPUT
-
-            output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
-            output.kv_connector_output = kv_connector_output
+        if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
             return output
 
-        assert isinstance(output, ModelRunnerOutput)
+        assert isinstance(output, IntermediateTensors)
+        parallel_config = self.vllm_config.parallel_config
+        assert parallel_config.distributed_executor_backend != (
+            "external_launcher") and not get_pp_group().is_last_rank
+
+        get_pp_group().send_tensor_dict(output.tensors,
+                                        all_gather_group=get_tp_group())
+
+        kv_connector_output = output.kv_connector_output
+        if not kv_connector_output:
+            return None
+
+        # In case of PP with kv transfer, we need to pass through the
+        # kv_connector_output
+        if (not kv_connector_output.finished_sending
+                and not kv_connector_output.finished_recving):
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.kv_connector_output = kv_connector_output
         return output
+
+    def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+        return self.model_runner.take_draft_token_ids()
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:
@@ -630,8 +582,10 @@ class Worker(WorkerBase):
             self.profiler.start()
         else:
             self.profiler.stop()
-            print(self.profiler.key_averages().table(
-                sort_by="self_cuda_time_total"))
+            # only print profiler results on rank 0
+            if self.local_rank == 0:
+                print(self.profiler.key_averages().table(
+                    sort_by="self_cuda_time_total"))
 
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1)
@@ -757,7 +711,8 @@ class Worker(WorkerBase):
         parallel_config = self.vllm_config.parallel_config
         moe_modules = [
             module for module in self.model_runner.model.modules()
-            if module.__class__.__name__ == "FusedMoE"
+            if (module.__class__.__name__ == "FusedMoE"
+                or module.__class__.__name__ == "SharedFusedMoE")
         ]
         num_local_experts = moe_modules[0].moe_config.num_local_experts
         assert all(module.moe_config.num_local_experts == num_local_experts
@@ -781,7 +736,7 @@ class Worker(WorkerBase):
             assert self.model_runner.eplb_state is not None
             new_physical_experts = \
                 self.model_runner.eplb_state.physical_to_logical_map.shape[1]
-            parallel_config.num_redundant_experts = (
+            parallel_config.eplb_config.num_redundant_experts = (
                 new_physical_experts -
                 self.model_runner.eplb_state.logical_replica_count.shape[1])
             global_expert_load = None
@@ -794,11 +749,11 @@ class Worker(WorkerBase):
                                         group_src=0)
             num_local_physical_experts = num_local_physical_experts.item()
             new_physical_experts = num_local_physical_experts * new_ep_size
-            if self.model_runner.eplb_state is not None:
-                global_expert_load = self.model_runner.eplb_state.rearrange(
-                    self.model_runner.model, execute_shuffle=False)
-                parallel_config.num_redundant_experts = (
-                    new_physical_experts - global_expert_load.shape[1])
+            assert self.model_runner.eplb_state is not None
+            global_expert_load = self.model_runner.eplb_state.rearrange(
+                self.model_runner.model, execute_shuffle=False)
+            parallel_config.eplb_config.num_redundant_experts = (
+                new_physical_experts - global_expert_load.shape[1])
         prepare_communication_buffer_for_model(self.model_runner.model)
         self.model_runner.model.update_physical_experts_metadata(
             num_physical_experts=new_physical_experts,
@@ -861,6 +816,9 @@ class Worker(WorkerBase):
         self.model_runner.save_tensorized_model(
             tensorizer_config=tensorizer_config, )
 
+    def shutdown(self) -> None:
+        self.model_runner.ensure_kv_transfer_shutdown()
+
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
@@ -881,29 +839,11 @@ def init_worker_distributed_environment(
     init_distributed_environment(parallel_config.world_size, rank,
                                  distributed_init_method, local_rank, backend)
 
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+    ensure_model_parallel_initialized(
+        parallel_config.tensor_parallel_size,
+        parallel_config.pipeline_parallel_size,
+        parallel_config.decode_context_parallel_size)
 
     # Only initialize KV transfer for real device backends
     if backend != FAKE_DISTRIBUTED_BACKEND:
         ensure_kv_transfer_initialized(vllm_config)
-
-
-def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
-    # Check if the GPU supports the dtype.
-    if torch_dtype == torch.bfloat16:  # noqa: SIM102
-        if not current_platform.has_device_capability(80):
-            capability = current_platform.get_device_capability()
-            gpu_name = current_platform.get_device_name()
-
-            if capability is None:
-                compute_str = "does not have a compute capability"
-            else:
-                version_str = capability.as_version_str()
-                compute_str = f"has compute capability {version_str}"
-
-            raise ValueError(
-                "Bfloat16 is only supported on GPUs with compute capability "
-                f"of at least 8.0. Your {gpu_name} GPU {compute_str}. "
-                "You can use float16 instead by explicitly setting the "
-                "`dtype` flag in CLI, for example: --dtype=half.")
