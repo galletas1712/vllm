@@ -5,7 +5,7 @@ logger = init_logger(__name__)
 
 # Try to import cuda-python
 try:
-    from cuda import cuda
+    import cuda.bindings.driver as cuda
     cuda_available = True
 except ImportError:
     logger.warning("cuda-python package not found. CUDA checkpointing will not be available. "

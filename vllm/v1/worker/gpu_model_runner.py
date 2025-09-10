@@ -92,11 +92,15 @@ from .utils import (AttentionGroup, MultiModalBudget,
 
 if TYPE_CHECKING:
     import xgrammar as xgr
+    import xgrammar.kernels.apply_token_bitmask_inplace_torch_compile as xgr_torch_compile  # noqa: E501
 
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
+    xgr_torch_compile = LazyLoader(
+        "xgr_torch_compile", globals(),
+        "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile")
 
 logger = init_logger(__name__)
 
@@ -2177,8 +2181,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         initialization (e.g., CUDA graph capture, warmup).
         """
         
-        self._may_reinitialize_input_batch(
-            kv_cache_config=self.kv_cache_config,
+        self.may_reinitialize_input_batch(
+            kv_cache_config=None,
             force=True
         )
         # Clear cached request states
@@ -3185,7 +3189,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.reorder_batch_threshold = reorder_batch_threshold_i
 
     def may_reinitialize_input_batch(self,
-                                     kv_cache_config: KVCacheConfig,
+                                     kv_cache_config: Optional[KVCacheConfig] = None,
                                      force: bool = False) -> None:
         """
         Re-initialize the input batch if the block sizes are different from
@@ -3195,7 +3199,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Args:
             kv_cache_config: The KV cache configuration.
         """
-        block_sizes = [
+        if kv_cache_config is None:
+            block_sizes = [self.cache_config.block_size]
+        else:
+            block_sizes = [
             kv_cache_group.kv_cache_spec.block_size
             for kv_cache_group in kv_cache_config.kv_cache_groups
         ]

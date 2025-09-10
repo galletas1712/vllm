@@ -402,9 +402,10 @@ class Worker(WorkerBase):
         warmup_sizes = self.vllm_config.compilation_config.compile_sizes.copy()
         if not self.model_config.enforce_eager:
             warmup_sizes = [
-                x for x in warmup_sizes if x not in
-                self.vllm_config.compilation_config.cudagraph_capture_sizes
+                x for x in self.vllm_config.compilation_config.cudagraph_capture_sizes
+                if x not in warmup_sizes
             ]
+        assert warmup_sizes, f"No warmup sizes found, enforce_eager: {self.model_config.enforce_eager}, compile_sizes: {self.vllm_config.compilation_config.compile_sizes}, cudagraph_capture_sizes: {self.vllm_config.compilation_config.cudagraph_capture_sizes}"
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
@@ -416,6 +417,8 @@ class Worker(WorkerBase):
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         self.model_runner.reset_input_batch_state()
+
+        # Warm up kernels (DeepGEMM, Flashinfer, ...)
         kernel_warmup(self)
 
     @torch.inference_mode()
@@ -740,7 +743,7 @@ class Worker(WorkerBase):
                 new_physical_experts -
                 self.model_runner.eplb_state.logical_replica_count.shape[1])
             global_expert_load = None
-        else:
+        elif new_ep_size > old_ep_size:
             num_local_physical_experts = torch.tensor([num_local_experts],
                                                       dtype=torch.int32,
                                                       device="cpu")
@@ -754,6 +757,9 @@ class Worker(WorkerBase):
                 self.model_runner.model, execute_shuffle=False)
             parallel_config.eplb_config.num_redundant_experts = (
                 new_physical_experts - global_expert_load.shape[1])
+        else:
+            num_local_physical_experts = num_local_experts
+            new_physical_experts = num_local_physical_experts * new_ep_size
         prepare_communication_buffer_for_model(self.model_runner.model)
         self.model_runner.model.update_physical_experts_metadata(
             num_physical_experts=new_physical_experts,

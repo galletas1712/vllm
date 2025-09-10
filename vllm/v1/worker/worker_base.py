@@ -14,6 +14,37 @@ from vllm.worker.worker_base import WorkerBase as WorkerBaseV0
 logger = init_logger(__name__)
 
 
+def get_model_weights_size_bytes(model: torch.nn.Module) -> int:
+    """Calculate total unique bytes of all parameters & buffers on CUDA.
+    
+    This accounts for tied weights by tracking unique storage pointers.
+    """
+    seen_storages: set[int] = set()
+    total = 0
+    
+    # Count parameters
+    for param in model.parameters():
+        if not param.is_cuda:
+            continue
+        data_ptr = param.storage().data_ptr()
+        if data_ptr in seen_storages:
+            continue  # Skip tied weights / shared storage
+        seen_storages.add(data_ptr)
+        total += param.storage().nbytes()
+    
+    # Count buffers (e.g., layer norm weights)
+    for buffer in model.buffers():
+        if not buffer.is_cuda:
+            continue
+        data_ptr = buffer.storage().data_ptr()
+        if data_ptr in seen_storages:
+            continue
+        seen_storages.add(data_ptr)
+        total += buffer.storage().nbytes()
+    
+    return total
+
+
 class WorkerBase(WorkerBaseV0):
     """
     Abstract class for v1 worker, mainly define some methods for v1.

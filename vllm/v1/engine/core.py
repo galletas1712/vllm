@@ -89,6 +89,11 @@ class EngineCore:
                 executor_fail_callback)
 
         self.available_gpu_memory_for_kv_cache = -1
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
+
+        self.mm_receiver_cache = None
+        self.request_block_hasher: Optional[Callable[[Request],
+                                                     list[BlockHash]]] = None
 
     def _phase_1_init_rpc(self) -> None:
         logger.info("Init stage: phase 1")
@@ -110,8 +115,6 @@ class EngineCore:
 
         logger.info("Init stage: phase 3")
         self.collective_rpc("phase_3_init")
-
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
         if isinstance(vllm_config.scheduler_config.scheduler_cls, str):
@@ -162,8 +165,6 @@ class EngineCore:
                         self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
 
-        self.request_block_hasher: Optional[Callable[[Request],
-                                                     list[BlockHash]]] = None
         if (self.vllm_config.cache_config.enable_prefix_caching
                 or self.scheduler.get_kv_connector() is not None):
 
@@ -174,6 +175,9 @@ class EngineCore:
 
             self.request_block_hasher = get_request_block_hasher(
                 block_size, caching_hash_fn)
+
+        self.step_fn = (self.step if self.batch_queue is None else
+                        self.step_with_batch_queue)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig,
@@ -561,9 +565,6 @@ class EngineCoreProc(EngineCore):
                         "Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
-
-        self.step_fn = (self.step if self.batch_queue is None else
-                        self.step_with_batch_queue)
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.

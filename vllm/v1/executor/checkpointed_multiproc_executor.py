@@ -285,9 +285,6 @@ class CheckpointedWorkerProc(WorkerProc):
         # Become session leader and set controlling TTY
         os.setsid()
 
-        # Restore usual worker log decoration (process title + prefix)
-        CheckpointedWorkerProc.decorate_logs(vllm_config, rank)
-        
         try:
             # Create worker in checkpoint mode
             worker_proc = CheckpointedWorkerProc(
@@ -569,21 +566,16 @@ class CheckpointedMultiprocExecutor(MultiprocExecutor):
     
     def _checkpoint_all_workers(self):
         """Checkpoint all workers using CRIU."""
-        # Remove semaphore files before checkpoint
-        self._remove_semaphore_files()
-        
-        # Checkpoint all workers in parallel
-        with ThreadPoolExecutor(max_workers=self.world_size) as executor:
-            futures = []
-            for worker in self.workers:
-                future = executor.submit(self._checkpoint_worker, worker)
-                futures.append(future)
-            
-            # Wait for all checkpoints to complete
-            for future in as_completed(futures):
-                result = future.result()
-                if not result["success"]:
-                    raise RuntimeError(f"Failed to checkpoint worker {result['rank']}: {result.get('error')}")
+        # Checkpoint all workers serially
+        logger.info("Starting serial checkpoint of %d workers...", len(self.workers))
+        for i, worker in enumerate(self.workers):
+            logger.info("Checkpointing worker %d/%d (rank %d)...", 
+                        i + 1, len(self.workers), worker.rank)
+            result = self._checkpoint_worker(worker)
+            if not result["success"]:
+                raise RuntimeError(f"Failed to checkpoint worker {result['rank']}: {result.get('error')}")
+            logger.info("Successfully checkpointed worker %d (rank %d)", 
+                        i + 1, worker.rank)
     
     def _checkpoint_worker(
             self, worker: CheckpointedWorkerProcHandle) -> dict[str, Any]:
@@ -601,6 +593,10 @@ class CheckpointedMultiprocExecutor(MultiprocExecutor):
             # Checkpoint CUDA state
             logger.info(f"Worker {rank}: Checkpointing CUDA state...")
             checkpoint_cuda_process(pid)
+            
+            # Remove semaphore files after CUDA checkpoint but before CRIU dump
+            logger.info(f"Worker {rank}: Removing semaphore files before CRIU dump...")
+            self._remove_semaphore_files(target_pid=pid)
             
             # Get TTY info and save it
             rdev, dev = _get_tty_info(pid)
@@ -656,10 +652,19 @@ class CheckpointedMultiprocExecutor(MultiprocExecutor):
                 "error": str(e),
             }
     
-    def _remove_semaphore_files(self):
-        """Remove semaphore files that could interfere with CRIU."""
-        logger.info("Removing semaphore files...")
-        our_pids = [os.getpid()] + [w.proc.pid for w in self.workers]
+    def _remove_semaphore_files(self, target_pid: Optional[int] = None):
+        """Remove semaphore files that could interfere with CRIU.
+        
+        Args:
+            target_pid: If specified, only remove semaphores for this PID.
+                       If None, remove semaphores for all processes.
+        """
+        if target_pid is not None:
+            logger.info(f"Removing semaphore files for PID {target_pid}...")
+            our_pids = [target_pid]
+        else:
+            logger.info("Removing semaphore files for all processes...")
+            our_pids = [os.getpid()] + [w.proc.pid for w in self.workers]
         logger.info(f"Checking semaphore files for PIDs: {our_pids}")
         our_semaphores = set()
         
