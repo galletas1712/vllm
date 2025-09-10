@@ -651,7 +651,8 @@ class EngineCoreProc(EngineCore):
             # Send ready message.
             # In checkpoint mode, num_gpu_blocks is not calculated yet.
             num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks or 0
-            # TODO (schwinns): move this information out of handshake - do this somewhere else so we actually get valid info?
+            # TODO (schwinns): move this information out of handshake -
+            # do this somewhere else so we actually get valid info?
 
             # We pass back the coordinator stats update address here for the
             # external LB case for our colocated front-end to use (coordinator
@@ -800,6 +801,10 @@ class EngineCoreProc(EngineCore):
         """Check if phase 1 checkpoint is ready."""
         return self.state == EngineCoreProcState.CHECKPOINTED_WORKERS
     
+    def is_ready_to_serve(self) -> bool:
+        """Check if the engine has fully initialized and is ready to serve."""
+        return self.state == EngineCoreProcState.READY_TO_SERVE
+    
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
 
@@ -838,7 +843,7 @@ class EngineCoreProc(EngineCore):
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
-        for output in (outputs.items() if outputs else ()):
+        for output in (outputs.items() if outputs else ()):            
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)

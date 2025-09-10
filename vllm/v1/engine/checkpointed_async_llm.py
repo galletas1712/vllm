@@ -3,7 +3,6 @@
 import asyncio
 import multiprocessing
 import os
-import signal
 import subprocess
 import time
 import traceback
@@ -130,6 +129,40 @@ def _load_tree_pid(checkpoint_dir: str) -> Optional[int]:
     except Exception as e:
         logger.warning("Failed to load tree pid for CRIU restore: %s", e)
         return None
+
+
+def _save_process_tree_pids(checkpoint_dir: str, pids: set[int]) -> None:
+    """Save the PIDs of all processes in the checkpointed tree."""
+    try:
+        path = os.path.join(checkpoint_dir, "criu_process_tree_pids.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            # Sort for consistent ordering
+            for pid in sorted(pids):
+                f.write(f"{pid}\n")
+    except Exception as e:
+        logger.warning("Failed to save process tree PIDs: %s", e)
+
+
+def _load_process_tree_pids(checkpoint_dir: str) -> set[int]:
+    """Load the PIDs of all processes that were checkpointed."""
+    try:
+        path = os.path.join(checkpoint_dir, "criu_process_tree_pids.txt")
+        if not os.path.exists(path):
+            return set()
+        
+        pids = set()
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        pids.add(int(line))
+                    except ValueError:
+                        continue
+        return pids
+    except Exception as e:
+        logger.warning("Failed to load process tree PIDs: %s", e)
+        return set()
 
 
 def _collect_process_tree_pids(root_pid: int) -> set[int]:
@@ -883,6 +916,9 @@ class CheckpointedAsyncLLM(EngineClient):
         # Take a snapshot of the process tree (for post-dump verification)
         root_pid = self.process.pid
         pre_dump_tree = _collect_process_tree_pids(root_pid)
+        
+        # Save the process tree PIDs for use after restore
+        _save_process_tree_pids(checkpoint_dir, pre_dump_tree)
 
         # Build CRIU dump command
         cmd = [
@@ -1067,14 +1103,14 @@ class CheckpointedAsyncLLM(EngineClient):
         # Wait a bit for the process to fully restore
         await asyncio.sleep(1)
         
-        # Find all processes using our ZMQ port
-        self._restored_pids = self._find_processes_using_port(self.port)
+        # Load the PIDs that were saved during checkpoint
+        self._restored_pids = _load_process_tree_pids(self.checkpoint_dir)
         if self._restored_pids:
-            logger.info("Found restored processes: %s", 
+            logger.info("Loaded %d restored process PIDs from checkpoint: %s",
+                        len(self._restored_pids), 
                         sorted(self._restored_pids))
         else:
-            logger.warning("Could not find restored processes using port %d", 
-                           self.port)
+            logger.warning("No process PIDs found in checkpoint directory")
         
         # Re-establish connection to the restored process
         self._is_running = True
@@ -1177,7 +1213,8 @@ class CheckpointedAsyncLLM(EngineClient):
                     #                              "%d: %s", pid, e)
                     # else:
                     #     logger.warning("No process reference and no tracked "
-                    #                    "PIDs - unable to ensure clean shutdown")
+                    #                    "PIDs - unable to ensure clean "
+                    #                    "shutdown")
                     pass
                 
                 sync_socket.close()
@@ -1200,51 +1237,6 @@ class CheckpointedAsyncLLM(EngineClient):
     def __del__(self):
         self.shutdown()
         
-    def _find_processes_using_port(self, port: int) -> set[int]:
-        """Find all processes using the given TCP port.
-        
-        Returns a set of PIDs that have connections to the port.
-        """
-        pids = set()
-        try:
-            # Use lsof to find processes using the port
-            result = subprocess.run(
-                ['lsof', '-ti', f'tcp:{port}'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0 and result.stdout:
-                for line in result.stdout.strip().split('\n'):
-                    try:
-                        pid = int(line.strip())
-                        pids.add(pid)
-                    except ValueError:
-                        continue
-        except Exception as e:
-            logger.warning("Could not find processes using port %d: %s", 
-                           port, e)
-            
-        # Alternative: check /proc/*/net/tcp for our port
-        if not pids:
-            try:
-                port_hex = f"{port:04X}"
-                # Check all processes
-                for pid_dir in os.listdir("/proc"):
-                    if not pid_dir.isdigit():
-                        continue
-                    try:
-                        tcp_path = f"/proc/{pid_dir}/net/tcp"
-                        if os.path.exists(tcp_path):
-                            with open(tcp_path) as f:
-                                content = f.read()
-                                if port_hex in content:
-                                    pids.add(int(pid_dir))
-                    except Exception:
-                        continue
-            except Exception as e:
-                logger.debug("Alternative port check failed: %s", e)
-                
-        return pids
     
     # ----- Internal helpers for CRIU PTY forwarding -----
     def _start_pty_forwarder(self, master_fd: int) -> None:

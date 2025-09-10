@@ -232,6 +232,10 @@ class EngineCoreClient(ABC):
 
     async def resume_init_async(self, after_criu_restore: bool = False) -> None:
         raise NotImplementedError
+    
+    async def wait_until_ready(self) -> None:
+        """Wait until the engine is fully initialized and ready to serve."""
+        raise NotImplementedError
 
 
 class InprocClient(EngineCoreClient):
@@ -989,6 +993,19 @@ class AsyncMPClient(MPClient):
             if is_ready:
                 break
             await asyncio.sleep(0.1)
+
+    async def wait_until_ready(self) -> None:
+        """Wait until the engine reports READY_TO_SERVE."""
+        # Ensure the output processing task is running
+        self._ensure_output_queue_task()
+        while True:
+            try:
+                ready = await self.call_utility_async("is_ready_to_serve")
+                if ready:
+                    return
+            except EngineDeadError:
+                raise
+            await asyncio.sleep(0.05)
 
 
 class DPAsyncMPClient(AsyncMPClient):

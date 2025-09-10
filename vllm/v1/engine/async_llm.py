@@ -705,6 +705,14 @@ class AsyncLLM(EngineClient):
         """
         await self.engine_core.wait_until_checkpoint_ready()
     
+    async def wait_until_ready(self) -> None:
+        """Wait until the engine is fully initialized and ready to serve.
+
+        This is useful to time full initialization in normal mode
+        (non-checkpoint), ensuring phases 1-3 complete before proceeding.
+        """
+        await self.engine_core.wait_until_ready()
+    
     async def resume_init(self, after_criu_restore: bool = False) -> None:
         """Resume initialization from phase 1 checkpoint.
         
