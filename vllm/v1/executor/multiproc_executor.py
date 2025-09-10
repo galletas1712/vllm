@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import multiprocessing
-import os
 import pickle
+import os
 import queue
 import signal
 import threading
@@ -621,7 +621,7 @@ class WorkerProc:
             ready_writer.close()
             ready_writer = None
 
-            worker.worker_busy_loop()
+            worker.worker_busy_loop(cancel=shutdown_event)
 
         except Exception:
             # NOTE: if an Exception arises in busy_loop, we send

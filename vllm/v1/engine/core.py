@@ -242,7 +242,7 @@ class EngineCore:
 
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
-        
+
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
@@ -839,6 +839,8 @@ class EngineCoreProc(EngineCore):
         # Put EngineCoreOutputs into the output queue.
         for output in (outputs.items() if outputs else ()):
             self.output_queue.put_nowait(output)
+        # Post-step hook.
+        self.post_step(model_executed)
 
         return model_executed
 
