@@ -487,7 +487,7 @@ class ModelConfig:
     used with `--generation-config auto`, the override parameters will be
     merged with the default config from the model. If used with
     `--generation-config vllm`, only the override parameters are used."""
-    enable_sleep_mode: bool = True
+    enable_sleep_mode: bool = False
     """Enable sleep mode for the engine (only cuda platform is supported)."""
     model_impl: Union[str, ModelImpl] = ModelImpl.AUTO.value
     """Which implementation of the model to use:\n

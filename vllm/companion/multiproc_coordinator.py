@@ -4,6 +4,7 @@
 """Simple coordinator for companion server/client communication."""
 
 import asyncio
+import time
 import multiprocessing as mp
 import signal
 from dataclasses import dataclass
@@ -160,6 +161,9 @@ class MultiProcCoordinator:
         import pickle
         
         try:
+            logger.info(
+                "[COORDINATOR] Received client request (bytes=%d, needs_empty_delim=%s)",
+                len(message), needs_empty_delim)
             # Decode the request to get device_id
             request = pickle.loads(message)
             
@@ -214,31 +218,13 @@ class MultiProcCoordinator:
         
         # Check if this is a model load request (has vllm_config and not a ping)
         if hasattr(request, 'vllm_config') and request.vllm_config is not None:
-            # If distributed not initialized yet, this is an init request
-            if not self.distributed_initialized:
-                # Collect init request for broadcast
-                request_key = (device_id, client_id)
-                self.pending_init_requests[request_key] = (client_id, message, needs_empty_delim)
-                
-                # Get unique devices we've collected so far
-                unique_devices = set(key[0] for key in self.pending_init_requests)
-                expected_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
-                
-                # When we have at least one request per device, broadcast init
-                if len(unique_devices) >= expected_count:
-                    logger.info("Broadcasting %d init requests to %d devices for GLOO rendezvous",
-                               len(self.pending_init_requests), len(unique_devices))
-                    await self._broadcast_init_requests()
-                    self.distributed_initialized = True
-                else:
-                    logger.debug("Collected init request for device %d (%d/%d devices covered)",
-                                device_id, len(unique_devices), expected_count)
-            else:
-                # Distributed already initialized, forward without blocking
-                asyncio.create_task(
-                    self._forward_single_request(client_id, message, device_id,
-                                                 needs_empty_delim)
-                )
+            # Forward immediately; companions will handle GLOO rendezvous.
+            asyncio.create_task(
+                self._forward_single_request(client_id, message, device_id,
+                                             needs_empty_delim)
+            )
+            # Mark as initialized to bypass any legacy gating paths.
+            self.distributed_initialized = True
         else:
             # Not a model load - forward without blocking (e.g., ping requests)
             asyncio.create_task(
@@ -375,6 +361,7 @@ class MultiProcCoordinator:
                                       device_id: int,
                                       needs_empty_delim: bool):
         """Forward a single request to a companion."""
+        t0 = time.perf_counter()
         # Ensure companion is running
         if device_id not in self.companions:
             self.start_companion(device_id)
@@ -400,10 +387,18 @@ class MultiProcCoordinator:
         try:
             # Create temporary connection to companion
             req_socket = self.context.socket(zmq.REQ)
+            # Add timeouts to avoid indefinite hangs
+            req_socket.setsockopt(zmq.RCVTIMEO, 300000)  # 5 minutes
+            req_socket.setsockopt(zmq.SNDTIMEO, 10000)   # 10 seconds
             req_socket.connect(f"tcp://127.0.0.1:{companion.port}")
             
             await req_socket.send(message)
+            logger.info("[COORDINATOR] Forwarded request to companion gpu=%d port=%d (bytes=%d)",
+                        device_id, companion.port, len(message))
             response = await req_socket.recv()
+            t1 = time.perf_counter()
+            logger.info("[COORDINATOR] Received response from companion gpu=%d in %.3fs (bytes=%d)",
+                        device_id, t1 - t0, len(response))
             
             req_socket.close()
             

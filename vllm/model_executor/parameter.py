@@ -51,11 +51,15 @@ class BasevLLMParameter(Parameter):
     into the parameter when the provided weight loader is called.
     """
 
-    def __new__(cls, data: Optional[torch.Tensor], **kwargs):
+    def __new__(cls, data: Optional[torch.Tensor], uninitialized: bool = False, **kwargs):
+        if uninitialized:
+            assert data is None, "Data should be None for UninitializedParameterFromTensor"
+            return UninitializedParameterFromTensor.__new__(cls, requires_grad=False)
+        else:
+            assert data is not None, "Data should not be None for InitializedParameterFromTensor"
+            return super().__new__(cls, data=data, requires_grad=False)
 
-        return super().__new__(cls, data=data, requires_grad=False)
-
-    def __init__(self, data: torch.Tensor, weight_loader: Callable):
+    def __init__(self, data: torch.Tensor, weight_loader: Callable, uninitialized: bool = False):
         """
         Initialize the BasevLLMParameter
 

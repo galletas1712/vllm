@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+from vllm.model_executor.parameter import UninitializedParameterFromTensor
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.platforms import current_platform
+from vllm.config import get_current_vllm_config
 
 logger = init_logger(__name__)
 
@@ -48,6 +50,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             f"{self.__class__.__name__}.apply should not be called.")
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        fake_delete =  get_current_vllm_config().load_config.enable_companion_process
+
         # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
         # regardless whether the kv-scale is available in the checkpoint.
         # No need to process kv scales after loading if we are going to
@@ -133,7 +137,18 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                 "issues. Please make sure q/prob scaling factors are "
                 "available in the fp8 checkpoint.")
 
-        del layer.k_scale
-        del layer.v_scale
-        del layer.q_scale
-        del layer.prob_scale
+        # Do not delete parameters; mark them uninitialized to retain names
+        # for IPC reload compatibility while freeing storage.
+        device = layer._k_scale.device if hasattr(layer, "_k_scale") else None
+        if fake_delete and isinstance(getattr(layer, "k_scale", None), torch.nn.Parameter):
+            layer.k_scale = UninitializedParameterFromTensor(
+                requires_grad=False, device=device, dtype=torch.float32)
+        if fake_delete and isinstance(getattr(layer, "v_scale", None), torch.nn.Parameter):
+            layer.v_scale = UninitializedParameterFromTensor(
+                requires_grad=False, device=device, dtype=torch.float32)
+        if fake_delete and isinstance(getattr(layer, "q_scale", None), torch.nn.Parameter):
+            layer.q_scale = UninitializedParameterFromTensor(
+                requires_grad=False, device=device, dtype=torch.float32)
+        if fake_delete and isinstance(getattr(layer, "prob_scale", None), torch.nn.Parameter):
+            layer.prob_scale = UninitializedParameterFromTensor(
+                requires_grad=False, device=device, dtype=torch.float32)

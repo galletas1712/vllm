@@ -101,12 +101,13 @@ def register_model_loader(load_format: str):
     return _wrapper
 
 
-def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+def get_model_loader(load_config: LoadConfig | None = None, vllm_config: VllmConfig | None = None) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     # Check if IPC loading is enabled
-    if load_config.enable_companion_process:
+    if (load_config and load_config.enable_companion_process) or (vllm_config and vllm_config.load_config.enable_companion_process):
         from vllm.model_executor.model_loader.ipc_loader import IPCModelLoader
-        return IPCModelLoader(load_config)
+        assert vllm_config is not None
+        return IPCModelLoader(vllm_config)
 
     load_format = load_config.load_format
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
@@ -117,7 +118,7 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 def get_model(*,
               vllm_config: VllmConfig,
               model_config: Optional[ModelConfig] = None) -> nn.Module:
-    loader = get_model_loader(vllm_config.load_config)
+    loader = get_model_loader(load_config=vllm_config.load_config, vllm_config=vllm_config)
     if model_config is None:
         model_config = vllm_config.model_config
     return loader.load_model(vllm_config=vllm_config,

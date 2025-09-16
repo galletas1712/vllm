@@ -3,6 +3,7 @@
 
 """Model instance manager for companion servers (shared by MultiProc and Dynamo)."""
 
+import copy
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
 
@@ -26,14 +27,7 @@ def override_vllm_config(
     vllm_config: VllmConfig,
     device_id: int,
 ) -> VllmConfig:
-    # NOTE: If we deepcopy, there's a bunch of other stuff that gets copied that we don't want
-    new_vllm_config = VllmConfig(
-        model_config=vllm_config.model_config,
-        parallel_config=vllm_config.parallel_config,
-        cache_config=vllm_config.cache_config,
-        device_config=vllm_config.device_config,
-        load_config=vllm_config.load_config,
-    )
+    new_vllm_config = copy.deepcopy(vllm_config)
     # Override load config for fake run on SPECIFIED device
     # NOTE: we use device_id and not local_rank because we assume CUDA_VISIBLE_DEVICES is not set
     # local_rank would come from the client view which may not be correct
@@ -130,7 +124,8 @@ class ModelInstanceManager:
         # Load model with vllm config context
         with set_current_vllm_config(self.vllm_config):
             self._model = default_loader.load_model(
-                self.vllm_config, self.vllm_config.model_config
+                self.vllm_config, self.vllm_config.model_config,
+                skip_postprocess=True
             )
 
         logger.info("[MODEL-LOAD] ✓ Model loaded successfully!")

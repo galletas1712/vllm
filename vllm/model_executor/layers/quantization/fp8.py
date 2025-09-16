@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -43,7 +44,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     requantize_with_max_scale)
 from vllm.model_executor.parameter import (BlockQuantScaleParameter,
                                            ModelWeightParameter,
-                                           PerTensorScaleParameter)
+                                           PerTensorScaleParameter, UninitializedParameterFromTensor)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
@@ -303,18 +304,25 @@ class Fp8LinearMethod(LinearMethodBase):
                             f"{output_partition_size} is not divisible by "
                             f"weight quantization block_n = {block_n}.")
 
+        uninitialized = get_current_vllm_config().load_config.enable_companion_process
         # WEIGHT
         weight_dtype = (torch.float8_e4m3fn
                         if self.quant_config.is_checkpoint_fp8_serialized else
                         params_dtype)
 
-        weight = ModelWeightParameter(data=torch.empty(
-            output_size_per_partition,
-            input_size_per_partition,
-            dtype=weight_dtype),
-                                      input_dim=1,
-                                      output_dim=0,
-                                      weight_loader=weight_loader)
+        weight = ModelWeightParameter(
+            data=(
+                    torch.empty(
+                        output_size_per_partition,
+                        input_size_per_partition,
+                        dtype=weight_dtype)
+                        if not uninitialized else None
+                ),
+            uninitialized=uninitialized,
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
         layer.register_parameter("weight", weight)
 
         # If checkpoint is serialized fp8, load them.
@@ -323,37 +331,54 @@ class Fp8LinearMethod(LinearMethodBase):
             # WEIGHT SCALE
             if not self.block_quant:
                 scale = PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes),
-                                     dtype=torch.float32),
+                    data=(
+                        torch.empty(len(output_partition_sizes),
+                                     dtype=torch.float32)
+                        if not uninitialized else None
+                    ),
+                    uninitialized=uninitialized,
                     weight_loader=weight_loader,
                 )
-                scale[:] = torch.finfo(torch.float32).min
+                if not uninitialized:
+                    scale[:] = torch.finfo(torch.float32).min
                 set_weight_attrs(scale, {"scale_type": "weight_scale"})
                 layer.register_parameter("weight_scale", scale)
             else:
                 assert self.quant_config.activation_scheme == "dynamic"
                 scale = BlockQuantScaleParameter(
-                    data=torch.empty(
-                        (output_size_per_partition + block_n - 1) // block_n,
-                        (input_size_per_partition + block_k - 1) // block_k,
-                        dtype=torch.float32,
+                    data=(
+                        torch.empty(
+                            (output_size_per_partition + block_n - 1) // block_n,
+                            (input_size_per_partition + block_k - 1) // block_k,
+                            dtype=torch.float32,
+                        )
+                        if not uninitialized else None
                     ),
+                    uninitialized=uninitialized,
                     input_dim=1,
                     output_dim=0,
                     weight_loader=weight_loader,
                 )
-                scale[:] = torch.finfo(torch.float32).min
+                if not uninitialized:
+                    scale[:] = torch.finfo(torch.float32).min
                 set_weight_attrs(scale, {"scale_type": "weight_scale"})
                 # The weight_scale_inv name is intentional for deepseekv3
                 layer.register_parameter("weight_scale_inv", scale)
 
             # INPUT ACTIVATION SCALE
             if self.quant_config.activation_scheme == "static":
-                scale = PerTensorScaleParameter(data=torch.empty(
-                    len(output_partition_sizes), dtype=torch.float32),
-                                                weight_loader=weight_loader)
+                scale = PerTensorScaleParameter(
+                    data=(
+                        torch.empty(
+                            len(output_partition_sizes), dtype=torch.float32)
+                        if not uninitialized else None
+                    ),
+                    uninitialized=uninitialized,
+                    weight_loader=weight_loader,
+                )
 
-                scale[:] = torch.finfo(torch.float32).min
+                if not uninitialized:
+                    scale[:] = torch.finfo(torch.float32).min
                 set_weight_attrs(scale, {"scale_type": "input_scale"})
                 layer.register_parameter("input_scale", scale)
             else:
@@ -371,6 +396,8 @@ class Fp8LinearMethod(LinearMethodBase):
         return weight
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        fake_delete = get_current_vllm_config().load_config.enable_companion_process
+
         size_k_first = True
         # TODO(rob): refactor block quant into separate class.
         if self.block_quant:
@@ -447,7 +474,9 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_marlin:
             prepare_fp8_layer_for_marlin(layer, size_k_first)
             # Activations not quantized for marlin.
-            del layer.input_scale
+            if fake_delete and isinstance(getattr(layer, "input_scale", None), torch.nn.Parameter):
+                layer.input_scale = UninitializedParameterFromTensor(
+                    requires_grad=False, device=layer.input_scale.device, dtype=torch.float32)
 
         # On B200, if E8M0 for DeepGemm is used, we need to
         # requantize the weight and input to the specific scale
@@ -617,21 +646,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     f"weight quantization block_k = {block_k}.")
 
         # WEIGHTS
-        w13_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            2 * intermediate_size_per_partition,
-            hidden_size,
-            dtype=params_dtype),
-                                        requires_grad=False)
+        if get_current_vllm_config().load_config.enable_companion_process:
+            w13_weight = UninitializedParameterFromTensor()
+        else:
+            w13_weight = torch.nn.Parameter(torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype),
+                                            requires_grad=False)
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        w2_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            dtype=params_dtype),
-                                       requires_grad=False)
+        if get_current_vllm_config().load_config.enable_companion_process:
+            w2_weight = UninitializedParameterFromTensor()
+        else:
+            w2_weight = torch.nn.Parameter(torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype),
+                                        requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
@@ -639,34 +674,46 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if not self.block_quant:
             # Allocate 2 scales for w1 and w3 respectively.
             # They will be combined to a single scale after weight loading.
-            w13_weight_scale = torch.nn.Parameter(torch.ones(
-                num_experts, 2, dtype=torch.float32),
-                                                  requires_grad=False)
-            w2_weight_scale = torch.nn.Parameter(torch.ones(
-                num_experts, dtype=torch.float32),
-                                                 requires_grad=False)
+            if get_current_vllm_config().load_config.enable_companion_process:
+                w13_weight_scale = UninitializedParameterFromTensor()
+            else:
+                w13_weight_scale = torch.nn.Parameter(torch.ones(
+                    num_experts, 2, dtype=torch.float32),
+                                                    requires_grad=False)
+            if get_current_vllm_config().load_config.enable_companion_process:
+                w2_weight_scale = UninitializedParameterFromTensor()
+            else:
+                w2_weight_scale = torch.nn.Parameter(torch.ones(
+                    num_experts, dtype=torch.float32),
+                                                    requires_grad=False)
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
         else:
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    num_experts,
-                    2 * ((intermediate_size_per_partition + block_n - 1) //
-                         block_n),
-                    (hidden_size + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    num_experts,
-                    (hidden_size + block_n - 1) // block_n,
-                    (intermediate_size_per_partition + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
+            if get_current_vllm_config().load_config.enable_companion_process:
+                w13_weight_scale = UninitializedParameterFromTensor()
+            else:
+                w13_weight_scale = torch.nn.Parameter(
+                    torch.ones(
+                        num_experts,
+                        2 * ((intermediate_size_per_partition + block_n - 1) //
+                            block_n),
+                        (hidden_size + block_k - 1) // block_k,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
+            if get_current_vllm_config().load_config.enable_companion_process:
+                w2_weight_scale = UninitializedParameterFromTensor()
+            else:
+                w2_weight_scale = torch.nn.Parameter(
+                    torch.ones(
+                        num_experts,
+                        (hidden_size + block_n - 1) // block_n,
+                        (intermediate_size_per_partition + block_k - 1) // block_k,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
@@ -691,15 +738,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     "Found static activation scheme for checkpoint that "
                     "was not serialized fp8.")
 
-            w13_input_scale = torch.nn.Parameter(torch.ones(
-                num_experts, dtype=torch.float32),
-                                                 requires_grad=False)
+            if get_current_vllm_config().load_config.enable_companion_process:
+                w13_input_scale = UninitializedParameterFromTensor()
+            else:
+                w13_input_scale = torch.nn.Parameter(torch.ones(
+                    num_experts, dtype=torch.float32),
+                                                    requires_grad=False)
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
-            w2_input_scale = torch.nn.Parameter(torch.ones(
-                num_experts, dtype=torch.float32),
-                                                requires_grad=False)
+            if get_current_vllm_config().load_config.enable_companion_process:
+                w2_input_scale = UninitializedParameterFromTensor()
+            else:
+                w2_input_scale = torch.nn.Parameter(torch.ones(
+                    num_experts, dtype=torch.float32),
+                                                    requires_grad=False)
             layer.register_parameter("w2_input_scale", w2_input_scale)
             set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
@@ -708,6 +761,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        fake_delete = get_current_vllm_config().load_config.enable_companion_process
+
         # Lazy import to avoid importing triton too early.
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
             is_rocm_aiter_moe_enabled, shuffle_weights)
@@ -893,8 +948,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.use_marlin:
             prepare_moe_fp8_layer_for_marlin(layer, False)
             # Activations not quantized for marlin.
-            del layer.w13_input_scale
-            del layer.w2_input_scale
+            if fake_delete and isinstance(getattr(layer, "w13_input_scale", None), torch.nn.Parameter):
+                layer.w13_input_scale = UninitializedParameterFromTensor(
+                    requires_grad=False, device=layer.w13_input_scale.device, dtype=torch.float32)
+            if fake_delete and isinstance(getattr(layer, "w2_input_scale", None), torch.nn.Parameter):
+                layer.w2_input_scale = UninitializedParameterFromTensor(
+                    requires_grad=False, device=layer.w2_input_scale.device, dtype=torch.float32)
 
         if is_deep_gemm_e8m0_used():
             assert layer.weight_block_size is not None

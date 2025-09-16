@@ -68,7 +68,12 @@ class GetModelParametersRequest:
     def compute_hash(self) -> str:
         """Compute a hash for this request configuration."""
         config_data = {
-            'vllm_config': self.vllm_config.compute_hash(),
+            'model_config_hash': self.vllm_config.model_config.compute_hash(),
+            'parallel_config_hash': self.vllm_config.parallel_config.compute_hash(),
+            'cache_config_hash': self.vllm_config.cache_config.compute_hash(),
+            'device_config_hash': self.vllm_config.device_config.compute_hash(),
+            'load_config_hash': self.vllm_config.load_config.compute_hash(),
+            'lora_config_hash': self.vllm_config.lora_config.compute_hash() if self.vllm_config.lora_config else "None",
             'local_rank': self.local_rank,
             'global_rank': self.global_rank,
             'world_size': self.world_size

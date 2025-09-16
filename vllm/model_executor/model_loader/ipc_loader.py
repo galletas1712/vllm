@@ -66,16 +66,22 @@ class IPCModelLoader(BaseModelLoader):
     based on the worker's rank.
     """
 
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
+    def __init__(self, vllm_config: VllmConfig):
+        self.vllm_config = VllmConfig(
+            model_config=copy.deepcopy(vllm_config.model_config),
+            parallel_config=copy.deepcopy(vllm_config.parallel_config),
+            cache_config=copy.deepcopy(vllm_config.cache_config),
+            device_config=copy.deepcopy(vllm_config.device_config),
+            load_config=copy.deepcopy(vllm_config.load_config),
+            companion_config=copy.deepcopy(vllm_config.companion_config),
+        )
 
-        if not load_config.enable_companion_process:
+        if not self.vllm_config.load_config.enable_companion_process:
             raise ValueError(
                 "IPCModelLoader requires enable_companion_process=True in LoadConfig"
             )
 
         self.client = None  # Will be initialized when we know the model
-        self.vllm_config = None
         self.use_multiproc = USE_MULTIPROC
         self.runtime = None  # Only used for Dynamo backend
 
@@ -267,6 +273,7 @@ class IPCModelLoader(BaseModelLoader):
         try:
             if self.use_multiproc:
                 # MultiProc client returns rebuild info directly
+                logger.info("[IPC-LOADER] Requesting model parameters via MultiProc client")
                 model_parameters_rebuild_info = self.client.get_model_parameters(
                     vllm_config=self.vllm_config,
                     device_id=torch.cuda.current_device()
@@ -274,10 +281,12 @@ class IPCModelLoader(BaseModelLoader):
             else:
                 # Dynamo client is async
                 loop = asyncio.get_event_loop()
+                logger.info("[IPC-LOADER] Requesting model parameters via Dynamo client (async)")
                 model_parameters_rebuild_info = loop.run_until_complete(
                     self.client.get_model_parameters()
                 )
         except Exception as e:
+            logger.error("[IPC-LOADER] Error getting tensor rebuild info: %s", e)
             raise RuntimeError(
                 f"Error getting tensor rebuild info: {e}") from e
 
@@ -299,16 +308,13 @@ class IPCModelLoader(BaseModelLoader):
                     )
 
                 logger.debug(
-                    "Reconstructed parameter %s with shape %s on device %s",
-                    name,
-                    parameter.shape,
-                    parameter.device,
-                )
+                    "[IPC-LOADER] Reconstructed parameter %s shape=%s device=%s",
+                    name, parameter.shape, parameter.device)
 
                 yield name, parameter
             except Exception as e:
                 logger.error(
-                    "Failed to reconstruct parameter %s: %s", name, e)
+                    "[IPC-LOADER] Failed to reconstruct parameter %s: %s", name, e)
                 raise RuntimeError(
                     f"Failed to reconstruct parameter {name}: {e}") from e
 
@@ -339,7 +345,8 @@ class IPCModelLoader(BaseModelLoader):
                 f"{weights_not_loaded}"
             )
 
-        logger.info("Successfully loaded all weights via IPC")
+        logger.info("Finished loading parameters via IPC: %d mapped, %d missing",
+                    len(loaded_weights), len(weights_not_loaded))
 
     def load_model(self, vllm_config: VllmConfig,
                    model_config: ModelConfig) -> nn.Module:
@@ -355,9 +362,6 @@ class IPCModelLoader(BaseModelLoader):
                                          model_config=model_config)
 
             logger.debug("Loading weights on %s ...", load_device)
-
-            # Store vllm_config for use in download_model
-            self.vllm_config = copy.deepcopy(vllm_config)
             
             # Log rank information for debugging
             # By this point, the distributed environment is already initialized

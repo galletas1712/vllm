@@ -26,7 +26,6 @@ from vllm.distributed.parallel_state import get_pp_group, get_tp_group, get_ep_g
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
-from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -38,8 +37,7 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
                              DraftTokenIds, ModelRunnerOutput)
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.worker_base import WorkerBase, get_model_weights_size_bytes
-from vllm.device_allocator.cumem import CuMemAllocator
+from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
 
@@ -131,15 +129,7 @@ class Worker(WorkerBase):
         """
         assert self.init_phase == WorkerInitPhase.PHASE_1, "Worker must be in phase 1"
         self.init_model_runner()
-        # Defer real weights: load dummy weights in phase 1 so that we can
-        # precompile without committing real weight memory. We'll switch
-        # to the real loader and reload weights in phase 2.
-        if self._original_load_format != "dummy":
-            self.model_runner.update_config({
-                "load_config": {
-                    "load_format": "dummy",
-                }
-            })
+        assert self.vllm_config.load_config.enable_companion_process, "Companion process must be enabled."
         self.load_model()
         self.precompile_model()
 
@@ -151,9 +141,8 @@ class Worker(WorkerBase):
         self.model_runner.reset_input_batch_state()
         cleanup_dist_env_and_memory()
 
-        # Offload weight pool to free physical backing while retaining virtual
-        # mappings so phase 2 can measure GPU free memory without weights.
-        self.sleep(level=2)
+        # Release imported IPC handles and set parameter data to UninitializedParameterFromTensor
+        self.model_runner.unmap_and_release_ipc_handles()
 
         self.init_phase = WorkerInitPhase.PHASE_2
     
@@ -167,7 +156,6 @@ class Worker(WorkerBase):
         """
         assert self.init_phase == WorkerInitPhase.PHASE_2, "Worker must be in phase 2"
 
-        self.wake_up(tags=("weights", ))
         # This only reinitializes the distributed environment, but doesn't take a memory snapshot
         # since we want to use the memory snapshot without weights loaded
         self.reinit_device()
@@ -444,10 +432,9 @@ class Worker(WorkerBase):
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         # NOTE: since our initial memory snapshot was taken prior to weights loaded, we need to pass the weights size to the profiler
-        weights_bytes = get_model_weights_size_bytes(self.model_runner.model)
         with memory_profiling(
                 self.init_snapshot,
-                weights_memory=weights_bytes) as profile_result:
+                weights_memory=self.model_runner.model_memory_usage) as profile_result:
             self.model_runner.profile_run()
 
         free_gpu_memory = profile_result.after_profile.free_memory
@@ -464,12 +451,12 @@ class Worker(WorkerBase):
         available_kv_cache_memory = self.requested_memory \
             - profile_result.non_kv_cache_memory
 
-        logger.debug(
+        logger.info(
             "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
             "requested GPU memory: %.2f GiB",
             GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
             GiB(self.requested_memory))
-        logger.debug(profile_result)
+        logger.info(profile_result)
         logger.info("Available KV cache memory: %.2f GiB",
                     GiB(available_kv_cache_memory))
         gc.collect()

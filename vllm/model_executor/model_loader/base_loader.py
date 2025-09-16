@@ -32,7 +32,8 @@ class BaseModelLoader(ABC):
         raise NotImplementedError
 
     def load_model(self, vllm_config: VllmConfig,
-                   model_config: ModelConfig) -> nn.Module:
+                   model_config: ModelConfig,
+                   skip_postprocess: bool = False) -> nn.Module:
         """Load a model with the given configurations."""
         device_config = vllm_config.device_config
         load_config = vllm_config.load_config
@@ -47,5 +48,6 @@ class BaseModelLoader(ABC):
             logger.debug("Loading weights on %s ...", load_device)
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model, model_config)
-            process_weights_after_loading(model, model_config, target_device)
+            if not skip_postprocess:
+                process_weights_after_loading(model, model_config, target_device)
         return model.eval()

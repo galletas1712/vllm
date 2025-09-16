@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT, marlin_make_workspace_new, marlin_permute_bias,
     marlin_permute_scales, should_use_atomic_add_reduce)
+from vllm.model_executor.parameter import UninitializedParameterFromTensor
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
@@ -117,7 +118,9 @@ def prepare_fp8_layer_for_marlin(layer: torch.nn.Module,
         scales = layer.weight_scale.to(layer.orig_dtype)
     elif "weight_scale_inv" in dir(layer):
         scales = layer.weight_scale_inv.to(layer.orig_dtype)
-        del layer.weight_scale_inv
+        if isinstance(getattr(layer, "weight_scale_inv", None), torch.nn.Parameter):
+            layer.weight_scale_inv = UninitializedParameterFromTensor(
+                requires_grad=False, device=layer.weight_scale_inv.device, dtype=torch.float32)
 
     group_size = -1 if weight_block_size is None else weight_block_size[1]
 

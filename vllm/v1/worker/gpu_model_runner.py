@@ -39,6 +39,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
+from vllm.model_executor.parameter import UninitializedParameterFromTensor
 from vllm.model_executor.models.interfaces import (is_mixture_of_experts,
                                                    supports_eagle3,
                                                    supports_transcription)
@@ -2257,7 +2258,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         with DeviceMemoryProfiler() as m:
             time_before_load = time.perf_counter()
-            model_loader = get_model_loader(self.load_config)
+            model_loader = get_model_loader(load_config=self.load_config, vllm_config=self.vllm_config)
             logger.info("Loading model from scratch...")
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config)
@@ -2318,10 +2319,36 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                           self.vllm_config,
                                           runtime_mode=CUDAGraphMode.FULL)
 
+    def unmap_and_release_ipc_handles(self) -> None:
+        for name, module in self.get_model().named_modules():
+            for param_name in list(module._parameters.keys()):
+                param = module._parameters[param_name]
+                if param is not None:
+                    # Create uninitialized parameter
+                    new_param = UninitializedParameterFromTensor(
+                        requires_grad=param.requires_grad,
+                        device=param.device,
+                        dtype=param.dtype
+                    )
+                    # Actually replace it in the module
+                    module._parameters[param_name] = new_param
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        # Get how much CUDA memory is occupied by process
+        process_mem_bytes = torch.cuda.memory_allocated()
+        total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+        logger.info(
+            "CUDA memory allocated by this process after unmapping and releasing IPC handles: %.2f GiB / %.2f GiB",
+            process_mem_bytes / GiB_bytes, total_bytes / GiB_bytes
+        )
+
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, \
             "Cannot reload weights before model is loaded."
-        model_loader = get_model_loader(self.load_config)
+        model_loader = get_model_loader(load_config=self.load_config, vllm_config=self.vllm_config)
         logger.info("Reloading weights inplace...")
         model = self.get_model()
         model_loader.load_weights(model, model_config=self.model_config)
