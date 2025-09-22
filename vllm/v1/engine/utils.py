@@ -589,66 +589,6 @@ class CoreEngineActorManager:
             ray.util.remove_placement_group(pg)
 
 
-def _wait_for_companion_coordinator_ready(coordinator_address: str, 
-                                         timeout: float = 30.0) -> None:
-    """Wait for the companion coordinator to be ready to accept connections.
-    
-    Args:
-        coordinator_address: ZMQ address of the coordinator
-        timeout: Maximum time to wait in seconds
-    """
-    import time
-    import zmq
-    import pickle
-    from vllm.companion.messages import GetModelParametersRequest
-    
-    start_time = time.time()
-    last_error = None
-    
-    while time.time() - start_time < timeout:
-        context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
-        socket.setsockopt(zmq.LINGER, 0)  # Don't wait on close
-        
-        try:
-            socket.connect(coordinator_address)
-            
-            # Send a proper ping request that the coordinator expects
-            ping_request = GetModelParametersRequest(
-                vllm_config=None,  # None will be handled as ping
-                device_id=0,  # Use GPU 0 for the ping
-                local_rank=0,
-                global_rank=0,
-                world_size=1,
-                ping_only=True
-            )
-            socket.send(pickle.dumps(ping_request))
-            
-            # Try to receive response
-            response = socket.recv()
-            # If we got any response, coordinator is ready
-            socket.close()
-            context.term()
-            logger.info("Companion coordinator is ready")
-            return
-            
-        except zmq.error.Again:
-            # Timeout - coordinator not ready yet
-            last_error = "Coordinator not responding"
-        except Exception as e:
-            last_error = str(e)
-        finally:
-            socket.close()
-            context.term()
-        
-        # Brief sleep before retry
-        time.sleep(0.1)
-    
-    raise RuntimeError(
-        f"Companion coordinator at {coordinator_address} failed to start "
-        f"within {timeout} seconds. Last error: {last_error}"
-    )
 
 
 @contextlib.contextmanager
@@ -739,10 +679,6 @@ def launch_core_engines(
                     name="CompanionCoordinator"
                 )
                 companion_coordinator.start()
-                
-                # Wait for coordinator to be ready by checking if it responds
-                _wait_for_companion_coordinator_ready(
-                    vllm_config.companion_config.coordinator_address)
                 
                 logger.info("Started companion coordinator on port %d",
                            coordinator_port)

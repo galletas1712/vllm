@@ -4,7 +4,6 @@
 """Simple companion client for GPU workers to retrieve model parameters."""
 
 import pickle
-from typing import Optional
 
 import torch
 import zmq
@@ -14,10 +13,15 @@ from vllm.config.companion import CompanionConfig
 from vllm.distributed import get_world_group
 from vllm.logger import init_logger
 from vllm.companion.messages import (
-    GetModelParametersRequest,
-    ModelParametersResponse,
     CUDATensorRebuildInfo,
+    GetCompanionStatusRequest,
+    CompanionState,
+    ResponseType,
+    HandshakeRequest,
+    LoadModelRequest,
+    GetModelParametersRebuildInfoRequest,
 )
+from vllm.utils import make_zmq_socket
 
 logger = init_logger(__name__)
 
@@ -28,68 +32,197 @@ class MultiProcCompanionClient:
     companion servers.
     """
     
-    def __init__(self, companion_config: CompanionConfig):
+    def __init__(self, companion_config: CompanionConfig, device_id: int):
         """
-        Initialize the client.
+        Initialize the client for a specific GPU device.
         
         Args:
             companion_config: CompanionConfig object containing coordinator address
                 and other companion settings.
+            device_id: Physical GPU device ID this client will manage
         """
         if not companion_config or not companion_config.coordinator_address:
             raise ValueError("CompanionConfig with coordinator_address is required")
         
         self.companion_config = companion_config
         self.coordinator_address = companion_config.coordinator_address
+        self.device_id = device_id  # This client always manages this specific GPU
         
         # ZMQ context and socket
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REQ)
-        # Set timeout for model loading (5 minutes should be enough for most models)
-        self.socket.setsockopt(zmq.RCVTIMEO, 300000)  # 5 minutes in milliseconds
-        self.socket.setsockopt(zmq.SNDTIMEO, 10000)   # 10 seconds for send
-        self.socket.connect(self.coordinator_address)
+        self.socket = make_zmq_socket(
+            self.context,
+            self.coordinator_address,
+            zmq.REQ,
+            bind=False
+        )
+        # Set reasonable timeouts - model loading happens during wait_for_coordinator_ready
+        self.socket.setsockopt(zmq.RCVTIMEO, 10000)   # 10 seconds receive timeout
+        self.socket.setsockopt(zmq.SNDTIMEO, 5000)    # 5 seconds send timeout
         
-        logger.info("Companion client connected to %s (recv timeout: 5min)",
-                   self.coordinator_address)
+        logger.info("Companion client for device %d connecting to %s",
+                   self.device_id, self.coordinator_address)
+        
+        # Perform handshake with coordinator first
+        self._perform_coordinator_handshake()
+        
+        # Then perform handshake with companion server to ensure it's ready
+        self._perform_server_handshake()
+        
+        logger.info("Companion client for device %d ready", self.device_id)
+    
+    def _perform_coordinator_handshake(self) -> None:
+        """Perform handshake with coordinator to ensure it's alive."""
+        logger.info("Performing handshake with coordinator")
+        
+        # Send handshake request to coordinator (no device_id needed)
+        request = HandshakeRequest()
+        request_data = pickle.dumps(request)
+        logger.debug("Sending handshake request to coordinator (bytes=%d)", len(request_data))
+        self.socket.send(request_data)
+        logger.debug("Handshake request sent, waiting for response...")
+        
+        try:
+            logger.debug("Calling socket.recv() with timeout %dms", self.socket.getsockopt(zmq.RCVTIMEO))
+            response_data = self.socket.recv()
+            logger.debug("Received response from coordinator (bytes=%d)", len(response_data))
+            response = pickle.loads(response_data)
+            logger.debug("Response unpickled: %s", response)
+            
+            # Verify we got the expected response type
+            if getattr(response, 'response_type', None) != ResponseType.HANDSHAKE:
+                raise RuntimeError(f"Unexpected response type during coordinator handshake: {response}")
+            
+            if not response.success:
+                raise RuntimeError(f"Coordinator handshake failed: {getattr(response, 'message', 'Unknown error')}")
+                
+            logger.info("Handshake successful with coordinator")
+                       
+        except zmq.error.Again as e:
+            logger.error("ZMQ timeout error: %s", e)
+            raise RuntimeError("Timeout during handshake with coordinator") from None
+        except Exception as e:
+            logger.error("Unexpected error during handshake: %s", e)
+            raise
+    
+    def _perform_server_handshake(self) -> None:
+        """Perform handshake with companion server for our device.
+        
+        This ensures the companion server is started and ready to receive requests.
+        """
+        logger.info("Performing handshake with companion server for device %d", self.device_id)
+        
+        # Send handshake request with device_id to check companion server
+        request = HandshakeRequest(device_id=self.device_id)
+        self.socket.send(pickle.dumps(request))
+        
+        try:
+            response_data = self.socket.recv()
+            response = pickle.loads(response_data)
+            
+            # Verify we got the expected response type
+            if getattr(response, 'response_type', None) != ResponseType.HANDSHAKE:
+                raise RuntimeError(f"Unexpected response type during server handshake: {response}")
+            
+            # Check if handshake was successful
+            if not response.success:
+                raise RuntimeError(
+                    f"Companion server handshake failed for device {self.device_id}: "
+                    f"{getattr(response, 'message', 'Unknown error')}")
+            
+            logger.info("Handshake complete with companion server for device %d", 
+                       self.device_id)
+                       
+        except zmq.error.Again:
+            raise RuntimeError(
+                f"Timeout during handshake with companion server for device {self.device_id}"
+            ) from None
+    
+    def wait_for_server_ready(self, timeout: float = 300.0) -> None:
+        """Wait for the companion server to finish loading the model.
+        
+        Args:
+            timeout: Maximum time to wait in seconds (default: 5 minutes)
+            
+        Raises:
+            RuntimeError: If server fails to load model or encounters an error
+        """
+        import time
+        
+        start_time = time.time()
+        
+        # Create a separate socket for status checks to avoid REQ/REP state issues
+        status_socket = make_zmq_socket(
+            self.context,
+            self.coordinator_address,
+            zmq.REQ,
+            bind=False
+        )
+        status_socket.setsockopt(zmq.RCVTIMEO, 5000)   # 5 seconds timeout
+        status_socket.setsockopt(zmq.SNDTIMEO, 5000)    # 5 seconds timeout
+        
+        try:
+            while time.time() - start_time < timeout:
+                try:
+                    # Send status request for our companion
+                    request = GetCompanionStatusRequest(device_id=self.device_id)
+                    status_socket.send(pickle.dumps(request))
+                    response_data = status_socket.recv()
+                    response = pickle.loads(response_data)
+                    
+                    # Check response type
+                    response_type = getattr(response, 'response_type', None)
+                    if response_type != ResponseType.COMPANION_STATUS:
+                        logger.warning("Unexpected response type: %s", response_type)
+                        time.sleep(0.5)
+                        continue
+                    
+                    # Check state
+                    if response.state == CompanionState.READY:
+                        logger.info("Companion server for GPU %d has finished loading model", self.device_id)
+                        return
+                    elif response.state == CompanionState.ERROR:
+                        raise RuntimeError(
+                            f"Companion server for GPU {self.device_id} encountered an error: {response.error_message}"
+                        )
+                    elif response.state == CompanionState.LOADING:
+                        logger.debug("Companion server for GPU %d is loading model...", self.device_id)
+                    else:
+                        logger.debug("Companion server for GPU %d state: %s", self.device_id, response.state)
+                    
+                    time.sleep(0.5)  # Poll every 500ms
+                    
+                except zmq.error.Again:
+                    logger.warning("Timeout waiting for companion server status")
+                    time.sleep(1.0)
+                except Exception as e:
+                    logger.error("Error checking companion server status: %s", e)
+                    time.sleep(1.0)
+            
+            raise RuntimeError(
+                f"Companion server for GPU {self.device_id} failed to load model within {timeout} seconds"
+            )
+        finally:
+            status_socket.close()
     
     def get_model_parameters(
-            self, vllm_config: VllmConfig,
-            device_id: Optional[int] = None) -> dict[str, CUDATensorRebuildInfo]:
+            self, vllm_config: VllmConfig) -> dict[str, CUDATensorRebuildInfo]:
         """
         Get model parameters from companion server.
         
+        This method will:
+        1. Send LoadModelRequest to trigger model loading
+        2. Poll until model is loaded
+        3. Send GetModelParametersRebuildInfoRequest to get the actual parameters
+        
         Args:
             vllm_config: VllmConfig for the model
-            device_id: GPU device ID (default: current device)
             
         Returns:
             Dict of parameter name to CUDATensorRebuildInfo
         """
-        if device_id is None:
-            device_id = torch.cuda.current_device()
-        
-        # CRITICAL: For DP with EP, we need to map logical device to physical device
-        # Workers see their device as 0 due to CUDA_VISIBLE_DEVICES, but companion
-        # needs the physical device ID to route to the correct companion process
-        # Use DP rank as a proxy for physical device ID (assumes DP ranks map to consecutive GPUs)
-        if hasattr(vllm_config.parallel_config, 'data_parallel_rank'):
-            dp_rank = vllm_config.parallel_config.data_parallel_rank
-            tp_size = vllm_config.parallel_config.tensor_parallel_size
-            pp_size = vllm_config.parallel_config.pipeline_parallel_size
-            tp_pp_size = tp_size * pp_size
-            
-            # Calculate physical device ID based on DP rank and TP/PP layout
-            # With TP=1, PP=1: DP rank 0 → GPU 0, DP rank 1 → GPU 1
-            # With TP=2, PP=1: DP rank 0 → GPUs 0-1, DP rank 1 → GPUs 2-3
-            physical_device_id = dp_rank * tp_pp_size + device_id
-            
-            logger.debug(
-                "[COMPANION-CLIENT] Mapping logical device %d → physical device %d "
-                "(DP rank=%d, TP=%d, PP=%d)",
-                device_id, physical_device_id, dp_rank, tp_size, pp_size
-            )
-            device_id = physical_device_id
+        # Use the device_id from initialization - this client always manages the same GPU
+        device_id = self.device_id
         
         # Get rank information from the distributed environment
         # Send local TP/PP rank and let companion server handle DP adjustment
@@ -122,9 +255,8 @@ class MultiProcCompanionClient:
             local_tp_pp_rank, local_tp_pp_world,
             vllm_config.parallel_config.data_parallel_rank)
         
-        # Create request with local TP/PP rank info
-        # Companion server will handle DP adjustment like workers do
-        request = GetModelParametersRequest(
+        # Create request to trigger model loading
+        load_request = LoadModelRequest(
             vllm_config=vllm_config,
             device_id=device_id,
             local_rank=local_rank,
@@ -132,26 +264,68 @@ class MultiProcCompanionClient:
             world_size=local_tp_pp_world    # Pass TP*PP world size
         )
         
-        # Send request and get response
+        # Send request to trigger model loading
         try:
-            self.socket.send(pickle.dumps(request))
+            self.socket.send(pickle.dumps(load_request))
+            response_data = self.socket.recv()
+            load_response = pickle.loads(response_data)
+            
+            # Check if we got a load response
+            response_type = getattr(load_response, 'response_type', None)
+            if response_type != ResponseType.LOAD_MODEL:
+                raise RuntimeError(f"Expected LOAD_MODEL response, got {response_type}")
+            
+            if not load_response.success:
+                # Check for hash mismatch or other errors
+                if load_response.error and load_response.error.startswith("hash_mismatch:"):
+                    parts = load_response.error.split(":")
+                    if len(parts) >= 3:
+                        server_hash = parts[1]
+                        request_hash = parts[2]
+                        raise RuntimeError(
+                            f"Model configuration mismatch: Companion server has "
+                            f"already loaded a model with hash {server_hash}, but "
+                            f"received request for different model with hash "
+                            f"{request_hash}. This typically happens when a warm "
+                            f"spare worker requests a different model "
+                            f"configuration than the primary worker. Each "
+                            f"companion server can "
+                            f"only serve one model configuration."
+                        )
+                raise RuntimeError(f"Failed to trigger model loading: {load_response.error}")
+                
+            logger.info("Model loading triggered on companion server for GPU %d", device_id)
+            
+        except zmq.error.Again as e:
+            raise RuntimeError(
+                f"Timeout sending load request to companion server. "
+                f"Device ID: {device_id}, Model: {vllm_config.model_config.model}"
+            ) from e
+        
+        # Wait for the companion server to be ready
+        logger.info("Waiting for companion server to load model on GPU %d...", device_id)
+        self.wait_for_server_ready()
+        
+        # Now send request to get actual model parameters
+        rebuild_request = GetModelParametersRebuildInfoRequest(device_id=device_id)
+        
+        try:
+            self.socket.send(pickle.dumps(rebuild_request))
             response_data = self.socket.recv()
         except zmq.error.Again as e:
             raise RuntimeError(
-                f"Timeout waiting for companion server response after 5 minutes. "
-                f"The model may be too large or the companion server may be stuck. "
+                f"Timeout waiting for model parameters from companion server. "
                 f"Device ID: {device_id}, Model: {vllm_config.model_config.model}"
             ) from e
         
         response = pickle.loads(response_data)
         
-        # Handle both dict and ModelParametersResponse object formats
-        if isinstance(response, dict):
-            # Legacy format or error from coordinator - convert to ModelParametersResponse
-            response = ModelParametersResponse(
-                success=response.get('success', False),
-                model_parameters=response.get('model_parameters'),
-                error=response.get('error')
+        # Check response type
+        response_type = getattr(response, 'response_type', None)
+        if response_type != ResponseType.MODEL_PARAMETERS_REBUILD_INFO:
+            # Unexpected response type
+            raise RuntimeError(
+                f"Expected MODEL_PARAMETERS_REBUILD_INFO response, got {response_type}"
             )
         
         if not response.success:

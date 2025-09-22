@@ -10,7 +10,7 @@ import uvloop
 import torch
 from torch import nn
 
-from vllm.config import LoadConfig, ModelConfig, VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.distributed import get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
@@ -185,9 +185,26 @@ class IPCModelLoader(BaseModelLoader):
                     if not self.vllm_config or not self.vllm_config.companion_config:
                         raise ValueError("VllmConfig with CompanionConfig is required for IPC loading")
                     
-                    self.client = MultiProcCompanionClient(self.vllm_config.companion_config)
-                    logger.info("MultiProc companion client initialized with coordinator at: %s",
-                               self.vllm_config.companion_config.coordinator_address)
+                    # Compute physical device ID for this worker
+                    logical_device = torch.cuda.current_device()
+                    physical_device = logical_device  # Default if no DP
+                    
+                    if hasattr(self.vllm_config.parallel_config, 'data_parallel_rank'):
+                        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+                        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+                        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+                        tp_pp_size = tp_size * pp_size
+                        physical_device = dp_rank * tp_pp_size + logical_device
+                        
+                        logger.info(
+                            "[IPC-LOADER] Creating companion client for physical device %d "
+                            "(logical device %d, DP rank %d)",
+                            physical_device, logical_device, dp_rank
+                        )
+                    
+                    self.client = MultiProcCompanionClient(self.vllm_config.companion_config, physical_device)
+                    logger.info("MultiProc companion client initialized for device %d with coordinator at: %s",
+                               physical_device, self.vllm_config.companion_config.coordinator_address)
                     
                     # Validate that companion server exists for our device
                     self._validate_companion_server_availability()
@@ -275,8 +292,7 @@ class IPCModelLoader(BaseModelLoader):
                 # MultiProc client returns rebuild info directly
                 logger.info("[IPC-LOADER] Requesting model parameters via MultiProc client")
                 model_parameters_rebuild_info = self.client.get_model_parameters(
-                    vllm_config=self.vllm_config,
-                    device_id=torch.cuda.current_device()
+                    vllm_config=self.vllm_config
                 )
             else:
                 # Dynamo client is async

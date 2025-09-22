@@ -4,6 +4,7 @@
 """Simple companion server for CUDA IPC weight sharing."""
 
 import asyncio
+import contextlib
 import pickle
 import signal
 from concurrent.futures import ThreadPoolExecutor
@@ -16,9 +17,16 @@ import zmq.asyncio
 from vllm.logger import init_logger
 from vllm.companion.model_instance_manager import ModelInstanceManager
 from vllm.companion.messages import (
-    GetModelParametersRequest,
-    ModelParametersResponse,
+    CompanionState,
+    GetCompanionStatusResponse,
+    RequestType,
+    ResponseType,
+    HandshakeResponse,
+    LoadModelRequest,
+    LoadModelResponse,
+    ModelParametersRebuildInfoResponse,
 )
+from vllm.utils import make_zmq_socket
 
 logger = init_logger(__name__)
 
@@ -29,17 +37,20 @@ class MultiProcCompanionServer:
     CUDA IPC. Uses the same ModelInstanceManager as Dynamo companion.
     """
     
-    def __init__(self, device_id: int, port: int, companion_master_port: int):
+    def __init__(self, device_id: int, data_port: int, status_port: int, 
+                 companion_master_port: int):
         """
         Initialize the companion server.
         
         Args:
             device_id: Physical GPU device ID  
-            port: Port for this companion server to listen on
+            data_port: Port for model parameter requests
+            status_port: Port for status queries
             companion_master_port: Master port for CPU group initialization
         """
         self.device_id = device_id
-        self.port = port
+        self.data_port = data_port
+        self.status_port = status_port
         self.companion_master_port = companion_master_port
         
         # Model cache - only one model per companion server
@@ -47,9 +58,14 @@ class MultiProcCompanionServer:
         self.model_hash: Optional[str] = None
         self.model_parameters: Optional[dict] = None
         
-        # ZMQ socket
+        # State tracking - only track model loading state
+        self.state = CompanionState.INITIALIZING
+        self.error_message: Optional[str] = None
+        
+        # ZMQ sockets
         self.context: Optional[zmq.asyncio.Context] = None
-        self.rep_socket: Optional[zmq.asyncio.Socket] = None
+        self.data_socket: Optional[zmq.asyncio.Socket] = None
+        self.status_socket: Optional[zmq.asyncio.Socket] = None
         
         # Shutdown flags
         self.shutdown_event = asyncio.Event()
@@ -66,12 +82,15 @@ class MultiProcCompanionServer:
         # Set CUDA device
         torch.cuda.set_device(self.device_id)
         
-        logger.info("Companion server for GPU %d on port %d",
-                   device_id, port)
+        logger.info("Companion server for GPU %d on ports %d/%d",
+                   device_id, data_port, status_port)
+        
+        # Server is ready to receive requests immediately
+        # Note: Model loading happens asynchronously later
     
 
     
-    def _load_model_sync(self, request: GetModelParametersRequest) -> Optional[dict]:
+    def _load_model_sync(self, request: LoadModelRequest) -> Optional[dict]:
         """Load model weights for the given configuration (runs in thread pool).
         
         Returns:
@@ -100,34 +119,47 @@ class MultiProcCompanionServer:
                     self.device_id,
                     request.global_rank, request.world_size)
         
-        # Get companion_master_port from vllm_config if available,
-        # otherwise use server's default
-        companion_master_port = getattr(
-            request.vllm_config.load_config, 'companion_master_port',
-            self.companion_master_port
-        )
+        # Update state to LOADING
+        self.state = CompanionState.LOADING
         
-        # Create ModelInstanceManager
-        self.model_manager = ModelInstanceManager(
-            vllm_config=request.vllm_config,
-            device_id=self.device_id,
-            local_rank=request.local_rank,
-            global_rank=request.global_rank,
-            world_size=request.world_size,
-            companion_master_port=companion_master_port,
-        )
-        
-        # Initialize distributed environment only once
-        if not self.distributed_initialized:
-            logger.info("[COMPANION-SERVER] Starting distributed initialization for device %d", self.device_id)
-            self.model_manager.initialize_distributed()
-            self.distributed_initialized = True
-            logger.info("[COMPANION-SERVER] Distributed initialization complete for device %d", self.device_id)
-        
-        # Load model weights
-        logger.info("[COMPANION-SERVER] Starting model weight loading for device %d", self.device_id)
-        self.model_manager.load_model_weights()
-        logger.info("[COMPANION-SERVER] Model weight loading complete for device %d", self.device_id)
+        try:
+            # Get companion_master_port from vllm_config if available,
+            # otherwise use server's default
+            companion_master_port = getattr(
+                request.vllm_config.load_config, 'companion_master_port',
+                self.companion_master_port
+            )
+            
+            # Create ModelInstanceManager
+            self.model_manager = ModelInstanceManager(
+                vllm_config=request.vllm_config,
+                device_id=self.device_id,
+                local_rank=request.local_rank,
+                global_rank=request.global_rank,
+                world_size=request.world_size,
+                companion_master_port=companion_master_port,
+            )
+            
+            # Initialize distributed environment only once
+            if not self.distributed_initialized:
+                logger.info("[COMPANION-SERVER] Starting distributed initialization for device %d", self.device_id)
+                self.model_manager.initialize_distributed()
+                self.distributed_initialized = True
+                logger.info("[COMPANION-SERVER] Distributed initialization complete for device %d", self.device_id)
+            
+            # Load model weights
+            logger.info("[COMPANION-SERVER] Starting model weight loading for device %d", self.device_id)
+            self.model_manager.load_model_weights()
+            logger.info("[COMPANION-SERVER] Model weight loading complete for device %d", self.device_id)
+            
+            # Update state to READY
+            self.state = CompanionState.READY
+            
+        except Exception as e:
+            logger.exception("Failed to load model on device %d", self.device_id)
+            self.state = CompanionState.ERROR
+            self.error_message = str(e)
+            raise
         
         # Get IPC info for parameters
         model_params_ipc = self.model_manager.get_model_parameters_ipc_info()
@@ -141,7 +173,7 @@ class MultiProcCompanionServer:
         
         return model_params_ipc
     
-    async def _load_model_async(self, request: GetModelParametersRequest) -> Optional[dict]:
+    async def _load_model_async(self, request: LoadModelRequest) -> Optional[dict]:
         """Load model weights asynchronously using thread pool.
         
         Returns:
@@ -153,105 +185,212 @@ class MultiProcCompanionServer:
 
     
     async def handle_request(self, message: bytes) -> bytes:
-        """Handle a request for model parameters."""
+        """Handle different types of requests."""
         try:
-            request: GetModelParametersRequest = pickle.loads(message)
-            # Fast path for health checks: don't try to load the model
-            if getattr(request, "ping_only", False):
-                response = ModelParametersResponse(
-                    success=True,
-                    model_parameters=None,
-                    error=None,
-                )
-                return pickle.dumps(response)
+            request = pickle.loads(message)
             
-            # Check if model is already loaded (fast path)
-            config_hash = request.compute_hash()
-            if self.model_hash == config_hash and self.model_parameters is not None:
-                logger.debug("Returning cached model parameters for hash %s", config_hash)
-                response = ModelParametersResponse(
-                    success=True,
-                    model_parameters=self.model_parameters,
-                    error=None
-                )
-                return pickle.dumps(response)
-            
-            # Check for hash mismatch (another fast path)
-            if self.model_hash is not None and self.model_hash != config_hash:
-                logger.warning(
-                    "Model hash mismatch: server has %s, request has %s",
-                    self.model_hash, config_hash
-                )
-                response = ModelParametersResponse(
+            # Get request type
+            request_type = getattr(request, 'request_type', None)
+            if request_type is None:
+                logger.error("Request missing request_type field: %s", type(request))
+                response = ModelParametersRebuildInfoResponse(
                     success=False,
                     model_parameters=None,
-                    error=f"hash_mismatch:{self.model_hash}:{config_hash}"
+                    error="Request missing request_type field",
+                    response_type=ResponseType.MODEL_PARAMETERS_REBUILD_INFO
                 )
                 return pickle.dumps(response)
             
-            # Need to load model - use async loading with lock to prevent duplicates
-            async with self.model_loading_lock:
-                # Check again in case another request loaded it while we waited
-                if self.model_hash == config_hash and self.model_parameters is not None:
-                    response = ModelParametersResponse(
-                        success=True,
-                        model_parameters=self.model_parameters,
-                        error=None
+            # Handle requests based on type
+            if request_type == RequestType.HANDSHAKE:
+                # Simple handshake response
+                response = HandshakeResponse(
+                    success=True,
+                    message=f"Companion server for GPU {self.device_id} ready"
+                )
+                return pickle.dumps(response)
+            
+            elif request_type == RequestType.GET_COMPANION_STATUS:
+                # Return the current state
+                response = GetCompanionStatusResponse(
+                    device_id=self.device_id,
+                    state=self.state,
+                    error_message=self.error_message
+                )
+                return pickle.dumps(response)
+            
+            elif request_type == RequestType.LOAD_MODEL:
+                config_hash = request.compute_hash()
+                
+                # Check for hash mismatch first
+                if self.model_hash is not None and self.model_hash != config_hash:
+                    logger.warning(
+                        "Model hash mismatch: server has %s, request has %s",
+                        self.model_hash, config_hash
+                    )
+                    response = LoadModelResponse(
+                        success=False,
+                        error=f"hash_mismatch:{self.model_hash}:{config_hash}",
+                        response_type=ResponseType.LOAD_MODEL
                     )
                     return pickle.dumps(response)
                 
-                # Load model asynchronously
-                model_params = await self._load_model_async(request)
+                # If model is already loaded for this config, just return success
+                if self.model_hash == config_hash and self.state == CompanionState.READY:
+                    logger.debug("Model already loaded for hash %s", config_hash)
+                    response = LoadModelResponse(
+                        success=True,
+                        error=None,
+                        response_type=ResponseType.LOAD_MODEL
+                    )
+                    return pickle.dumps(response)
                 
-                # Check if model load returned None (shouldn't happen now, but keep for safety)
-                if model_params is None:
-                    response = ModelParametersResponse(
+                # If not loading yet, start loading asynchronously
+                if self.state == CompanionState.INITIALIZING:
+                    # Start loading task if not already started
+                    if self.model_loading_task is None or self.model_loading_task.done():
+                        logger.info("Starting async model loading for hash %s", config_hash)
+                        self.model_loading_task = asyncio.create_task(
+                            self._load_model_async(request)
+                        )
+                    
+                    # Return immediate ack
+                    response = LoadModelResponse(
+                        success=True,
+                        error=None,
+                        response_type=ResponseType.LOAD_MODEL
+                    )
+                    return pickle.dumps(response)
+                
+                # If already loading, just return ack
+                if self.state == CompanionState.LOADING:
+                    logger.debug("Model already loading for hash %s", config_hash)
+                    response = LoadModelResponse(
+                        success=True,
+                        error=None,
+                        response_type=ResponseType.LOAD_MODEL
+                    )
+                    return pickle.dumps(response)
+                
+                # If in error state, return error
+                if self.state == CompanionState.ERROR:
+                    response = LoadModelResponse(
+                        success=False,
+                        error=self.error_message,
+                        response_type=ResponseType.LOAD_MODEL
+                    )
+                    return pickle.dumps(response)
+            
+            elif request_type == RequestType.GET_MODEL_PARAMETERS_REBUILD_INFO:
+                # Request for model parameters - model should already be loaded
+                if self.state != CompanionState.READY or self.model_parameters is None:
+                    logger.error("Model not ready when parameters requested. State: %s", self.state)
+                    response = ModelParametersRebuildInfoResponse(
                         success=False,
                         model_parameters=None,
-                        error=f"hash_mismatch:{self.model_hash}:{config_hash}"
+                        error=f"Model not ready. Current state: {self.state}",
+                        response_type=ResponseType.MODEL_PARAMETERS_REBUILD_INFO
                     )
                     return pickle.dumps(response)
                 
-                response = ModelParametersResponse(
+                logger.debug("Returning model parameters for device %d", self.device_id)
+                response = ModelParametersRebuildInfoResponse(
                     success=True,
-                    model_parameters=model_params,
-                    error=None
+                    model_parameters=self.model_parameters,
+                    error=None,
+                    response_type=ResponseType.MODEL_PARAMETERS_REBUILD_INFO
                 )
-                
+                return pickle.dumps(response)
+            
+            else:
+                # Unknown request type
+                logger.error("Unknown request type: %s", request_type)
+                response = ModelParametersRebuildInfoResponse(
+                    success=False,
+                    model_parameters=None,
+                    error=f"Unknown request type: {request_type}",
+                    response_type=ResponseType.MODEL_PARAMETERS_REBUILD_INFO
+                )
                 return pickle.dumps(response)
             
         except Exception as e:
             logger.exception("Failed to handle request: %s", e)
-            response = ModelParametersResponse(
+            response = ModelParametersRebuildInfoResponse(
                 success=False,
                 model_parameters=None,
-                error=str(e)
+                error=str(e),
+                response_type=ResponseType.MODEL_PARAMETERS_REBUILD_INFO
             )
             return pickle.dumps(response)
     
-    async def start(self):
-        """Start the companion server."""
-        logger.info("Starting companion server...")
-        
-        # Initialize ZMQ
-        self.context = zmq.asyncio.Context()
-        self.rep_socket = self.context.socket(zmq.REP)
-        self.rep_socket.bind(f"tcp://*:{self.port}")
-        
-        logger.info("Companion server listening on port %d", self.port)
-        
-        # Main loop
+    async def _handle_data_requests(self):
+        """Handle model parameter requests on the data socket."""
         while not self.shutdown_event.is_set():
             try:
-                if await self.rep_socket.poll(timeout=1000):
-                    request = await self.rep_socket.recv()
+                if await self.data_socket.poll(timeout=1000):
+                    request = await self.data_socket.recv()
                     response = await self.handle_request(request)
-                    await self.rep_socket.send(response)
-                    
+                    await self.data_socket.send(response)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Error in companion loop: %s", e)
+                logger.error("Error handling data request: %s", e)
+    
+    async def _handle_status_requests(self):
+        """Handle status queries on the status socket."""
+        while not self.shutdown_event.is_set():
+            try:
+                if await self.status_socket.poll(timeout=100):  # Shorter timeout for status
+                    request = await self.status_socket.recv()
+                    response = await self.handle_request(request)
+                    await self.status_socket.send(response)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error handling status request: %s", e)
+    
+    async def start(self):
+        """Start the companion server."""
+        logger.info("Starting companion server for GPU %d...", self.device_id)
+        
+        # Initialize ZMQ
+        self.context = zmq.asyncio.Context()
+        
+        # Create data socket for model parameter requests
+        self.data_socket = make_zmq_socket(
+            self.context,
+            f"tcp://*:{self.data_port}",
+            zmq.REP,
+            bind=True
+        )
+        
+        # Create status socket for quick status queries
+        self.status_socket = make_zmq_socket(
+            self.context,
+            f"tcp://*:{self.status_port}",
+            zmq.REP,
+            bind=True
+        )
+        
+        logger.info("Companion server for GPU %d listening on ports %d (data) and %d (status)",
+                   self.device_id,
+                   self.data_port, self.status_port)
+        
+        # Create tasks for handling both sockets
+        data_task = asyncio.create_task(self._handle_data_requests())
+        status_task = asyncio.create_task(self._handle_status_requests())
+        
+        try:
+            # Wait for either task to complete or shutdown
+            await asyncio.gather(data_task, status_task)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Cancel both tasks
+            data_task.cancel()
+            status_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.gather(data_task, status_task, return_exceptions=True)
     
     async def shutdown(self):
         """Shutdown the companion server."""
@@ -259,7 +398,7 @@ class MultiProcCompanionServer:
             return  # Already shutting down
         self.shutdown_called = True
         
-        logger.info("Shutting down companion server...")
+        logger.info("Shutting down companion server for GPU %d...", self.device_id)
         self.shutdown_event.set()
         
         # Cancel any pending model loading
@@ -276,20 +415,25 @@ class MultiProcCompanionServer:
         torch.cuda.empty_cache()
         
         # Clean up ZMQ
-        if self.rep_socket:
-            self.rep_socket.close()
-            self.rep_socket = None
+        if self.data_socket:
+            self.data_socket.close()
+            self.data_socket = None
+        if self.status_socket:
+            self.status_socket.close()
+            self.status_socket = None
         if self.context:
             self.context.term()
             self.context = None
 
 
-def run_companion_server(device_id: int, port: int, companion_master_port: int):
+def run_companion_server(device_id: int, data_port: int, status_port: int,
+                        companion_master_port: int):
     """Run the companion server in a process.
     
     Args:
         device_id: Physical GPU device ID
-        port: Port for this companion server
+        data_port: Port for model parameter requests
+        status_port: Port for status queries
         companion_master_port: Master port for CPU group initialization
     """
     # Don't set CUDA_VISIBLE_DEVICES - we need physical device IDs for IPC
@@ -297,7 +441,8 @@ def run_companion_server(device_id: int, port: int, companion_master_port: int):
     asyncio.set_event_loop(asyncio.new_event_loop())
     loop = asyncio.get_event_loop()
     
-    server = MultiProcCompanionServer(device_id, port, companion_master_port)
+    server = MultiProcCompanionServer(device_id, data_port, status_port, 
+                                     companion_master_port)
     
     def signal_handler(sig, frame):
         loop.create_task(server.shutdown())
