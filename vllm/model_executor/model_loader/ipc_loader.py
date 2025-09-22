@@ -3,14 +3,12 @@
 from collections.abc import Generator
 import contextlib
 import copy
-import asyncio
-import os
-import uvloop
 
 import torch
 from torch import nn
 
 from vllm.config import ModelConfig, VllmConfig
+from vllm.companion.multiproc_companion_client import MultiProcCompanionClient
 from vllm.distributed import get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
@@ -23,42 +21,12 @@ from vllm.model_executor.parameter import UninitializedParameterFromTensor
 
 logger = init_logger(__name__)
 
-# Determine which companion backend to use
-USE_MULTIPROC = os.environ.get("VLLM_IPC_USE_MULTIPROC", "1") == "1"
-
-if USE_MULTIPROC:
-    # Import MultiProc companion client (default)
-    try:
-        from vllm.companion.multiproc_companion_client import (
-            MultiProcCompanionClient)
-        logger.info("Using MultiProc companion backend for IPC loading")
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import MultiProc companion components. "
-            "Make sure the vllm.companion module is available"
-        ) from e
-else:
-    # Import Dynamo companion client
-    try:
-        from dynamo.runtime import DistributedRuntime
-        from dynamo.companion.dynamo_companion_client import create_model_client
-        logger.info("Using Dynamo companion backend for IPC loading")
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import Dynamo companion components. "
-            "Make sure the companion module is installed"
-        ) from e
-
-
 class IPCModelLoader(BaseModelLoader):
     """Model loader that retrieves weights via IPC from a model server.
     
-    This loader connects to a companion server (MultiProc or Dynamo) that has
+    This loader connects to a companion server that has
     pre-loaded the model weights and retrieves them via CUDA IPC. This allows
     multiple processes to share the same GPU memory for model weights.
-    
-    The backend can be selected via the VLLM_IPC_USE_MULTIPROC environment
-    variable (default: "1" for MultiProc, "0" for Dynamo).
     
     The loader automatically obtains rank information from vLLM's parallel_state
     module, which is initialized during init_device() before model loading.
@@ -82,13 +50,8 @@ class IPCModelLoader(BaseModelLoader):
             )
 
         self.client = None  # Will be initialized when we know the model
-        self.use_multiproc = USE_MULTIPROC
-        self.runtime = None  # Only used for Dynamo backend
 
-        logger.info(
-            "IPC model loader initialized with %s backend",
-            "MultiProc" if self.use_multiproc else "Dynamo"
-        )
+        logger.info("IPC model loader initialized")
     
     def _validate_companion_server_availability(self) -> None:
         """Validate that a companion server exists for the computed physical device.
@@ -96,7 +59,7 @@ class IPCModelLoader(BaseModelLoader):
         Raises:
             RuntimeError: If no companion server is available for the target device.
         """
-        if not self.use_multiproc or not self.client:
+        if not self.client:
             return  # Skip validation for Dynamo backend
         
         # Get current logical device
@@ -179,98 +142,38 @@ class IPCModelLoader(BaseModelLoader):
         assert self.vllm_config is not None, "vllm_config not set"
 
         if self.client is None:
-            if self.use_multiproc:
-                # Initialize MultiProc client
-                try:
-                    if not self.vllm_config or not self.vllm_config.companion_config:
-                        raise ValueError("VllmConfig with CompanionConfig is required for IPC loading")
+            # Initialize MultiProc client
+            try:
+                if not self.vllm_config or not self.vllm_config.companion_config:
+                    raise ValueError("VllmConfig with CompanionConfig is required for IPC loading")
+                
+                # Compute physical device ID for this worker
+                logical_device = torch.cuda.current_device()
+                physical_device = logical_device  # Default if no DP
+                
+                if hasattr(self.vllm_config.parallel_config, 'data_parallel_rank'):
+                    dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+                    tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+                    pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+                    tp_pp_size = tp_size * pp_size
+                    physical_device = dp_rank * tp_pp_size + logical_device
                     
-                    # Compute physical device ID for this worker
-                    logical_device = torch.cuda.current_device()
-                    physical_device = logical_device  # Default if no DP
-                    
-                    if hasattr(self.vllm_config.parallel_config, 'data_parallel_rank'):
-                        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-                        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-                        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
-                        tp_pp_size = tp_size * pp_size
-                        physical_device = dp_rank * tp_pp_size + logical_device
-                        
-                        logger.info(
-                            "[IPC-LOADER] Creating companion client for physical device %d "
-                            "(logical device %d, DP rank %d)",
-                            physical_device, logical_device, dp_rank
-                        )
-                    
-                    self.client = MultiProcCompanionClient(self.vllm_config.companion_config, physical_device)
-                    logger.info("MultiProc companion client initialized for device %d with coordinator at: %s",
-                               physical_device, self.vllm_config.companion_config.coordinator_address)
-                    
-                    # Validate that companion server exists for our device
-                    self._validate_companion_server_availability()
-                except Exception as e:
-                    logger.error(
-                        "Error creating MultiProc companion client: %s", e)
-                    raise
-            else:
-                # Initialize Dynamo runtime and client
-                try:
-                    # Create a new event loop for this thread if needed
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_closed():
-                            raise RuntimeError("Event loop is closed")
-                    except RuntimeError:
-                        # No event loop in this thread, create one
-                        uvloop.install()
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-
-                    # Create a Dynamo runtime instance
-                    # Second parameter is whether it's static
-                    # (False = dynamic, can discover services)
-                    self.runtime = DistributedRuntime(loop, False)
-
-                    async def _create():
-                        # Get rank information from the distributed environment
-                        # By the time this is called, init_device() has already
-                        # initialized the distributed environment
-                        world_group = get_world_group()
-                        
-                        return await create_model_client(
-                            runtime=self.runtime,
-                            vllm_config=self.vllm_config,
-                            local_rank=world_group.local_rank,
-                            global_rank=world_group.rank,
-                            world_size=world_group.world_size,
-                            namespace="companion",
-                        )
-
-                    self.client = loop.run_until_complete(_create())
-                except Exception as e:
-                    logger.error("Error creating Dynamo model client: %s", e)
-                    raise
-
-                # Wait for model to be ready with two-phase timeout
-                # (blocking from sync context)
-                logger.info("Waiting for model to be ready on server...")
-                success, server_info = loop.run_until_complete(
-                    self.client.wait_for_model_ready(
-                        initial_timeout=15.0,  # TODO: make configurable
-                        loading_timeout=300.0,
+                    logger.info(
+                        "[IPC-LOADER] Creating companion client for physical device %d "
+                        "(logical device %d, DP rank %d)",
+                        physical_device, logical_device, dp_rank
                     )
-                )
-
-                if not success:
-                    raise RuntimeError(
-                        "Failed to connect to model server or model not ready"
-                    )
-
-                logger.info(
-                    "Model %s is ready on server (device: cuda:%s)",
-                    model_config.model,
-                    server_info.get("device_id", "unknown"),
-                )
+                
+                self.client = MultiProcCompanionClient(self.vllm_config.companion_config, physical_device)
+                logger.info("MultiProc companion client initialized for device %d with coordinator at: tcp://127.0.0.1:%d",
+                            physical_device, self.vllm_config.companion_config.coordinator_port)
+                
+                # Validate that companion server exists for our device
+                self._validate_companion_server_availability()
+            except Exception as e:
+                logger.error(
+                    "Error creating MultiProc companion client: %s", e)
+                raise
 
     def get_all_weights(
         self,
@@ -282,25 +185,14 @@ class IPCModelLoader(BaseModelLoader):
         self.download_model(model_config)
 
         # Both clients now have the same API - they return rebuild info
-        logger.info(
-            "Retrieving model parameters rebuild info from %s companion...",
-            "MultiProc" if self.use_multiproc else "Dynamo"
-        )
+        logger.info("Retrieving model parameters rebuild info from companion...")
         
         try:
-            if self.use_multiproc:
-                # MultiProc client returns rebuild info directly
-                logger.info("[IPC-LOADER] Requesting model parameters via MultiProc client")
-                model_parameters_rebuild_info = self.client.get_model_parameters(
-                    vllm_config=self.vllm_config
-                )
-            else:
-                # Dynamo client is async
-                loop = asyncio.get_event_loop()
-                logger.info("[IPC-LOADER] Requesting model parameters via Dynamo client (async)")
-                model_parameters_rebuild_info = loop.run_until_complete(
-                    self.client.get_model_parameters()
-                )
+            # MultiProc client returns rebuild info directly
+            logger.info("[IPC-LOADER] Requesting model parameters via MultiProc client")
+            model_parameters_rebuild_info = self.client.get_model_parameters(
+                vllm_config=self.vllm_config
+            )
         except Exception as e:
             logger.error("[IPC-LOADER] Error getting tensor rebuild info: %s", e)
             raise RuntimeError(
@@ -395,13 +287,7 @@ class IPCModelLoader(BaseModelLoader):
 
     def __del__(self):
         """Clean up the client connection when the loader is destroyed."""
-        if hasattr(self, "use_multiproc") and self.use_multiproc:
-            # Clean up MultiProc client
-            if hasattr(self, "client") and self.client is not None:
-                with contextlib.suppress(Exception):
-                    self.client.close()
-        else:
-            # Dynamo runtime cleanup happens automatically when it goes
-            # out of scope
-            if hasattr(self, "runtime") and self.runtime is not None:
-                pass
+        # Clean up client
+        if hasattr(self, "client") and self.client is not None:
+            with contextlib.suppress(Exception):
+                self.client.close()

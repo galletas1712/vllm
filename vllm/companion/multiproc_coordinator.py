@@ -25,6 +25,7 @@ from vllm.companion.messages import (
     HandshakeResponse,
     LoadModelResponse,
     ModelParametersRebuildInfoResponse,
+    MemoryUsageResponse,
 )
 from vllm.logger import init_logger
 from vllm.utils import make_zmq_socket
@@ -221,7 +222,8 @@ class MultiProcCoordinator:
                 # Forward to companion's status port synchronously
                 await self._forward_request(client_id, message, request.device_id, use_status_port=True)
                 
-            elif request_type in (RequestType.LOAD_MODEL, RequestType.GET_MODEL_PARAMETERS_REBUILD_INFO):
+            elif request_type in (RequestType.LOAD_MODEL, RequestType.GET_MODEL_PARAMETERS_REBUILD_INFO, 
+                                  RequestType.GET_MEMORY_USAGE):
                 # Forward to companion's data port synchronously
                 await self._forward_request(client_id, message, request.device_id, use_status_port=False)
                 
@@ -295,6 +297,14 @@ class MultiProcCoordinator:
                     model_parameters=None,
                     error=f"Companion for GPU {device_id} not available",
                     response_type=ResponseType.MODEL_PARAMETERS_REBUILD_INFO
+                ))
+            elif request_type == RequestType.GET_MEMORY_USAGE:
+                error_response = pickle.dumps(MemoryUsageResponse(
+                    success=False,
+                    model_weights_bytes=0,
+                    is_model_loaded=False,
+                    error=f"Companion for GPU {device_id} not available",
+                    response_type=ResponseType.MEMORY_USAGE
                 ))
             else:
                 # Fallback for unknown request types

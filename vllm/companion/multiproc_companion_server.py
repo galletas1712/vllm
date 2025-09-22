@@ -16,6 +16,7 @@ import zmq.asyncio
 
 from vllm.logger import init_logger
 from vllm.companion.model_instance_manager import ModelInstanceManager
+from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 from vllm.companion.messages import (
     CompanionState,
     GetCompanionStatusResponse,
@@ -25,6 +26,7 @@ from vllm.companion.messages import (
     LoadModelRequest,
     LoadModelResponse,
     ModelParametersRebuildInfoResponse,
+    MemoryUsageResponse,
 )
 from vllm.utils import make_zmq_socket
 
@@ -57,6 +59,8 @@ class MultiProcCompanionServer:
         self.model_manager: Optional[ModelInstanceManager] = None
         self.model_hash: Optional[str] = None
         self.model_parameters: Optional[dict] = None
+        # Actual memory usage measured by profiler
+        self.model_memory_usage: int = 0
         
         # State tracking - only track model loading state
         self.state = CompanionState.INITIALIZING
@@ -123,13 +127,6 @@ class MultiProcCompanionServer:
         self.state = CompanionState.LOADING
         
         try:
-            # Get companion_master_port from vllm_config if available,
-            # otherwise use server's default
-            companion_master_port = getattr(
-                request.vllm_config.load_config, 'companion_master_port',
-                self.companion_master_port
-            )
-            
             # Create ModelInstanceManager
             self.model_manager = ModelInstanceManager(
                 vllm_config=request.vllm_config,
@@ -137,7 +134,7 @@ class MultiProcCompanionServer:
                 local_rank=request.local_rank,
                 global_rank=request.global_rank,
                 world_size=request.world_size,
-                companion_master_port=companion_master_port,
+                companion_master_port=self.companion_master_port,
             )
             
             # Initialize distributed environment only once
@@ -147,10 +144,15 @@ class MultiProcCompanionServer:
                 self.distributed_initialized = True
                 logger.info("[COMPANION-SERVER] Distributed initialization complete for device %d", self.device_id)
             
-            # Load model weights
+            # Load model weights and measure memory usage
             logger.info("[COMPANION-SERVER] Starting model weight loading for device %d", self.device_id)
-            self.model_manager.load_model_weights()
+            with DeviceMemoryProfiler() as m:
+                self.model_manager.load_model_weights()
+            self.model_memory_usage = m.consumed_memory
             logger.info("[COMPANION-SERVER] Model weight loading complete for device %d", self.device_id)
+            logger.info(
+                "[COMPANION-SERVER] Model memory usage: %.4f GiB", 
+                self.model_memory_usage / GiB_bytes)
             
             # Update state to READY
             self.state = CompanionState.READY
@@ -302,6 +304,23 @@ class MultiProcCompanionServer:
                 )
                 return pickle.dumps(response)
             
+            elif request_type == RequestType.GET_MEMORY_USAGE:
+                # Request for memory usage information
+                memory_bytes = self.model_memory_usage
+                is_loaded = self.state == CompanionState.READY and self.model_parameters is not None
+                
+                logger.debug("Memory usage request: device=%d, loaded=%s, bytes=%d", 
+                           self.device_id, is_loaded, memory_bytes)
+                
+                response = MemoryUsageResponse(
+                    success=True,
+                    model_weights_bytes=memory_bytes,
+                    is_model_loaded=is_loaded,
+                    error=None,
+                    response_type=ResponseType.MEMORY_USAGE
+                )
+                return pickle.dumps(response)
+            
             else:
                 # Unknown request type
                 logger.error("Unknown request type: %s", request_type)
@@ -412,6 +431,7 @@ class MultiProcCompanionServer:
         self.model_manager = None
         self.model_hash = None
         self.model_parameters = None
+        self.model_memory_usage = 0
         torch.cuda.empty_cache()
         
         # Clean up ZMQ

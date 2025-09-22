@@ -2281,6 +2281,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         "aux_hidden_state_outputs was requested")
             time_after_load = time.perf_counter()
         self.model_memory_usage = m.consumed_memory
+        
+        # If using companion process, get its memory usage as well
+        self.companion_memory_usage = 0
+        if self.load_config.enable_companion_process:
+            from vllm.model_executor.model_loader.ipc_loader import (
+                IPCModelLoader)
+            assert isinstance(model_loader, IPCModelLoader)
+            assert model_loader.client is not None
+            weights_bytes, is_loaded = \
+                model_loader.client.get_memory_usage()
+            assert is_loaded
+            self.companion_memory_usage = weights_bytes
+            logger.info(
+                "Companion process memory usage: %.4f GiB",
+                self.companion_memory_usage / GiB_bytes)
+        
         logger.info("Model loading took %.4f GiB and %.6f seconds",
                     self.model_memory_usage / GiB_bytes,
                     time_after_load - time_before_load)

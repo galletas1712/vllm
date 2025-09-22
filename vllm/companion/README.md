@@ -50,11 +50,6 @@ engine_args = AsyncEngineArgs(
 engine = AsyncLLM.from_engine_args(engine_args)
 ```
 
-## Environment Variables
-
-- `VLLM_IPC_USE_MULTIPROC` (default: "1") - Use MultiProc companion instead of Dynamo
-- `VLLM_COMPANION_COORDINATOR_ADDRESS` - Auto-set by vLLM when coordinator starts
-
 ## Benefits
 
 - **No External Dependencies** - Uses only ZMQ (already required by vLLM)

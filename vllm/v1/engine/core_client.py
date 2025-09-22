@@ -334,8 +334,6 @@ class BackgroundResources:
     engine_manager: Optional[Union[CoreEngineProcManager,
                                    CoreEngineActorManager]] = None
     coordinator: Optional[DPCoordinator] = None
-    # Process object for companion coordinator
-    companion_coordinator: Optional[Any] = None
     output_socket: Optional[Union[zmq.Socket, zmq.asyncio.Socket]] = None
     input_socket: Optional[Union[zmq.Socket, zmq.asyncio.Socket]] = None
     first_req_send_socket: Optional[zmq.asyncio.Socket] = None
@@ -357,14 +355,6 @@ class BackgroundResources:
             self.engine_manager.close()
         if self.coordinator is not None:
             self.coordinator.close()
-        
-        # Clean up companion coordinator last to ensure IPC handles remain valid
-        if (self.companion_coordinator is not None and
-                self.companion_coordinator.is_alive()):
-            self.companion_coordinator.terminate()
-            self.companion_coordinator.join(timeout=5)
-            if self.companion_coordinator.is_alive():
-                self.companion_coordinator.kill()
 
         if isinstance(self.output_socket, zmq.asyncio.Socket):
             # Async case.
@@ -466,11 +456,9 @@ class MPClient(EngineCoreClient):
                 # Engines are managed by this client.
                 with launch_core_engines(vllm_config, executor_class,
                                          log_stats) as engine_context:
-                    (engine_manager, coordinator, addresses,
-                     companion_coordinator) = engine_context
+                    (engine_manager, coordinator, addresses) = engine_context
                     self.resources.coordinator = coordinator
                     self.resources.engine_manager = engine_manager
-                    self.resources.companion_coordinator = companion_coordinator
 
                 (input_address, ) = addresses.inputs
                 (output_address, ) = addresses.outputs

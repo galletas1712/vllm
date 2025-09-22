@@ -20,6 +20,7 @@ from vllm.companion.messages import (
     HandshakeRequest,
     LoadModelRequest,
     GetModelParametersRebuildInfoRequest,
+    GetMemoryUsageRequest,
 )
 from vllm.utils import make_zmq_socket
 
@@ -37,15 +38,16 @@ class MultiProcCompanionClient:
         Initialize the client for a specific GPU device.
         
         Args:
-            companion_config: CompanionConfig object containing coordinator address
+            companion_config: CompanionConfig object containing coordinator port
                 and other companion settings.
             device_id: Physical GPU device ID this client will manage
         """
-        if not companion_config or not companion_config.coordinator_address:
-            raise ValueError("CompanionConfig with coordinator_address is required")
+        if not companion_config:
+            raise ValueError("CompanionConfig is required")
         
         self.companion_config = companion_config
-        self.coordinator_address = companion_config.coordinator_address
+        # Construct coordinator address from localhost and port
+        self.coordinator_address = f"tcp://127.0.0.1:{companion_config.coordinator_port}"
         self.device_id = device_id  # This client always manages this specific GPU
         
         # ZMQ context and socket
@@ -392,6 +394,53 @@ class MultiProcCompanionClient:
         tensor = rebuild_cuda_tensor(*rebuild_args)
         
         return tensor
+    
+    def get_memory_usage(self) -> tuple[int, bool]:
+        """Get memory usage information from the companion server.
+        
+        Returns:
+            Tuple of (model_weights_bytes, is_model_loaded)
+            - model_weights_bytes: Total bytes used by model weights (0 if not loaded)
+            - is_model_loaded: Whether the model is currently loaded
+            
+        Raises:
+            RuntimeError: If failed to get memory usage information
+        """
+        # Use the device_id from initialization
+        device_id = self.device_id
+        
+        # Create request to get memory usage
+        request = GetMemoryUsageRequest(device_id=device_id)
+        
+        try:
+            self.socket.send(pickle.dumps(request))
+            response_data = self.socket.recv()
+            response = pickle.loads(response_data)
+            
+            # Check response type
+            response_type = getattr(response, 'response_type', None)
+            if response_type != ResponseType.MEMORY_USAGE:
+                raise RuntimeError(
+                    f"Expected MEMORY_USAGE response, got {response_type}"
+                )
+            
+            if not response.success:
+                raise RuntimeError(
+                    f"Failed to get memory usage: {response.error}"
+                )
+            
+            logger.debug(
+                "Memory usage for GPU %d: %d bytes, loaded=%s",
+                device_id, response.model_weights_bytes, response.is_model_loaded
+            )
+            
+            return response.model_weights_bytes, response.is_model_loaded
+            
+        except zmq.error.Again as e:
+            raise RuntimeError(
+                f"Timeout getting memory usage from companion server. "
+                f"Device ID: {device_id}"
+            ) from e
     
     def close(self):
         """Close the client connection."""

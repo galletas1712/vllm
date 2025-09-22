@@ -601,7 +601,6 @@ def launch_core_engines(
         Optional[Union[CoreEngineProcManager, CoreEngineActorManager]],
         Optional[DPCoordinator],
         EngineZmqAddresses,
-        Optional[Process],  # companion_coordinator
 ]]:
     """Launch engine and DP coordinator processes as needed."""
 
@@ -653,39 +652,6 @@ def launch_core_engines(
     else:
         coordinator = None
     
-    # Start companion coordinator if IPC loading is enabled
-    companion_coordinator = None
-    if vllm_config.load_config.enable_companion_process:
-        use_multiproc = os.environ.get("VLLM_IPC_USE_MULTIPROC", "1") == "1"
-        
-        if use_multiproc:
-            # Get the coordinator port from config
-            coordinator_port = vllm_config.companion_config.coordinator_port
-            
-            # All ranks set the address in their config
-            vllm_config.companion_config.coordinator_address = \
-                f"tcp://127.0.0.1:{coordinator_port}"
-            
-            # Only rank 0 actually starts the coordinator
-            if dp_rank == 0 or offline_mode:
-                from vllm.companion.multiproc_coordinator import run_coordinator
-                
-                # Get companion_master_port from config
-                companion_master_port = (
-                    vllm_config.companion_config.companion_master_port)
-                companion_coordinator = Process(
-                    target=run_coordinator,
-                    args=(coordinator_port, companion_master_port),
-                    name="CompanionCoordinator"
-                )
-                companion_coordinator.start()
-                
-                logger.info("Started companion coordinator on port %d",
-                           coordinator_port)
-            else:
-                logger.info("Using companion coordinator at %s (started by rank 0)",
-                           vllm_config.companion_config.coordinator_address)
-
     if parallel_config.data_parallel_backend == "ray":
         logger.info("Starting ray-based data parallel backend")
 
@@ -696,9 +662,7 @@ def launch_core_engines(
             log_stats=log_stats,
         )
 
-        # Don't clean up companion coordinator here - caller manages it
-        yield (engine_actor_manager, coordinator, addresses,
-               companion_coordinator)
+        yield (engine_actor_manager, coordinator, addresses)
         return
 
     if offline_mode:
@@ -761,9 +725,7 @@ def launch_core_engines(
         else:
             local_engine_manager = None
 
-        # Don't clean up companion coordinator here - caller manages it
-        yield (local_engine_manager, coordinator, addresses,
-               companion_coordinator)
+        yield (local_engine_manager, coordinator, addresses)
         
         # Now wait for engines to start.
         wait_for_engine_startup(

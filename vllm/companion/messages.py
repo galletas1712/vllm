@@ -18,6 +18,7 @@ class RequestType(Enum):
     HANDSHAKE = "handshake"
     LOAD_MODEL = "load_model"
     GET_MODEL_PARAMETERS_REBUILD_INFO = "get_model_parameters_rebuild_info"
+    GET_MEMORY_USAGE = "get_memory_usage"
 
 
 class ResponseType(Enum):
@@ -26,6 +27,7 @@ class ResponseType(Enum):
     HANDSHAKE = "handshake"
     LOAD_MODEL = "load_model"
     MODEL_PARAMETERS_REBUILD_INFO = "model_parameters_rebuild_info"
+    MEMORY_USAGE = "memory_usage"
 
 
 class CompanionState(Enum):
@@ -164,3 +166,20 @@ class ModelParametersRebuildInfoResponse:
     model_parameters: Optional[dict[str, CUDATensorRebuildInfo]] = None
     error: Optional[str] = None
     response_type: ResponseType = ResponseType.MODEL_PARAMETERS_REBUILD_INFO
+
+
+@dataclass 
+class GetMemoryUsageRequest:
+    """Request to get memory usage of model weights."""
+    device_id: int
+    request_type: RequestType = RequestType.GET_MEMORY_USAGE
+
+
+@dataclass
+class MemoryUsageResponse:
+    """Response containing memory usage information."""
+    success: bool
+    model_weights_bytes: int = 0  # Total bytes used by model weights
+    is_model_loaded: bool = False  # Whether model is currently loaded
+    error: Optional[str] = None
+    response_type: ResponseType = ResponseType.MEMORY_USAGE

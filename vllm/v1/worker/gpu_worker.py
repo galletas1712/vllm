@@ -6,7 +6,8 @@ from enum import Enum
 import gc
 import os
 from contextlib import AbstractContextManager, nullcontext
-from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
+from collections.abc import Iterable
 
 import torch
 import torch.distributed
@@ -127,24 +128,25 @@ class Worker(WorkerBase):
         4. precompile_model (pre-compile model)
         5. shut down the fake distributed environment
         """
-        assert self.init_phase == WorkerInitPhase.PHASE_1, "Worker must be in phase 1"
-        self.init_model_runner()
-        assert self.vllm_config.load_config.enable_companion_process, "Companion process must be enabled."
-        self.load_model()
-        self.precompile_model()
+        with set_current_vllm_config(self.vllm_config):
+            assert self.init_phase == WorkerInitPhase.PHASE_1, "Worker must be in phase 1"
+            self.init_model_runner()
+            assert self.vllm_config.load_config.enable_companion_process, "Companion process must be enabled."
+            self.load_model()
+            self.precompile_model()
 
-        self._phase_1_ep_size = get_ep_group().world_size
-        self._phase_1_ep_rank = get_ep_group().rank_in_group
-        logger.info(f"Phase 1 - EP size: {self._phase_1_ep_size}, EP rank: {self._phase_1_ep_rank}")
+            self._phase_1_ep_size = get_ep_group().world_size
+            self._phase_1_ep_rank = get_ep_group().rank_in_group
+            logger.info("Phase 1 - EP size: %d, EP rank: %d", self._phase_1_ep_size, self._phase_1_ep_rank)
 
-        # Clean up the model runner and the fake distributed environment
-        self.model_runner.reset_input_batch_state()
-        cleanup_dist_env_and_memory()
+            # Clean up the model runner and the fake distributed environment
+            self.model_runner.reset_input_batch_state()
+            cleanup_dist_env_and_memory()
 
-        # Release imported IPC handles and set parameter data to UninitializedParameterFromTensor
-        self.model_runner.unmap_and_release_ipc_handles()
+            # Release imported IPC handles and set parameter data to UninitializedParameterFromTensor
+            self.model_runner.unmap_and_release_ipc_handles()
 
-        self.init_phase = WorkerInitPhase.PHASE_2
+            self.init_phase = WorkerInitPhase.PHASE_2
     
     def phase_2_init(self) -> None:
         """
@@ -154,58 +156,60 @@ class Worker(WorkerBase):
         Since the EngineCore calculates the minimum available memory across all workers (DP incl.),
         phase 2 and 3 need to be split.
         """
-        assert self.init_phase == WorkerInitPhase.PHASE_2, "Worker must be in phase 2"
+        with set_current_vllm_config(self.vllm_config):
+            assert self.init_phase == WorkerInitPhase.PHASE_2, "Worker must be in phase 2"
 
-        # This only reinitializes the distributed environment, but doesn't take a memory snapshot
-        # since we want to use the memory snapshot without weights loaded
-        self.reinit_device()
-        self.model_runner.reset_input_batch_state()
-       
-        # Switch back to the original loader and load real weights inplace.
-        # The weights are already mapped in GPU memory from wake_up.
-        if self._original_load_format and self._original_load_format != "dummy":
-            self.model_runner.update_config({
-                "load_config": {
-                    "load_format": self._original_load_format,
-                }
-            })
-
-            # NOTE: must update expert map before reloading weights to ensure expert_map is valid before loading
-            if self.vllm_config.parallel_config.enable_expert_parallel:
-                moe_modules = [
-                    module for module in self.model_runner.model.modules()
-                    if module.__class__.__name__ == "FusedMoE"
-                ]
-                for module in moe_modules:
-                    if hasattr(module, 'update_expert_map'):
-                        logger.debug(f"Updating expert map for module: {module}")
-                        module.update_expert_map()
-
-            # Allocate actual weights into the existing parameter storages.
-            logger.info("Reloading weights")
-            self.reload_weights()
-
-            if self.vllm_config.parallel_config.enable_expert_parallel:
-                current_ep_size = get_ep_group().world_size
-                current_ep_rank = get_ep_group().rank_in_group
-                assert current_ep_size == self._phase_1_ep_size, "EP size should be the same"
-                assert current_ep_rank == self._phase_1_ep_rank, "EP rank should be the same"
-                self._reconfigure_moe(old_ep_size=self._phase_1_ep_size, new_ep_size=current_ep_size)
+            # This only reinitializes the distributed environment, but doesn't take a memory snapshot
+            # since we want to use the memory snapshot without weights loaded
+            self.reinit_device()
+            self.model_runner.reset_input_batch_state()
         
-        self.model_runner.recreate_persistent_buffers()
+            # Switch back to the original loader and load real weights inplace.
+            # The weights are already mapped in GPU memory from wake_up.
+            if self._original_load_format and self._original_load_format != "dummy":
+                self.model_runner.update_config({
+                    "load_config": {
+                        "load_format": self._original_load_format,
+                    }
+                })
 
-        available_memory = self.determine_available_memory()
-        self.init_phase = WorkerInitPhase.INITIALIZING_CACHE
-        return available_memory
+                # NOTE: must update expert map before reloading weights to ensure expert_map is valid before loading
+                if self.vllm_config.parallel_config.enable_expert_parallel:
+                    moe_modules = [
+                        module for module in self.model_runner.model.modules()
+                        if module.__class__.__name__ == "FusedMoE"
+                    ]
+                    for module in moe_modules:
+                        if hasattr(module, 'update_expert_map'):
+                            logger.debug("Updating expert map for module: %s", module)
+                            module.update_expert_map()
+
+                # Allocate actual weights into the existing parameter storages.
+                logger.info("Reloading weights")
+                self.reload_weights()
+
+                if self.vllm_config.parallel_config.enable_expert_parallel:
+                    current_ep_size = get_ep_group().world_size
+                    current_ep_rank = get_ep_group().rank_in_group
+                    assert current_ep_size == self._phase_1_ep_size, "EP size should be the same"
+                    assert current_ep_rank == self._phase_1_ep_rank, "EP rank should be the same"
+                    self._reconfigure_moe(old_ep_size=self._phase_1_ep_size, new_ep_size=current_ep_size)
+            
+            self.model_runner.recreate_persistent_buffers()
+
+            available_memory = self.determine_available_memory()
+            self.init_phase = WorkerInitPhase.INITIALIZING_CACHE
+            return available_memory
 
     def phase_3_init(self) -> None:
         """
         Captures CUDA graphs for the model.
         This assumes the KV cache has already been initialized.
         """
-        assert self.init_phase == WorkerInitPhase.PHASE_3, "Worker must be in phase 3"
-        self.compile_or_warm_up_model()
-        self.init_phase = WorkerInitPhase.DONE
+        with set_current_vllm_config(self.vllm_config):
+            assert self.init_phase == WorkerInitPhase.PHASE_3, "Worker must be in phase 3"
+            self.compile_or_warm_up_model()
+            self.init_phase = WorkerInitPhase.DONE
     
     def sleep_tensors(self, tensors: Iterable[torch.Tensor], offload: bool = False) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
@@ -295,7 +299,7 @@ class Worker(WorkerBase):
                                     self.cache_config.gpu_memory_utilization)
         GiB = lambda b: round(b / GiB_bytes, 2)
         
-        if self.init_snapshot.free_memory < self.requested_memory:
+        if not self.vllm_config.load_config.enable_companion_process and self.init_snapshot.free_memory < self.requested_memory:
             raise ValueError(
                 f"Free memory on device "
                 f"({GiB(self.init_snapshot.free_memory)}/"
@@ -305,6 +309,8 @@ class Worker(WorkerBase):
                 f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
                 f"utilization or reduce GPU memory used by other processes."
             )
+        else:
+            logger.warning("Companion process is enabled, skipping memory snapshot check")
     
     def _init_distributed_environment(self, fake_distributed_env: bool = False):
         logger.info("Initializing worker distributed environment...")
@@ -429,12 +435,29 @@ class Worker(WorkerBase):
         torch.cuda.reset_peak_memory_stats()
         GiB = lambda b: b / GiB_bytes
 
+        # Calculate total weights memory including companion process memory
+        # The model_runner tracks local memory usage, and companion_memory_usage
+        # tracks memory in the companion process (if enabled)
+        companion_memory = getattr(self.model_runner, 
+                                   'companion_memory_usage', 0)
+        local_memory = self.model_runner.model_memory_usage
+        weights_memory = companion_memory + local_memory
+        
+        if companion_memory > 0:
+            logger.info(
+                "Total model weights memory: %.2f GiB "
+                "(companion: %.2f GiB, local: %.2f GiB)",
+                weights_memory / GiB_bytes,
+                companion_memory / GiB_bytes, 
+                local_memory / GiB_bytes)
+        
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        # NOTE: since our initial memory snapshot was taken prior to weights loaded, we need to pass the weights size to the profiler
+        # NOTE: since our initial memory snapshot was taken prior to weights
+        # loaded, we need to pass the weights size to the profiler
         with memory_profiling(
                 self.init_snapshot,
-                weights_memory=self.model_runner.model_memory_usage) as profile_result:
+                weights_memory=weights_memory) as profile_result:
             self.model_runner.profile_run()
 
         free_gpu_memory = profile_result.after_profile.free_memory
