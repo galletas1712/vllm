@@ -179,7 +179,9 @@ class CuMemAllocator:
     def sleep(
             self,
             offload_tags: Optional[Union[tuple[str, ...],
-                                         str]] = None) -> None:
+                                         str]] = None,
+            sleep_tags: Optional[Union[tuple[str, ...],
+                                      str]] = None) -> None:
         """
         Put the allocator in sleep mode.
         All data in the memory allocation with the specified tag will be
@@ -187,6 +189,8 @@ class CuMemAllocator:
 
         :param offload_tags: The tags of the memory allocation that will be
             offloaded. The rest of the memory allocation will be discarded.
+        :param sleep_tags: If specified, only tensors with these tags will be
+            put to sleep. If None, all tensors are put to sleep.
         """
         if offload_tags is None:
             # by default, allocated tensors are offloaded
@@ -195,9 +199,18 @@ class CuMemAllocator:
         elif isinstance(offload_tags, str):
             offload_tags = (offload_tags, )
 
+        if sleep_tags is not None:
+            if isinstance(sleep_tags, str):
+                sleep_tags = (sleep_tags, )
+            assert isinstance(sleep_tags, tuple)
+
         assert isinstance(offload_tags, tuple)
 
         for ptr, data in self.pointer_to_data.items():
+            # Skip if sleep_tags is specified and this tensor doesn't match
+            if sleep_tags is not None and data.tag not in sleep_tags:
+                continue
+                
             handle = data.handle
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]

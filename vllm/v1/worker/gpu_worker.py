@@ -117,7 +117,7 @@ class Worker(WorkerBase):
         # switch back after phase 2 init if needed.
         self._original_load_format: Optional[str] = self.load_config.load_format
 
-        self.init_device(fake_distributed_env=True)
+        self.init_device(fake_distributed_env=False)
     
     def phase_1_init(self) -> None:
         """
@@ -126,7 +126,8 @@ class Worker(WorkerBase):
         2. init_model_runner (which includes buffers)
         3. load_model (model weights)
         4. precompile_model (pre-compile model)
-        5. shut down the fake distributed environment
+        5. profile memory and allocate KV cache (if sleep mode enabled)
+        6. shut down the fake distributed environment
         """
         with set_current_vllm_config(self.vllm_config):
             assert self.init_phase == WorkerInitPhase.PHASE_1, "Worker must be in phase 1"
@@ -138,6 +139,21 @@ class Worker(WorkerBase):
             self._phase_1_ep_size = get_ep_group().world_size
             self._phase_1_ep_rank = get_ep_group().rank_in_group
             logger.info("Phase 1 - EP size: %d, EP rank: %d", self._phase_1_ep_size, self._phase_1_ep_rank)
+
+            # If sleep mode is enabled, profile memory and allocate KV cache early
+            # This avoids allocator switching issues with CUDA graph capture
+            if self.vllm_config.model_config.enable_sleep_mode:
+                logger.info("Sleep mode enabled: profiling memory and allocating KV cache in phase 1")
+                # Profile memory to determine available space
+                self._phase_1_available_memory = self.determine_available_memory()
+                # Get KV cache specs and create config
+                kv_cache_spec = self.model_runner.get_kv_cache_spec()
+                self._phase_1_kv_cache_config = self._create_kv_cache_config(kv_cache_spec)
+                # Allocate KV cache with custom allocator and immediately sleep it
+                self._allocate_and_sleep_kv_cache()
+            else:
+                self._phase_1_available_memory = None
+                self._phase_1_kv_cache_config = None
 
             # Clean up the model runner and the fake distributed environment
             self.model_runner.reset_input_batch_state()
@@ -152,7 +168,7 @@ class Worker(WorkerBase):
         """
         1. init_device (refreshes memory snapshot and reinitializes distributed environment)
         2. Reinitialize buffers in model runner
-        3. Calculate available memory
+        3. Calculate available memory (or use pre-calculated from phase 1)
         Since the EngineCore calculates the minimum available memory across all workers (DP incl.),
         phase 2 and 3 need to be split.
         """
@@ -197,7 +213,16 @@ class Worker(WorkerBase):
             
             self.model_runner.recreate_persistent_buffers()
 
-            available_memory = self.determine_available_memory()
+            # If sleep mode is enabled and we allocated KV cache in phase 1, wake it up
+            if self.vllm_config.model_config.enable_sleep_mode and hasattr(self, '_phase_1_available_memory'):
+                logger.info("Waking up KV cache allocated in phase 1")
+                from vllm.device_allocator.cumem import CuMemAllocator
+                allocator = CuMemAllocator.get_instance()
+                allocator.wake_up(["kv_cache"])
+                available_memory = self._phase_1_available_memory
+            else:
+                available_memory = self.determine_available_memory()
+            
             self.init_phase = WorkerInitPhase.INITIALIZING_CACHE
             return available_memory
 
@@ -226,6 +251,7 @@ class Worker(WorkerBase):
             used_bytes / GiB_bytes)
 
     def sleep(self, level: int = 1) -> None:
+        assert self.vllm_config.model_config.enable_sleep_mode, "Sleep mode must be enabled"
         from vllm.device_allocator.cumem import CuMemAllocator
 
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
@@ -239,7 +265,18 @@ class Worker(WorkerBase):
             }
 
         allocator = CuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=("weights", ) if level == 1 else tuple())
+        
+        # Level 1: Sleep model weights with offloading (if companion process is NOT enabled)
+        # Level 2: Sleep model weights without offloading (if companion process is NOT enabled)
+        if level >= 1 and not self.vllm_config.load_config.enable_companion_process:
+            allocator.sleep(offload_tags=("weights", ) if level == 1 else tuple(), sleep_tags=("weights", ))
+        
+        # Level 3: Additionally sleep KV cache (requires sleep mode to be enabled)
+        if level >= 3:
+            # Sleep only the KV cache tensors (no offloading needed)
+            # The tensors were already tagged with "kv_cache" during allocation
+            allocator.sleep(offload_tags=None, sleep_tags="kv_cache")
+        
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -253,7 +290,24 @@ class Worker(WorkerBase):
         from vllm.device_allocator.cumem import CuMemAllocator
 
         allocator = CuMemAllocator.get_instance()
-        allocator.wake_up(tags)
+        
+        # Wake up allocations based on tags
+        if tags is not None:
+            allocator.wake_up(tags)
+        else:
+            # Wake up all by default
+            tags_to_wake = []
+            
+            # Wake up weights only if companion process is NOT enabled
+            if not self.vllm_config.load_config.enable_companion_process:
+                tags_to_wake.append("weights")
+            
+            # Wake up KV cache if sleep mode is enabled
+            if self.vllm_config.model_config.enable_sleep_mode:
+                tags_to_wake.append("kv_cache")
+            
+            if tags_to_wake:
+                allocator.wake_up(tags_to_wake)
 
         # Restore the buffers after level 2 sleep
         if len(self._sleep_saved_buffers):
@@ -277,6 +331,50 @@ class Worker(WorkerBase):
         else:
             context = nullcontext()
         return context
+    
+    def _create_kv_cache_config(self, kv_cache_spec: dict[str, Any]) -> KVCacheConfig:
+        """Create KV cache configuration from spec and available memory."""
+        from vllm.v1.kv_cache_interface import KVCacheConfig
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_config
+        
+        # Use the available memory calculated in phase 1
+        available_memory = self._phase_1_available_memory
+        
+        # Create KV cache config
+        kv_cache_config = get_kv_cache_config(
+            self.vllm_config,
+            kv_cache_spec,
+            available_memory
+        )
+        
+        return kv_cache_config
+    
+    def _allocate_and_sleep_kv_cache(self) -> None:
+        """Allocate KV cache tensors using custom allocator and immediately sleep them."""
+        from vllm.device_allocator.cumem import CuMemAllocator
+        
+        allocator = CuMemAllocator.get_instance()
+        
+        # Allocate KV cache tensors with memory pool tagging
+        logger.info("Allocating KV cache tensors with custom allocator")
+        
+        # We need to manually allocate the tensors here instead of calling initialize_kv_cache
+        # because we need to use the custom allocator context
+        kv_cache_raw_tensors = {}
+        with allocator.use_memory_pool("kv_cache"):
+            for kv_cache_tensor in self._phase_1_kv_cache_config.kv_cache_tensors:
+                tensor = torch.zeros(kv_cache_tensor.size,
+                                     dtype=torch.int8,
+                                     device=self.device)
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = tensor
+        
+        # Store the allocated tensors for later use
+        self._phase_1_kv_cache_tensors = kv_cache_raw_tensors
+        
+        # Immediately sleep the KV cache to free memory for torch.compile
+        logger.info("Sleeping KV cache to free memory for compilation")
+        allocator.sleep(offload_tags=None, sleep_tags="kv_cache")
     
     def init_model_runner(self) -> None:
         self.model_runner: GPUModelRunner = GPUModelRunner(
@@ -374,7 +472,11 @@ class Worker(WorkerBase):
     # to hijack tensor allocation.
     def load_model(self) -> None:
         eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
-        with self._maybe_get_memory_pool_context(tag="weights"):
+        if not self.vllm_config.load_config.enable_companion_process:
+            context = self._maybe_get_memory_pool_context(tag="weights")
+        else:
+            context = nullcontext()
+        with context:
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
     
     def update_config(self, overrides: dict[str, Any]) -> None:
@@ -491,15 +593,15 @@ class Worker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
-
-        if self.vllm_config.model_config.enable_sleep_mode:
-            from vllm.device_allocator.cumem import CuMemAllocator
-
-            allocator = CuMemAllocator.get_instance()
-            context = allocator.use_memory_pool(tag="kv_cache")
+        # If sleep mode is enabled and we already allocated in phase 1, use pre-allocated tensors
+        if (self.vllm_config.model_config.enable_sleep_mode and 
+            hasattr(self, '_phase_1_kv_cache_tensors') and 
+            self._phase_1_kv_cache_tensors is not None):
+            # KV cache was already allocated in phase 1, pass the pre-allocated tensors
+            logger.info("Using pre-allocated KV cache tensors from phase 1")
+            self.model_runner.initialize_kv_cache_with_tensors(
+                kv_cache_config, self._phase_1_kv_cache_tensors)
         else:
-            context = nullcontext()
-        with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> None:

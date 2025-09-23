@@ -404,6 +404,13 @@ class EngineCore:
         self.scheduler.reset_prefix_cache()
 
     def sleep(self, level: int = 1):
+        """Put the engine to sleep to free GPU memory.
+        
+        Sleep levels:
+        - Level 1: Sleep model weights (if companion process is not enabled)
+        - Level 2: Sleep model weights and buffers
+        - Level 3: Sleep model weights, buffers, and KV cache (requires sleep mode)
+        """
         self.model_executor.sleep(level)
 
     def wake_up(self, tags: Optional[list[str]] = None):
