@@ -177,7 +177,12 @@ class EngineCore:
     def _complete_initialization(self) -> None:
         logger.info("Init stage: phase 2")
         self.collective_rpc("phase_2_init")
-        self.collective_rpc("wake_up", kwargs=dict(tags=["kv_cache"]))
+        
+        # Only wake up KV cache if not configured to start asleep
+        if not self.vllm_config.launch_config.start_kv_asleep:
+            self.collective_rpc("wake_up", kwargs=dict(tags=["kv_cache"]))
+        else:
+            logger.info("KV cache left asleep as configured by start_kv_asleep=True")
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig,

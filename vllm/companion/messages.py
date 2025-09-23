@@ -131,7 +131,8 @@ class LoadModelRequest:
             'model_config_hash': self.vllm_config.model_config.compute_hash(),
             'parallel_config_hash': (
                 self.vllm_config.parallel_config.compute_hash()),
-            'cache_config_hash': self.vllm_config.cache_config.compute_hash(),
+            # cache_config_hash removed to allow sharing weights between instances
+            # with different KV cache configurations
             'device_config_hash': self.vllm_config.device_config.compute_hash(),
             'load_config_hash': self.vllm_config.load_config.compute_hash(),
             'lora_config_hash': (

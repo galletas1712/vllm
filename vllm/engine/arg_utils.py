@@ -454,6 +454,7 @@ class EngineArgs:
     # Launch configuration
     init_mode: Optional[str] = LaunchConfig.init_mode
     checkpoint_dir_root: str = LaunchConfig.checkpoint_dir_root
+    start_kv_asleep: bool = LaunchConfig.start_kv_asleep
 
     # DEPRECATED
     enable_multimodal_encoder_data_parallel: bool = False
@@ -619,6 +620,8 @@ class EngineArgs:
                                   **launch_kwargs["init_mode"])
         launch_group.add_argument("--checkpoint-dir-root",
                                   **launch_kwargs["checkpoint_dir_root"])
+        launch_group.add_argument("--start-kv-asleep",
+                                  **launch_kwargs["start_kv_asleep"])
 
         # Guided decoding arguments
         guided_decoding_kwargs = get_kwargs(DecodingConfig)
@@ -1424,7 +1427,8 @@ class EngineArgs:
         companion_config = CompanionConfig()
         launch_config = LaunchConfig(
             init_mode=self.init_mode,
-            checkpoint_dir_root=self.checkpoint_dir_root
+            checkpoint_dir_root=self.checkpoint_dir_root,
+            start_kv_asleep=self.start_kv_asleep
         )
         
         config = VllmConfig(

@@ -33,6 +33,11 @@ class LaunchConfig:
     checkpoint_dir_root: str = "/tmp"
     """Root directory for CRIU dump files."""
 
+    start_kv_asleep: bool = False
+    """Whether to start with KV cache asleep. If True, the engine will complete
+    initialization without waking up the KV cache, leaving only VMA ranges active.
+    The KV cache must be explicitly woken up before scheduling any requests."""
+
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs
