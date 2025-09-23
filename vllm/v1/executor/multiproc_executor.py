@@ -70,8 +70,6 @@ class MultiprocExecutor(Executor):
         # Multiprocessing-based executor does not support multi-node setting.
         # Since it only works for single node, we can use the loopback address
         # get_loopback_ip() for communication.
-        fake_distributed_init_method = get_distributed_init_method(
-            get_loopback_ip(), get_open_port())
         distributed_init_method = get_distributed_init_method(
             get_loopback_ip(), get_open_port())
 
@@ -94,7 +92,6 @@ class MultiprocExecutor(Executor):
                         local_rank=rank,
                         rank=rank,
                         distributed_init_method=distributed_init_method,
-                        fake_distributed_init_method=fake_distributed_init_method,
                         input_shm_handle=scheduler_output_handle,
                     ))
 
@@ -408,7 +405,6 @@ class WorkerProc:
         local_rank: int,
         rank: int,
         distributed_init_method: str,
-        fake_distributed_init_method: str,
         input_shm_handle: Handle,
     ):
         self.init_worker_proc(
@@ -416,7 +412,6 @@ class WorkerProc:
             local_rank,
             rank,
             distributed_init_method,
-            fake_distributed_init_method,
         )
 
         # Initialize MessageQueue for receiving SchedulerOutput
@@ -445,7 +440,6 @@ class WorkerProc:
         local_rank: int,
         rank: int,
         distributed_init_method: str,
-        fake_distributed_init_method: str,
     ):
         self.rank = rank
         wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
@@ -460,7 +454,6 @@ class WorkerProc:
             "local_rank": local_rank,
             "rank": rank,
             "distributed_init_method": distributed_init_method,
-            "fake_distributed_init_method": fake_distributed_init_method,
             "is_driver_worker": is_driver_worker,
         }
         wrapper.init_worker(all_kwargs)
@@ -475,7 +468,6 @@ class WorkerProc:
             local_rank: int,
             rank: int,
             distributed_init_method: str,
-            fake_distributed_init_method: str,
             input_shm_handle,  # Receive SchedulerOutput
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
@@ -490,7 +482,6 @@ class WorkerProc:
             "local_rank": local_rank,
             "rank": rank,
             "distributed_init_method": distributed_init_method,
-            "fake_distributed_init_method": fake_distributed_init_method,
             "input_shm_handle": input_shm_handle,
             "ready_pipe": (reader, writer),
             "death_pipe": death_reader,

@@ -3279,26 +3279,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
          """
-        # Check if sleep mode is enabled
-        # use_memory_pool = self.vllm_config.model_config.enable_sleep_mode
-        use_memory_pool = False
-        
-        if use_memory_pool:
-            from vllm.device_allocator.cumem import CuMemAllocator
-            allocator = CuMemAllocator.get_instance()
-            
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if use_memory_pool:
-                # Allocate with memory pool tagging for sleep/wake functionality
-                with allocator.use_memory_pool("kv_cache"):
-                    tensor = torch.zeros(kv_cache_tensor.size,
-                                         dtype=torch.int8,
-                                         device=self.device)
-            else:
-                tensor = torch.zeros(kv_cache_tensor.size,
-                                     dtype=torch.int8,
-                                     device=self.device)
+            tensor = torch.zeros(kv_cache_tensor.size,
+                                 dtype=torch.int8,
+                                 device=self.device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 
@@ -3513,47 +3498,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             assert isinstance(self.drafter, EagleProposer)
             # validate all draft model layers belong to the same kv cache
             # group
-            self.drafter.validate_same_kv_cache_group(kv_cache_config)
-
-        if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
-            if self.device.type == 'xpu':
-                get_kv_transfer_group().set_host_xfer_buffer_ops(
-                    copy_kv_blocks)
-
-        if self.dcp_world_size > 1:
-            layer_names = self.attn_groups[0][0].layer_names
-            layers = get_layers_from_vllm_config(self.vllm_config,
-                                                 AttentionLayerBase,
-                                                 layer_names)
-            for layer in layers.values():
-                assert layer.impl.need_to_return_lse_for_decode, (
-                    "DCP requires attention impls to return"
-                    " the softmax lse for decode, but the impl "
-                    f"{layer.impl.__class__.__name__} "
-                    "does not return the softmax lse for decode.")
-    
-    def initialize_kv_cache_with_tensors(self, kv_cache_config: KVCacheConfig, 
-                                         kv_cache_raw_tensors: dict[str, torch.Tensor]) -> None:
-        """
-        Initialize KV cache using pre-allocated tensors.
-        Args:
-            kv_cache_config: Configuration for the KV cache
-            kv_cache_raw_tensors: Pre-allocated KV cache tensors
-        """
-        kv_cache_config = deepcopy(kv_cache_config)
-        self.kv_cache_config = kv_cache_config
-        self.may_reinitialize_input_batch(kv_cache_config)
-        self.may_add_encoder_only_layers_to_kv_cache_config()
-        self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
-        self.initialize_attn_backend(kv_cache_config)
-        
-        # Use the pre-allocated tensors and reshape them
-        kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
-        
-        # Continue with the rest of initialization
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
         if has_kv_transfer_group():

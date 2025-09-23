@@ -97,13 +97,8 @@ class EngineCore:
 
     def _phase_1_init_rpc(self) -> None:
         logger.info("Init stage: phase 1")
-        self.collective_rpc("phase_1_init")
-    
-    def _complete_initialization(self) -> None:
         vllm_config = self.vllm_config
-
-        logger.info("Init stage: phase 2")
-        available_gpu_memory = self.collective_rpc("phase_2_init")
+        available_gpu_memory = self.collective_rpc("phase_1_init")
         logger.info("Init stage: KV cache config initialization")
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
             self._initialize_kv_caches(vllm_config, available_gpu_memory)
@@ -112,9 +107,9 @@ class EngineCore:
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
         self.collective_rpc("initialize_cache",
                             args=(num_gpu_blocks, num_cpu_blocks))
-
-        logger.info("Init stage: phase 3")
-        self.collective_rpc("phase_3_init")
+        
+        # Puts KV cache to sleep. NOTE: requires companion process so weights don't get put to slee
+        self.collective_rpc("sleep", args=(3, ))
 
         # Setup scheduler.
         if isinstance(vllm_config.scheduler_config.scheduler_cls, str):
@@ -178,6 +173,11 @@ class EngineCore:
 
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
+    
+    def _complete_initialization(self) -> None:
+        logger.info("Init stage: phase 2")
+        self.collective_rpc("phase_2_init")
+        self.collective_rpc("wake_up", kwargs=dict(tags=["kv_cache"]))
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig,

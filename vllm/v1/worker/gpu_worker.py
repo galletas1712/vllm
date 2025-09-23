@@ -19,10 +19,7 @@ from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
-from vllm.distributed.parallel_state import (
-    cleanup_dist_env_and_memory,
-    FAKE_DISTRIBUTED_BACKEND,
-)
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group, get_ep_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -42,7 +39,6 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
 
-
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -50,9 +46,8 @@ if TYPE_CHECKING:
 
 class WorkerInitPhase(Enum):
     PHASE_1 = "phase_1"
-    PHASE_2 = "phase_2"
     INITIALIZING_CACHE = "initializing_cache"
-    PHASE_3 = "phase_3"
+    PHASE_2 = "phase_2"
     DONE = "done"
 
 
@@ -64,7 +59,6 @@ class Worker(WorkerBase):
         local_rank: int,
         rank: int,
         distributed_init_method: str,
-        fake_distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
 
@@ -73,8 +67,6 @@ class Worker(WorkerBase):
                          rank=rank,
                          distributed_init_method=distributed_init_method,
                          is_driver_worker=is_driver_worker)
-        
-        self.fake_distributed_init_method = fake_distributed_init_method
 
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
@@ -113,13 +105,9 @@ class Worker(WorkerBase):
             self.profiler = None
         
         self.init_phase = WorkerInitPhase.PHASE_1
-        # Record the original load format so we can defer real weights and
-        # switch back after phase 2 init if needed.
-        self._original_load_format: Optional[str] = self.load_config.load_format
-
-        self.init_device(fake_distributed_env=False)
+        self.init_device()
     
-    def phase_1_init(self) -> None:
+    def phase_1_init(self) -> int:
         """
         Initialize the common worker components that can be reused and don't depend on the real distributed environment:
         1. init_device (device + fake distributed setup, already done in __init__)
@@ -140,20 +128,7 @@ class Worker(WorkerBase):
             self._phase_1_ep_rank = get_ep_group().rank_in_group
             logger.info("Phase 1 - EP size: %d, EP rank: %d", self._phase_1_ep_size, self._phase_1_ep_rank)
 
-            # If sleep mode is enabled, profile memory and allocate KV cache early
-            # This avoids allocator switching issues with CUDA graph capture
-            if self.vllm_config.model_config.enable_sleep_mode:
-                logger.info("Sleep mode enabled: profiling memory and allocating KV cache in phase 1")
-                # Profile memory to determine available space
-                self._phase_1_available_memory = self.determine_available_memory()
-                # Get KV cache specs and create config
-                kv_cache_spec = self.model_runner.get_kv_cache_spec()
-                self._phase_1_kv_cache_config = self._create_kv_cache_config(kv_cache_spec)
-                # Allocate KV cache with custom allocator and immediately sleep it
-                self._allocate_and_sleep_kv_cache()
-            else:
-                self._phase_1_available_memory = None
-                self._phase_1_kv_cache_config = None
+            available_gpu_memory = self.determine_available_memory()
 
             # Clean up the model runner and the fake distributed environment
             self.model_runner.reset_input_batch_state()
@@ -162,7 +137,9 @@ class Worker(WorkerBase):
             # Release imported IPC handles and set parameter data to UninitializedParameterFromTensor
             self.model_runner.unmap_and_release_ipc_handles()
 
-            self.init_phase = WorkerInitPhase.PHASE_2
+            self.init_phase = WorkerInitPhase.INITIALIZING_CACHE
+        
+        return available_gpu_memory
     
     def phase_2_init(self) -> None:
         """
@@ -180,76 +157,36 @@ class Worker(WorkerBase):
             self.reinit_device()
             self.model_runner.reset_input_batch_state()
         
-            # Switch back to the original loader and load real weights inplace.
-            # The weights are already mapped in GPU memory from wake_up.
-            if self._original_load_format and self._original_load_format != "dummy":
-                self.model_runner.update_config({
-                    "load_config": {
-                        "load_format": self._original_load_format,
-                    }
-                })
+            # NOTE: must update expert map before reloading weights to ensure expert_map is valid before loading
+            if self.vllm_config.parallel_config.enable_expert_parallel:
+                moe_modules = [
+                    module for module in self.model_runner.model.modules()
+                    if module.__class__.__name__ == "FusedMoE"
+                ]
+                for module in moe_modules:
+                    if hasattr(module, 'update_expert_map'):
+                        logger.debug("Updating expert map for module: %s", module)
+                        module.update_expert_map()
 
-                # NOTE: must update expert map before reloading weights to ensure expert_map is valid before loading
-                if self.vllm_config.parallel_config.enable_expert_parallel:
-                    moe_modules = [
-                        module for module in self.model_runner.model.modules()
-                        if module.__class__.__name__ == "FusedMoE"
-                    ]
-                    for module in moe_modules:
-                        if hasattr(module, 'update_expert_map'):
-                            logger.debug("Updating expert map for module: %s", module)
-                            module.update_expert_map()
+            # Allocate actual weights into the existing parameter storages.
+            logger.info("Reloading weights")
+            self.reload_weights()
 
-                # Allocate actual weights into the existing parameter storages.
-                logger.info("Reloading weights")
-                self.reload_weights()
-
-                if self.vllm_config.parallel_config.enable_expert_parallel:
-                    current_ep_size = get_ep_group().world_size
-                    current_ep_rank = get_ep_group().rank_in_group
-                    assert current_ep_size == self._phase_1_ep_size, "EP size should be the same"
-                    assert current_ep_rank == self._phase_1_ep_rank, "EP rank should be the same"
-                    self._reconfigure_moe(old_ep_size=self._phase_1_ep_size, new_ep_size=current_ep_size)
+            if self.vllm_config.parallel_config.enable_expert_parallel:
+                current_ep_size = get_ep_group().world_size
+                current_ep_rank = get_ep_group().rank_in_group
+                assert current_ep_size == self._phase_1_ep_size, "EP size should be the same"
+                assert current_ep_rank == self._phase_1_ep_rank, "EP rank should be the same"
+                self._reconfigure_moe(old_ep_size=self._phase_1_ep_size, new_ep_size=current_ep_size)
             
             self.model_runner.recreate_persistent_buffers()
 
-            # If sleep mode is enabled and we allocated KV cache in phase 1, wake it up
-            if self.vllm_config.model_config.enable_sleep_mode and hasattr(self, '_phase_1_available_memory'):
-                logger.info("Waking up KV cache allocated in phase 1")
-                from vllm.device_allocator.cumem import CuMemAllocator
-                allocator = CuMemAllocator.get_instance()
-                allocator.wake_up(["kv_cache"])
-                available_memory = self._phase_1_available_memory
-            else:
-                available_memory = self.determine_available_memory()
-            
-            self.init_phase = WorkerInitPhase.INITIALIZING_CACHE
-            return available_memory
-
-    def phase_3_init(self) -> None:
-        """
-        Captures CUDA graphs for the model.
-        This assumes the KV cache has already been initialized.
-        """
+        # Capture CUDA graphs
         with set_current_vllm_config(self.vllm_config):
-            assert self.init_phase == WorkerInitPhase.PHASE_3, "Worker must be in phase 3"
             self.compile_or_warm_up_model()
-            self.init_phase = WorkerInitPhase.DONE
-    
-    def sleep_tensors(self, tensors: Iterable[torch.Tensor], offload: bool = False) -> None:
-        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
-        from vllm.device_allocator.cumem import CuMemAllocator
-        allocator = CuMemAllocator.get_instance()
-        allocator.sleep_tensors(tensors)
-        free_bytes_after_sleep, total = torch.cuda.mem_get_info()
-        freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
-        used_bytes = total - free_bytes_after_sleep
-        assert freed_bytes >= 0, "Memory usage increased after sleeping."
-        logger.info(
-            "Sleep mode freed %.2f GiB memory, "
-            "%.2f GiB memory is still in use.", freed_bytes / GiB_bytes,
-            used_bytes / GiB_bytes)
 
+        self.init_phase = WorkerInitPhase.DONE
+    
     def sleep(self, level: int = 1) -> None:
         assert self.vllm_config.model_config.enable_sleep_mode, "Sleep mode must be enabled"
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -332,50 +269,6 @@ class Worker(WorkerBase):
             context = nullcontext()
         return context
     
-    def _create_kv_cache_config(self, kv_cache_spec: dict[str, Any]) -> KVCacheConfig:
-        """Create KV cache configuration from spec and available memory."""
-        from vllm.v1.kv_cache_interface import KVCacheConfig
-        from vllm.v1.core.kv_cache_utils import get_kv_cache_config
-        
-        # Use the available memory calculated in phase 1
-        available_memory = self._phase_1_available_memory
-        
-        # Create KV cache config
-        kv_cache_config = get_kv_cache_config(
-            self.vllm_config,
-            kv_cache_spec,
-            available_memory
-        )
-        
-        return kv_cache_config
-    
-    def _allocate_and_sleep_kv_cache(self) -> None:
-        """Allocate KV cache tensors using custom allocator and immediately sleep them."""
-        from vllm.device_allocator.cumem import CuMemAllocator
-        
-        allocator = CuMemAllocator.get_instance()
-        
-        # Allocate KV cache tensors with memory pool tagging
-        logger.info("Allocating KV cache tensors with custom allocator")
-        
-        # We need to manually allocate the tensors here instead of calling initialize_kv_cache
-        # because we need to use the custom allocator context
-        kv_cache_raw_tensors = {}
-        with allocator.use_memory_pool("kv_cache"):
-            for kv_cache_tensor in self._phase_1_kv_cache_config.kv_cache_tensors:
-                tensor = torch.zeros(kv_cache_tensor.size,
-                                     dtype=torch.int8,
-                                     device=self.device)
-                for layer_name in kv_cache_tensor.shared_by:
-                    kv_cache_raw_tensors[layer_name] = tensor
-        
-        # Store the allocated tensors for later use
-        self._phase_1_kv_cache_tensors = kv_cache_raw_tensors
-        
-        # Immediately sleep the KV cache to free memory for torch.compile
-        logger.info("Sleeping KV cache to free memory for compilation")
-        allocator.sleep(offload_tags=None, sleep_tags="kv_cache")
-    
     def init_model_runner(self) -> None:
         self.model_runner: GPUModelRunner = GPUModelRunner(
             self.vllm_config, self.device)
@@ -385,7 +278,7 @@ class Worker(WorkerBase):
         assert self.init_phase == WorkerInitPhase.INITIALIZING_CACHE, "Worker must be in cache initialization phase"
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
-        self.init_phase = WorkerInitPhase.PHASE_3
+        self.init_phase = WorkerInitPhase.PHASE_2
     
     def _take_memory_snapshot(self):
         gc.collect()
@@ -410,21 +303,18 @@ class Worker(WorkerBase):
         else:
             logger.warning("Companion process is enabled, skipping memory snapshot check")
     
-    def _init_distributed_environment(self, fake_distributed_env: bool = False):
+    def _init_distributed_environment(self):
         logger.info("Initializing worker distributed environment...")
         with set_current_vllm_config(self.vllm_config):
             init_worker_distributed_environment(
                 self.vllm_config, self.rank,
-                self.fake_distributed_init_method if fake_distributed_env else self.distributed_init_method,
+                self.distributed_init_method,
                 self.local_rank,
-                backend=(
-                    FAKE_DISTRIBUTED_BACKEND if fake_distributed_env
-                    else current_platform.dist_backend
-                )
+                backend=current_platform.dist_backend
             )
         logger.info("Worker distributed environment initialized")
     
-    def init_device(self, fake_distributed_env: bool = False):
+    def init_device(self):
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
@@ -447,7 +337,7 @@ class Worker(WorkerBase):
                 f"Not support device type: {self.device_config.device}")
         
         self._take_memory_snapshot()
-        self._init_distributed_environment(fake_distributed_env)
+        self._init_distributed_environment()
         
         # Set random seed.
         set_random_seed(self.model_config.seed)
@@ -461,7 +351,7 @@ class Worker(WorkerBase):
     def reinit_device(self):
         logger.info("Reinitializing device and distributed environment...")
         torch.cuda.synchronize()
-        self._init_distributed_environment(fake_distributed_env=False)
+        self._init_distributed_environment()
         set_random_seed(self.model_config.seed)
         
         if self.rank == 0:
@@ -530,9 +420,6 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        from vllm.distributed.parallel_state import IS_FAKE_DISTRIBUTED
-        assert not IS_FAKE_DISTRIBUTED(), "Memory profiling should not be called in fake mode"
-        
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         GiB = lambda b: b / GiB_bytes
@@ -593,15 +480,15 @@ class Worker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
-        # If sleep mode is enabled and we already allocated in phase 1, use pre-allocated tensors
-        if (self.vllm_config.model_config.enable_sleep_mode and 
-            hasattr(self, '_phase_1_kv_cache_tensors') and 
-            self._phase_1_kv_cache_tensors is not None):
-            # KV cache was already allocated in phase 1, pass the pre-allocated tensors
-            logger.info("Using pre-allocated KV cache tensors from phase 1")
-            self.model_runner.initialize_kv_cache_with_tensors(
-                kv_cache_config, self._phase_1_kv_cache_tensors)
+
+        if self.vllm_config.model_config.enable_sleep_mode:
+            from vllm.device_allocator.cumem import CuMemAllocator
+
+            allocator = CuMemAllocator.get_instance()
+            context = allocator.use_memory_pool(tag="kv_cache")
         else:
+            context = nullcontext()
+        with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> None:
@@ -633,6 +520,7 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(
                     hidden_states=last_hidden_states)
+        
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -703,7 +591,7 @@ class Worker(WorkerBase):
                     sort_by="self_cuda_time_total"))
 
     def execute_dummy_batch(self) -> None:
-        self.model_runner._dummy_run(1)
+        self.model_runner._dummy_run(1, uniform_decode=True)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
@@ -842,10 +730,6 @@ class Worker(WorkerBase):
                 vllm_parallel_config=parallel_config,
             )
             module.moe_config.moe_parallel_config = module.moe_parallel_config
-            # Reinitialize MoE kernel after updating expert_map
-            if hasattr(module.quant_method, 'init_prepare_finalize'):
-                module.quant_method.init_prepare_finalize(module.moe_config)
-        global_expert_load = None
         if new_ep_size < old_ep_size:
             num_local_physical_experts = num_local_experts
             assert self.model_runner.eplb_state is not None
@@ -872,6 +756,7 @@ class Worker(WorkerBase):
         else:
             num_local_physical_experts = num_local_experts
             new_physical_experts = num_local_physical_experts * new_ep_size
+            global_expert_load = None
         prepare_communication_buffer_for_model(self.model_runner.model)
         self.model_runner.model.update_physical_experts_metadata(
             num_physical_experts=new_physical_experts,
@@ -935,7 +820,8 @@ class Worker(WorkerBase):
             tensorizer_config=tensorizer_config, )
 
     def shutdown(self) -> None:
-        self.model_runner.ensure_kv_transfer_shutdown()
+        if runner := getattr(self, "model_runner", None):
+            runner.ensure_kv_transfer_shutdown()
 
 
 def init_worker_distributed_environment(
@@ -945,10 +831,7 @@ def init_worker_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
 ) -> None:
-    """Initialize the distributed environment.
-    
-    If backend is FAKE_DISTRIBUTED_BACKEND, initializes with FakeGroupCoordinator.
-    """
+    """Initialize the distributed environment."""
     parallel_config = vllm_config.parallel_config
     # TODO (schwinns): remove this once custom all-reduce is supported
     assert parallel_config.disable_custom_all_reduce, "Custom all-reduce is not supported."
@@ -962,6 +845,4 @@ def init_worker_distributed_environment(
         parallel_config.pipeline_parallel_size,
         parallel_config.decode_context_parallel_size)
 
-    # Only initialize KV transfer for real device backends
-    if backend != FAKE_DISTRIBUTED_BACKEND:
-        ensure_kv_transfer_initialized(vllm_config)
+    ensure_kv_transfer_initialized(vllm_config)
