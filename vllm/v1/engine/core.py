@@ -108,8 +108,9 @@ class EngineCore:
         self.collective_rpc("initialize_cache",
                             args=(num_gpu_blocks, num_cpu_blocks))
         
-        # Puts KV cache to sleep. NOTE: requires companion process so weights don't get put to slee
-        self.collective_rpc("sleep", args=(3, ))
+        # Put KV cache to sleep at level 3. Using executor API ensures is_sleeping is tracked.
+        if vllm_config.model_config.enable_sleep_mode:
+            self.sleep(level=3)
 
         # Setup scheduler.
         if isinstance(vllm_config.scheduler_config.scheduler_cls, str):
@@ -179,8 +180,10 @@ class EngineCore:
         self.collective_rpc("phase_2_init")
         
         # Only wake up KV cache if not configured to start asleep
-        if not self.vllm_config.launch_config.start_kv_asleep:
-            self.collective_rpc("wake_up", kwargs=dict(tags=["kv_cache"]))
+        if not self.vllm_config.launch_config.start_kv_asleep and self.vllm_config.model_config.enable_sleep_mode:
+            # Wake KV cache via executor API so internal sleeping state is updated
+            # NOTE: Don't restrict tags to just kv_cache since executor_base puts both weights and kv_cache to sleep
+            self.wake_up()
         else:
             logger.info("KV cache left asleep as configured by start_kv_asleep=True")
 
