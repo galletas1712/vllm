@@ -2696,7 +2696,7 @@ class MemoryProfilingResult:
 
     def __repr__(self) -> str:
         return (f"Memory profiling takes {self.profile_time:.2f} seconds. "
-                f"Total non KV cache memory: "
+                f"Total non KV cache memory (includes weights and torch peak): "
                 f"{(self.non_kv_cache_memory / GiB_bytes):.2f}GiB; "
                 f"torch peak memory increase: "
                 f"{(self.torch_peak_increase / GiB_bytes):.2f}GiB; "

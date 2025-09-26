@@ -132,10 +132,8 @@ class Worker(WorkerBase):
 
             # Clean up the model runner and the fake distributed environment
             self.model_runner.reset_input_batch_state()
-            cleanup_dist_env_and_memory()
 
             # Release imported IPC handles and set parameter data to UninitializedParameterFromTensor
-            self.model_runner.unmap_and_release_ipc_handles()
 
             self.init_phase = WorkerInitPhase.INITIALIZING_CACHE
         
@@ -154,7 +152,6 @@ class Worker(WorkerBase):
 
             # This only reinitializes the distributed environment, but doesn't take a memory snapshot
             # since we want to use the memory snapshot without weights loaded
-            self.reinit_device()
             self.model_runner.reset_input_batch_state()
         
             # NOTE: must update expert map before reloading weights to ensure expert_map is valid before loading
@@ -167,10 +164,6 @@ class Worker(WorkerBase):
                     if hasattr(module, 'update_expert_map'):
                         logger.debug("Updating expert map for module: %s", module)
                         module.update_expert_map()
-
-            # Allocate actual weights into the existing parameter storages.
-            logger.info("Reloading weights")
-            self.reload_weights()
 
             if self.vllm_config.parallel_config.enable_expert_parallel:
                 current_ep_size = get_ep_group().world_size
@@ -286,23 +279,12 @@ class Worker(WorkerBase):
 
         # take current memory snapshot
         self.init_snapshot = MemorySnapshot()
-        self.requested_memory = (self.init_snapshot.total_memory *
-                                    self.cache_config.gpu_memory_utilization)
-        GiB = lambda b: round(b / GiB_bytes, 2)
-        
-        if not self.vllm_config.load_config.enable_companion_process and self.init_snapshot.free_memory < self.requested_memory:
-            raise ValueError(
-                f"Free memory on device "
-                f"({GiB(self.init_snapshot.free_memory)}/"
-                f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
-                f"is less than desired GPU memory utilization "
-                f"({self.cache_config.gpu_memory_utilization}, "
-                f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
-                f"utilization or reduce GPU memory used by other processes."
-            )
-        else:
-            logger.warning("Companion process is enabled, skipping memory snapshot check")
-    
+        # Always derive requested memory from the physical device capacity,
+        # ignoring current allocations (companion or otherwise).
+        device_total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+        self.requested_memory = (device_total_bytes *
+                                 self.cache_config.gpu_memory_utilization)
+
     def _init_distributed_environment(self):
         logger.info("Initializing worker distributed environment...")
         with set_current_vllm_config(self.vllm_config):
@@ -347,16 +329,6 @@ class Worker(WorkerBase):
             report_usage_stats(self.vllm_config)
         
         logger.info("Worker init_device has completed")
-    
-    def reinit_device(self):
-        logger.info("Reinitializing device and distributed environment...")
-        torch.cuda.synchronize()
-        self._init_distributed_environment()
-        set_random_seed(self.model_config.seed)
-        
-        if self.rank == 0:
-            report_usage_stats(self.vllm_config)
-        logger.info("Worker reinit_device has completed")
     
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
@@ -427,35 +399,35 @@ class Worker(WorkerBase):
         # Calculate total weights memory including companion process memory
         # The model_runner tracks local memory usage, and companion_memory_usage
         # tracks memory in the companion process (if enabled)
-        companion_memory = getattr(self.model_runner, 
-                                   'companion_memory_usage', 0)
+        assert hasattr(self.model_runner, 'companion_memory_usage'), "companion_memory_usage must be set"
+        assert self.model_runner.companion_memory_usage > 0, "companion_memory_usage must be greater than 0"
+        companion_memory = self.model_runner.companion_memory_usage
         local_memory = self.model_runner.model_memory_usage
-        weights_memory = companion_memory + local_memory
-        
+        total_weights_memory = companion_memory + local_memory
+
         if companion_memory > 0:
             logger.info(
-                "Total model weights memory: %.2f GiB "
-                "(companion: %.2f GiB, local: %.2f GiB)",
-                weights_memory / GiB_bytes,
-                companion_memory / GiB_bytes, 
+                "Total model weights memory: %.2f GiB (companion: %.2f GiB, local: %.2f GiB)",
+                total_weights_memory / GiB_bytes,
+                companion_memory / GiB_bytes,
                 local_memory / GiB_bytes)
-        
+
+        # Populates self.init_snapshot, self.requested_memory
+        self._take_memory_snapshot()
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        # NOTE: since our initial memory snapshot was taken prior to weights
-        # loaded, we need to pass the weights size to the profiler
         with memory_profiling(
                 self.init_snapshot,
-                weights_memory=weights_memory) as profile_result:
+                weights_memory=total_weights_memory) as profile_result:
             self.model_runner.profile_run()
 
-        free_gpu_memory = profile_result.after_profile.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
-        assert self.init_snapshot.free_memory > free_gpu_memory, (
+        assert profile_result.before_profile.free_memory >= profile_result.after_profile.free_memory - 1e-9, (
             "Error in memory profiling. "
-            f"Initial free memory {GiB(self.init_snapshot.free_memory)} GiB, "
-            f"current free memory {GiB(free_gpu_memory)} GiB. "
+            f"Before profile free memory {GiB(profile_result.before_profile.free_memory)} GiB, "
+            f"current free memory {GiB(profile_result.after_profile.free_memory)} GiB. "
             "This happens when other processes sharing the same container "
             "release GPU memory while vLLM is profiling during initialization. "
             "To fix this, ensure consistent GPU memory allocation or "
@@ -464,11 +436,10 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
 
         logger.info(
-            "Initial free memory: %.2f GiB, free memory: %.2f GiB, "
-            "requested GPU memory: %.2f GiB",
-            GiB(self.init_snapshot.free_memory), GiB(free_gpu_memory),
+            "Before profile free memory: %.2f GiB, after profile free memory: %.2f GiB, requested GPU memory: %.2f GiB",
+            GiB(profile_result.before_profile.free_memory), GiB(profile_result.after_profile.free_memory),
             GiB(self.requested_memory))
-        logger.info(profile_result)
+        logger.info("PROFILE_RESULT: %s", profile_result)
         logger.info("Available KV cache memory: %.2f GiB",
                     GiB(available_kv_cache_memory))
         gc.collect()

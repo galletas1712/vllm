@@ -170,53 +170,18 @@ class ModelInstanceManager:
 
     def _initialize_fake_distributed_environment(self):
         """Initialize distributed environment in fake mode for correct weight loading."""
-        # CRITICAL: Determine DP rank based on device_id
-        # This assumes a standard mapping: GPU 0 → DP rank 0, GPU 1 → DP rank 1, etc.
-        # This is necessary because the companion serves a specific GPU and should
-        # load the experts corresponding to that GPU's DP rank for EP to work correctly
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
-        
-        # Calculate DP rank based on device_id
-        # Assuming TP*PP groups are on consecutive GPUs, and DP spreads across nodes/GPUs
-        # For example, with TP=2, PP=1, DP=2:
-        #   GPUs 0-1: DP rank 0 (TP ranks 0-1)
-        #   GPUs 2-3: DP rank 1 (TP ranks 0-1)
-        # With TP=1, PP=1, DP=2:
-        #   GPU 0: DP rank 0
-        #   GPU 1: DP rank 1
-        tp_pp_size = tp_size * pp_size
-        computed_dp_rank = self.device_id // tp_pp_size
-        
-        # Validate and use the computed DP rank
-        if computed_dp_rank >= dp_size:
-            logger.warning(
-                "[DIST-INIT] Computed DP rank %d exceeds DP size %d, using config value %d",
-                computed_dp_rank, dp_size, 
-                self.vllm_config.parallel_config.data_parallel_rank
-            )
-            computed_dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-        else:
-            # Override the config's DP rank with the computed value
-            original_dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-            if original_dp_rank != computed_dp_rank:
-                logger.warning(
-                    "[DIST-INIT] Overriding config DP rank %d with computed value %d based on device_id %d",
-                    original_dp_rank, computed_dp_rank, self.device_id
-                )
-            self.vllm_config.parallel_config.data_parallel_rank = computed_dp_rank
-        
         logger.info(
             "[DIST-INIT] Starting companion shadow process initialization:\n"
-            "  Device ID: %d → Computed DP rank: %d\n"
+            "  Device ID: %d\n"
             "  local_rank=%d, rank=%d (TP/PP), world_size=%d (TP/PP)\n"
-            "  TP=%d, PP=%d, DP=%d, DP_rank=%d (computed from device_id)\n"
+            "  TP=%d, PP=%d, DP=%d, DP_rank=%d \n"
             "  Expert Parallel enabled=%s\n"
             "  companion_master_port=%d",
-            self.device_id, computed_dp_rank,
+            self.device_id,
             self.local_rank, self.global_rank, self.world_size,
-            tp_size, pp_size, dp_size,
+            self.vllm_config.parallel_config.tensor_parallel_size,
+            self.vllm_config.parallel_config.pipeline_parallel_size,
+            self.vllm_config.parallel_config.data_parallel_size,
             self.vllm_config.parallel_config.data_parallel_rank,
             self.vllm_config.parallel_config.enable_expert_parallel,
             self.companion_master_port,

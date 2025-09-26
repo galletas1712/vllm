@@ -32,12 +32,13 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.attention import Attention
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import fused_moe
+from vllm.model_executor.parameter import UninitializedParameterFromTensor
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
@@ -111,15 +112,25 @@ class DeepseekMoE(nn.Module):
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {self.n_routed_experts}.")
 
-        self.experts = nn.ModuleList([
-            DeepseekMLP(hidden_size=config.hidden_size,
-                        intermediate_size=config.moe_intermediate_size,
-                        hidden_act=config.hidden_act,
-                        quant_config=quant_config,
-                        reduce_results=False)
-            for idx in range(self.n_routed_experts)
-        ])
-        self.pack_params()
+        # Companion client vs server behavior
+        companion_enabled = get_current_vllm_config().load_config.enable_companion_process
+        if companion_enabled:
+            # Client: materialize packed buffers via IPC; do NOT allocate experts
+            self.w1 = UninitializedParameterFromTensor()
+            self.w2 = UninitializedParameterFromTensor()
+        else:
+            # Server: build experts locally and pack into contiguous buffers
+            self.experts = nn.ModuleList([
+                DeepseekMLP(hidden_size=config.hidden_size,
+                            intermediate_size=config.moe_intermediate_size,
+                            hidden_act=config.hidden_act,
+                            quant_config=quant_config,
+                            reduce_results=False)
+                for idx in range(self.n_routed_experts)
+            ])
+            self.pack_params()
+            print("W1: ", self.w1.shape, self.w1.is_contiguous(), self.w1.stride()[-1])
+            print("W2: ", self.w2.shape, self.w2.is_contiguous(), self.w2.stride()[-1])
 
         self.gate = ReplicatedLinear(config.hidden_size,
                                      self.n_routed_experts,
@@ -148,6 +159,8 @@ class DeepseekMoE(nn.Module):
         for data, param in zip(w1s, w1):
             param.data = data
         self.w1 = self.w1.view(len(w1), *w1s[0].shape)
+        # Register packed expert weights as parameters so IPC exporter can find them
+        self.w1 = nn.Parameter(self.w1.contiguous(), requires_grad=False)
 
         self.w2 = torch._utils._flatten_dense_tensors(w2)
         w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
@@ -155,6 +168,8 @@ class DeepseekMoE(nn.Module):
             param.data = data
 
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
+        # Register packed expert weights as parameters so IPC exporter can find them
+        self.w2 = nn.Parameter(self.w2.contiguous(), requires_grad=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
