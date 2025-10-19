@@ -58,6 +58,93 @@ from vllm.model_executor.layers.quantization.torchao import torchao_version_at_l
 
 logger = init_logger(__name__)
 
+
+def load_model_via_companion(
+    target_model: torch.nn.Module,
+    vllm_config,
+    device_id: int,
+    local_rank: int,
+    global_rank: int,
+    world_size: int,
+):
+    """
+    Load model weights from Dynamo companion server via CUDA IPC.
+
+    This helper function isolates the Dynamo-specific imports and calls
+    the dynamo_worker decorated function to load the model.
+
+    Args:
+        target_model: The model to load weights into (e.g., meta model)
+        vllm_config: vLLM configuration
+        device_id: GPU device ID (identifies companion server)
+        local_rank: Local rank for this process
+        global_rank: Global rank for this process
+        world_size: World size for distributed training
+        namespace: Dynamo namespace (default: "default")
+
+    Raises:
+        RuntimeError: If Dynamo runtime not initialized or imports fail
+    """
+    try:
+        from dynamo.runtime import DistributedRuntime
+        from dynamo.companion.client import CompanionClient
+    except ImportError as e:
+        raise RuntimeError(
+            "Cannot load from companion: Dynamo not available. "
+            "Make sure dynamo.companion is installed."
+        ) from e
+
+    import asyncio
+
+    namespace = os.environ.get("DYN_NAMESPACE", "dynamo")
+
+    async def load_async():
+        # When already in an async context, use detached runtime
+        runtime = DistributedRuntime.detached()
+        client = CompanionClient(runtime, device_id, namespace)
+        await client.load_model(
+            target_model=target_model,
+            vllm_config=vllm_config,
+            local_rank=local_rank,
+            global_rank=global_rank,
+            world_size=world_size
+        )
+
+    # Check if we're already in an event loop
+    try:
+        asyncio.get_running_loop()
+        # We're already in an async context
+        # Since we can't await here (we're in a sync function), we need to
+        # run the coroutine in a way that works with the existing loop
+        import concurrent.futures
+        import threading
+
+        # Create a future to get the result
+        future = concurrent.futures.Future()
+
+        def run_in_thread():
+            # Create a new event loop for this thread
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                new_loop.run_until_complete(load_async())
+                future.set_result(None)
+            except Exception as e:
+                future.set_exception(e)
+            finally:
+                new_loop.close()
+
+        # Run in a separate thread to avoid event loop conflicts
+        thread = threading.Thread(target=run_in_thread)
+        thread.start()
+        thread.join()
+
+        # Get the result (or raise exception if any)
+        future.result()
+    except RuntimeError:
+        # No running loop, create one
+        asyncio.run(load_async())
+
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
 # lock files in the temp directory will be automatically deleted when the

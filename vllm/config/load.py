@@ -50,6 +50,8 @@ class LoadConfig:
     - "mistral" will load weights from consolidated safetensors files used by
     Mistral models.
     - Other custom values can be supported via plugins."""
+    enable_companion_process: bool = False
+    """Whether to enable the companion process for loading the model weights."""
     download_dir: str | None = None
     """Directory to download and load the weights, default to the default
     cache directory of Hugging Face."""
