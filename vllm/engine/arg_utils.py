@@ -302,6 +302,7 @@ class EngineArgs:
     download_dir: Optional[str] = LoadConfig.download_dir
     safetensors_load_strategy: str = LoadConfig.safetensors_load_strategy
     load_format: Union[str, LoadFormats] = LoadConfig.load_format
+    enable_companion_process: bool = LoadConfig.enable_companion_process
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
@@ -603,6 +604,8 @@ class EngineArgs:
             description=LoadConfig.__doc__,
         )
         load_group.add_argument("--load-format", **load_kwargs["load_format"])
+        load_group.add_argument("--enable-companion-process",
+                                **load_kwargs["enable_companion_process"])
         load_group.add_argument("--download-dir",
                                 **load_kwargs["download_dir"])
         load_group.add_argument("--safetensors-load-strategy",
@@ -1069,6 +1072,7 @@ class EngineArgs:
 
         return LoadConfig(
             load_format=self.load_format,
+            enable_companion_process=self.enable_companion_process,
             download_dir=self.download_dir,
             safetensors_load_strategy=self.safetensors_load_strategy,
             device="cpu"

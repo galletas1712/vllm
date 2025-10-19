@@ -19,6 +19,8 @@ from vllm.model_executor.model_loader.runai_streamer_loader import (
 from vllm.model_executor.model_loader.sharded_state_loader import (
     ShardedStateLoader)
 from vllm.model_executor.model_loader.tensorizer_loader import TensorizerLoader
+from vllm.model_executor.model_loader.dynamo_companion_loader import (
+    DynamoCompanionLoader)
 from vllm.model_executor.model_loader.utils import (
     get_architecture_class_name, get_model_architecture, get_model_cls)
 
@@ -104,6 +106,10 @@ def register_model_loader(load_format: str):
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
+        # Check if IPC loading is enabled
+    if load_config.enable_companion_process:
+        return DynamoCompanionLoader(load_config)
+
     load_format = load_config.load_format
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")

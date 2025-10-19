@@ -673,6 +673,7 @@ class VllmConfig:
             f"max_seq_len={self.model_config.max_model_len}, "
             f"download_dir={self.load_config.download_dir!r}, "
             f"load_format={self.load_config.load_format}, "
+            f"enable_companion_process={self.load_config.enable_companion_process}, "
             f"tensor_parallel_size={self.parallel_config.tensor_parallel_size}, "  # noqa
             f"pipeline_parallel_size={self.parallel_config.pipeline_parallel_size}, "  # noqa
             f"data_parallel_size={self.parallel_config.data_parallel_size}, "  # noqa
