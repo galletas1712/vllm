@@ -22,7 +22,7 @@ import msgspec
 import zmq
 import zmq.asyncio
 
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import LiteVllmConfig, ModelConfig, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.inputs import PromptType
@@ -40,517 +40,110 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.output_processor import RequestOutputCollector
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory
-from vllm.v1.engine.cuda_checkpoint_utils import (
-    checkpoint_cuda_process, cuda_available,
+from vllm.checkpoint.utils import (
+    validate_cuda_process_tree, get_processes_with_nvidia_fds,
+    assert_no_nvidia_fds_in_tree, format_cuda_checkpoint_results,
+    checkpoint_cuda_processes_from_pids,
+    read_comm, read_cmdline, collect_process_tree_pids,
+    verify_processes_exited, get_tty_info,
+)
+from vllm.checkpoint.metadata import CheckpointMetadata
+from vllm.checkpoint.zmq_async_llm_server import (
+    RPCMessageType, RPCResponse, PropertyRequest, PropertyResponse,
+    run_async_llm_server,
 )
 
 logger = init_logger(__name__)
 
-# RPC message types
-class RPCMessageType(msgspec.Struct):
-    request_id: str
-    method: str
-    args_pickle: bytes = b''  # Cloudpickle serialized args
-    kwargs_pickle: bytes = b''  # Cloudpickle serialized kwargs
-    is_generator: bool = False
 
-class RPCResponse(msgspec.Struct):
-    request_id: str
-    result_pickle: bytes = b''  # Cloudpickle serialized result
-    error: Optional[str] = None
-    is_generator_item: bool = False
-    generator_done: bool = False
+def _create_engine_config_in_subprocess(queue: multiprocessing.Queue, engine_args_pickle: bytes) -> None:
+    """Create engine config in a subprocess with isolated CUDA context.
 
-class PropertyRequest(msgspec.Struct):
-    request_id: str
-    property_name: str
-
-class PropertyResponse(msgspec.Struct):
-    request_id: str
-    value_pickle: bytes = b''  # Cloudpickle serialized value
-    error: Optional[str] = None
-
-
-def _get_tty_info(pid: int) -> tuple[str, str]:
-    """Get TTY device info for a process."""
-    try:
-        # Get the TTY device from /proc/PID/fd/0
-        tty_path = f"/proc/{pid}/fd/0"
-        st = os.stat(tty_path)
-
-        # Format as hex values for CRIU
-        rdev = f"{st.st_rdev:x}"
-        dev = f"{st.st_dev:x}"
-
-        return rdev, dev
-    except Exception as e:
-        logger.warning("Could not get TTY info: %s", e)
-        return "", ""
-
-
-def _save_tty_id(checkpoint_dir: str, rdev: str, dev: str) -> None:
-    """Persist the external TTY id used during dump for reuse on restore."""
-    try:
-        path = os.path.join(checkpoint_dir, "criu_external_tty_id.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"tty[{rdev}:{dev}]\n")
-    except Exception as e:
-        logger.warning("Failed to save TTY id for CRIU restore: %s", e)
-
-
-def _load_tty_id(checkpoint_dir: str) -> Optional[str]:
-    """Load the external TTY id saved during dump, if present."""
-    try:
-        path = os.path.join(checkpoint_dir, "criu_external_tty_id.txt")
-        if not os.path.exists(path):
-            return None
-        with open(path, encoding="utf-8") as f:
-            value = f.read().strip()
-            return value or None
-    except Exception as e:
-        logger.warning("Failed to load TTY id for CRIU restore: %s", e)
-        return None
-
-
-def _save_tree_pid(checkpoint_dir: str, pid: int) -> None:
-    """Persist the original tree pid to wait for its exit on restore."""
-    try:
-        path = os.path.join(checkpoint_dir, "criu_tree_pid.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(str(pid))
-    except Exception as e:
-        logger.warning("Failed to save tree pid for CRIU restore: %s", e)
-
-
-def _load_tree_pid(checkpoint_dir: str) -> Optional[int]:
-    """Load the original tree pid if it was persisted."""
-    try:
-        path = os.path.join(checkpoint_dir, "criu_tree_pid.txt")
-        if not os.path.exists(path):
-            return None
-        with open(path, encoding="utf-8") as f:
-            data = f.read().strip()
-        return int(data) if data else None
-    except Exception as e:
-        logger.warning("Failed to load tree pid for CRIU restore: %s", e)
-        return None
-
-
-def _collect_process_tree_pids(root_pid: int) -> set[int]:
-    """Recursively collect PIDs in the process tree rooted at root_pid.
-
-    Uses /proc/<pid>/task/<pid>/children to discover descendants.
-    Best-effort: missing /proc entries are ignored.
-    """
-    pending: list[int] = [root_pid]
-    seen: set[int] = set[int]()
-    while pending:
-        pid = pending.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        children_path = f"/proc/{pid}/task/{pid}/children"
-        try:
-            with open(children_path, encoding="utf-8") as f:
-                content = f.read().strip()
-        except FileNotFoundError:
-            continue
-        except Exception:
-            continue
-        if not content:
-            continue
-        for token in content.split():
-            try:
-                child = int(token)
-            except ValueError:
-                continue
-            pending.append(child)
-    return seen
-
-
-def _process_has_nvidia_fd(pid: int) -> bool:
-    """Check if a process has any NVIDIA device file descriptors open.
+    This function runs in a separate process to ensure complete CUDA context isolation.
+    The subprocess will have its own CUDA context that won't interfere with the main
+    process or any subsequent subprocesses.
 
     Args:
-        pid: Process ID to check
+        queue: Multiprocessing queue to send results back to parent process
+        engine_args_pickle: Pickled AsyncEngineArgs object
+    """
+    try:
+        # Unpickle the engine args
+        engine_args = cloudpickle.loads(engine_args_pickle)
+
+        # Create the config (this may initialize CUDA)
+        org_vllm_config = engine_args.create_engine_config()
+        vllm_config = LiteVllmConfig.from_vllm_config(org_vllm_config)
+
+        # Pickle and send back the result
+        config_pickle = cloudpickle.dumps(vllm_config)
+        queue.put(("success", config_pickle))
+    except Exception as e:
+        # Send back the error with traceback for debugging
+        import traceback
+        error_msg = f"{str(e)}\n{traceback.format_exc()}"
+        queue.put(("error", error_msg))
+
+
+def create_engine_config_isolated(engine_args: AsyncEngineArgs) -> VllmConfig:
+    """Create engine config in a short-lived subprocess with separate CUDA context.
+
+    This function spawns a new process to create the VllmConfig, ensuring that any
+    CUDA initialization happens in a completely isolated context. This prevents
+    CUDA context conflicts between the configuration phase and the actual engine
+    execution.
+
+    The subprocess uses the 'spawn' start method to ensure a clean state without
+    inheriting any CUDA context from the parent process.
+
+    Args:
+        engine_args: AsyncEngineArgs object containing engine configuration
 
     Returns:
-        True if the process has /dev/nvidia* FDs open, False otherwise
+        VllmConfig: The created configuration object
+
+    Raises:
+        RuntimeError: If the subprocess fails to create the config
+        TimeoutError: If the subprocess takes too long
     """
-    fd_dir = f"/proc/{pid}/fd"
-    if not os.path.exists(fd_dir):
-        return False
-    try:
-        for fd in os.listdir(fd_dir):
-            try:
-                link = os.readlink(os.path.join(fd_dir, fd))
-                if link.startswith("/dev/nvidia"):
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return False
+    # Use spawn to ensure a clean CUDA context
+    ctx = multiprocessing.get_context('spawn')
+    queue = ctx.Queue()
 
+    # Pickle the engine args
+    engine_args_pickle = cloudpickle.dumps(engine_args)
 
-def _wait_until_no_nvidia_fds(root_pid: int,
-                              timeout_s: float = 10.0,
-                              poll_interval_s: float = 0.05) -> list[int]:
-    """Poll the process tree until no /dev/nvidia* FDs remain.
-
-    Returns list of PIDs that still have NVIDIA FDs open on timeout.
-    """
-    deadline = time.time() + timeout_s
-    remaining: list[int] = []
-    while time.time() < deadline:
-        pids = _collect_process_tree_pids(root_pid)
-        remaining = [pid for pid in pids if _process_has_nvidia_fd(pid)]
-        if not remaining:
-            return []
-        time.sleep(poll_interval_s)
-    return remaining
-
-
-def _find_gpu_worker_pids(root_pid: int) -> list[int]:
-    """Find all GPU worker processes in the process tree.
-
-    Returns PIDs of leaf processes that use GPU (workers).
-    """
-    all_pids = _collect_process_tree_pids(root_pid)
-
-    # Find leaf processes (no children)
-    leaf_pids = []
-    for pid in all_pids:
-        children_path = f"/proc/{pid}/task/{pid}/children"
-        try:
-            with open(children_path, encoding="utf-8") as f:
-                content = f.read().strip()
-            if not content:  # No children = leaf process
-                leaf_pids.append(pid)
-        except Exception:
-            continue
-
-    # Filter for GPU-using processes
-    gpu_pids = []
-    for pid in leaf_pids:
-        if _process_has_nvidia_fd(pid):
-            gpu_pids.append(pid)
-
-    return gpu_pids
-
-
-def _run_cuda_checkpoint(
-        pids: list[int], action: str,
-        cuda_checkpoint_path: str = "cuda-checkpoint") -> None:
-    """Run cuda-checkpoint utility on specified PIDs.
-
-    Args:
-        pids: List of process PIDs to checkpoint
-        action: Either "lock", "checkpoint", "restore", or "unlock"
-        cuda_checkpoint_path: Path to cuda-checkpoint utility
-    """
-    if not pids:
-        logger.warning("No PIDs provided for cuda-checkpoint")
-        return
-
-    # Check if cuda-checkpoint is available in PATH
-    import shutil
-    if not shutil.which(cuda_checkpoint_path):
-        raise RuntimeError(
-            f"cuda-checkpoint utility not found: '{cuda_checkpoint_path}'. "
-            "Please ensure cuda-checkpoint is installed and in your PATH."
-        )
-
-    # Build command for each PID
-    # The cuda-checkpoint utility uses --action <action> --pid <pid> syntax
-    for pid in pids:
-        cmd = [cuda_checkpoint_path, "--action", action, "--pid", str(pid)]
-
-        logger.info("Running cuda-checkpoint: %s", ' '.join(cmd))
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                logger.error("cuda-checkpoint %s failed for PID %d: %s",
-                            action, pid, result.stderr)
-                raise RuntimeError(
-                    f"cuda-checkpoint {action} failed for PID {pid}: "
-                    f"{result.stderr}")
-            logger.info("cuda-checkpoint %s succeeded for PID %d", action, pid)
-        except Exception as e:
-            logger.error("Failed to run cuda-checkpoint for PID %d: %s", pid, e)
-            raise
-
-
-class AsyncLLMServer:
-    """Server process that runs AsyncLLM and handles RPC calls."""
-
-    def __init__(self, socket_url: str, vllm_config: VllmConfig,
-                 executor_class: type[Executor], **kwargs):
-        self.socket_url = socket_url
-        self.vllm_config = vllm_config
-        self.executor_class = executor_class
-        self.kwargs = kwargs
-        self.async_llm: Optional[AsyncLLM] = None
-        self.running = True
-        self.engine_ready = False
-
-        # For handling async generators
-        self.active_generators: dict[str, AsyncGenerator] = {}
-
-    async def initialize(self):
-        """Initialize the AsyncLLM instance and wait for engine to be ready."""
-        logger.info("Initializing AsyncLLM...")
-        self.async_llm = AsyncLLM(
-            vllm_config=self.vllm_config,
-            executor_class=self.executor_class,
-            **self.kwargs
-        )
-
-        # The AsyncLLM constructor returns after starting the engine,
-        # but the engine may still be initializing (loading model,
-        # compiling, etc.)
-        # Try to verify the engine is ready by calling a simple method
-        max_wait_time = 900  # 15 minutes
-        start_time = time.time()
-        last_error = None
-
-        while time.time() - start_time < max_wait_time:
-            try:
-                # Try to get model config - this will succeed when
-                # engine is ready
-                await self.async_llm.get_model_config()
-                self.engine_ready = True
-                logger.info("AsyncLLM engine is fully initialized and ready")
-                return
-            except Exception as e:
-                last_error = e
-                # Check if the engine is dead
-                if (hasattr(self.async_llm, 'errored') and
-                        self.async_llm.errored):
-                    raise RuntimeError(
-                        f"AsyncLLM engine failed during initialization: {e}"
-                    ) from e
-                # Engine not ready yet, wait a bit
-                await asyncio.sleep(0.5)
-                elapsed = time.time() - start_time
-                if int(elapsed) % 10 == 0 and int(elapsed) > 0:
-                    logger.info("Waiting for AsyncLLM engine to initialize... "
-                               "(%d seconds elapsed)", int(elapsed))
-
-        raise RuntimeError(
-            f"AsyncLLM engine failed to initialize within {max_wait_time} "
-            f"seconds. Last error: {last_error}")
-
-    async def is_engine_ready(self) -> bool:
-        """Check if the AsyncLLM engine is fully initialized and ready."""
-        return self.engine_ready and self.async_llm is not None
-
-    async def handle_rpc_request(self, msg: RPCMessageType) -> Any:
-        """Handle an RPC request and return the result."""
-        if self.async_llm is None:
-            raise RuntimeError("AsyncLLM not initialized")
-
-        # Handle special server-side methods
-        if msg.method == "is_engine_ready":
-            return await self.is_engine_ready()
-
-        method = getattr(self.async_llm, msg.method)
-
-        # Deserialize args and kwargs
-        args = cloudpickle.loads(msg.args_pickle) if msg.args_pickle else ()
-        kwargs = (cloudpickle.loads(msg.kwargs_pickle)
-                  if msg.kwargs_pickle else {})
-
-        if msg.is_generator:
-            # For generator methods, we store the generator and
-            # return items one by one
-            generator = method(*args, **kwargs)
-            self.active_generators[msg.request_id] = generator
-            return None  # Initial response for generator
-        else:
-            # Regular method call
-            result = method(*args, **kwargs)
-            # Handle both sync and async methods
-            if asyncio.iscoroutine(result):
-                result = await result
-            return result
-
-    async def handle_generator_next(self,
-                                     request_id: str) -> tuple[Any, bool]:
-        """Get the next item from a generator."""
-        if request_id not in self.active_generators:
-            raise RuntimeError(
-                f"No active generator for request {request_id}")
-
-        generator = self.active_generators[request_id]
-        try:
-            item = await generator.__anext__()
-            return item, False  # not done
-        except StopAsyncIteration:
-            del self.active_generators[request_id]
-            return None, True  # done
-
-    async def handle_property_request(self, msg: PropertyRequest) -> Any:
-        """Handle a property access request."""
-        if self.async_llm is None:
-            raise RuntimeError("AsyncLLM not initialized")
-
-        return getattr(self.async_llm, msg.property_name)
-
-    async def run(self):
-        """Main server loop."""
-        ctx = zmq.asyncio.Context()
-        socket = ctx.socket(zmq.DEALER)
-        socket.bind(self.socket_url)
-
-        logger.info("AsyncLLM server listening on %s", self.socket_url)
-
-        # Wait for initial HELLO from client
-        logger.debug("Waiting for HELLO message...")
-        hello_msg = await socket.recv()
-        logger.debug("Received message: %s", hello_msg)
-        if hello_msg != b"HELLO":
-            logger.warning("Expected HELLO, got %s", hello_msg)
-
-        # Initialize AsyncLLM
-        logger.debug("Initializing AsyncLLM...")
-        await self.initialize()
-        logger.debug("AsyncLLM initialized")
-
-        # Send ready signal
-        logger.debug("Sending READY signal...")
-        await socket.send(b"READY")
-        logger.debug("READY signal sent")
-
-        try:
-            while self.running:
-                # Receive message
-                frames = await socket.recv_multipart()
-                msg_type = frames[0].decode()
-
-                if msg_type == "RPC":
-                    msg = msgspec.msgpack.decode(frames[1], type=RPCMessageType)
-                    try:
-                        if msg.method == "_generator_next":
-                            # Special case for getting next item from generator
-                            # Deserialize the request_id from args_pickle
-                            request_id = cloudpickle.loads(msg.args_pickle)[0]
-                            result, done = await self.handle_generator_next(
-                                request_id)
-                            response = RPCResponse(
-                                request_id=msg.request_id,
-                                result_pickle=(cloudpickle.dumps(result)
-                                              if not done else b''),
-                                is_generator_item=True,
-                                generator_done=done
-                            )
-                        else:
-                            result = await self.handle_rpc_request(msg)
-                            response = RPCResponse(
-                                request_id=msg.request_id,
-                                result_pickle=cloudpickle.dumps(result)
-                            )
-                    except Exception as e:
-                        response = RPCResponse(
-                            request_id=msg.request_id,
-                            error=(f"{type(e).__name__}: {str(e)}\n"
-                                   f"{traceback.format_exc()}")
-                        )
-                    await socket.send_multipart(
-                        [b"RPC_RESPONSE", msgspec.msgpack.encode(response)])
-
-                elif msg_type == "PROPERTY":
-                    msg = msgspec.msgpack.decode(
-                        frames[1], type=PropertyRequest)
-                    try:
-                        value = await self.handle_property_request(msg)
-                        response = PropertyResponse(
-                            request_id=msg.request_id,
-                            value_pickle=cloudpickle.dumps(value)
-                        )
-                    except Exception as e:
-                        response = PropertyResponse(
-                            request_id=msg.request_id,
-                            error=f"{type(e).__name__}: {str(e)}"
-                        )
-                    await socket.send_multipart(
-                        [b"PROPERTY_RESPONSE",
-                         msgspec.msgpack.encode(response)])
-
-                elif msg_type == "SHUTDOWN":
-                    logger.info("Received shutdown signal")
-                    break
-
-        finally:
-            logger.info("AsyncLLM server shutting down...")
-            if self.async_llm:
-                logger.info("Shutting down AsyncLLM instance...")
-                self.async_llm.shutdown()
-                logger.info("AsyncLLM instance shutdown complete")
-            socket.close()
-            ctx.term()
-            logger.info("AsyncLLM server shutdown complete")
-
-
-def run_async_llm_server(socket_url: str, vllm_config_pickle: bytes,
-                        executor_class_pickle: bytes,
-                        kwargs_pickle: bytes,
-                        parent_pid_for_tty: Optional[int] = None,
-                        parent_tty_slave_fd: Optional[int] = None):
-    """Entry point for the subprocess running AsyncLLM."""
-    # Set up a private controlling TTY if provided by the parent.
-    if parent_pid_for_tty is not None and parent_tty_slave_fd is not None:
-        try:
-            fd_path = f"/proc/{parent_pid_for_tty}/fd/{parent_tty_slave_fd}"
-            tty_fd = os.open(fd_path, os.O_RDWR | os.O_NOCTTY)
-            with contextlib.suppress(Exception):
-                os.setsid()
-            tiocsctty = getattr(termios, 'TIOCSCTTY', 0x540E)
-            with contextlib.suppress(Exception):
-                fcntl.ioctl(tty_fd, tiocsctty, 0)
-            with contextlib.suppress(Exception):
-                os.dup2(tty_fd, 0)
-                os.dup2(tty_fd, 1)
-                os.dup2(tty_fd, 2)
-        except Exception as e:
-            # Fall back to default stdio if anything fails; logs still work.
-            print(f"Failed to set controlling TTY: {e}", file=sys.stderr)
-        finally:
-            with contextlib.suppress(Exception):
-                os.close(tty_fd)  # type: ignore[name-defined]
-
-    # Ensure logger is initialized in subprocess AFTER stdio is set
-    import logging
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    # Start the subprocess
+    process = ctx.Process(
+        target=_create_engine_config_in_subprocess,
+        args=(queue, engine_args_pickle),
+        daemon=True
     )
+    logger.info("Spawning subprocess for isolated config creation...")
+    process.start()
 
+    # Wait for the result
     try:
-        print(f"AsyncLLM server starting on {socket_url}", file=sys.stderr)
+        status, result = queue.get(timeout=60)  # 60 second timeout
+        process.join(timeout=5)  # Wait for process to cleanup
 
-        # Deserialize the configuration
-        vllm_config = cloudpickle.loads(vllm_config_pickle)
-        executor_class = cloudpickle.loads(executor_class_pickle)
-        kwargs = cloudpickle.loads(kwargs_pickle)
+        if status == "error":
+            raise RuntimeError(f"Failed to create engine config in subprocess:\n{result}")
 
-        print(f"Model: {vllm_config.model_config.model}", file=sys.stderr)
-
-        # Create and run the server
-        server = AsyncLLMServer(
-            socket_url,
-            vllm_config,
-            executor_class,
-            **kwargs,
-        )
-
-        # Run the async event loop
-        asyncio.run(server.run())
+        # Unpickle and return the config
+        return cloudpickle.loads(result)
+    except multiprocessing.TimeoutError:
+        # Handle timeout specifically
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        raise TimeoutError("Subprocess timed out while creating engine config")
     except Exception as e:
-        print(f"AsyncLLM server failed: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
+        # Make sure to terminate the subprocess if something goes wrong
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        raise e
 
 
 class CheckpointableAsyncLLM(EngineClient):
@@ -594,10 +187,13 @@ class CheckpointableAsyncLLM(EngineClient):
         client_index: int = 0,
         auto_start: bool = True,
     ) -> None:
+        if auto_start:
+            # Use TCP socket instead of IPC for better CRIU compatibility
+            # Only set these attributes if not restoring (auto_start=True)
+            self.port = get_open_port()
+            self.socket_url = f"tcp://127.0.0.1:{self.port}"
+
         self.vllm_config = vllm_config
-        # Use TCP socket instead of IPC for better CRIU compatibility
-        self.port = get_open_port()
-        self.socket_url = f"tcp://127.0.0.1:{self.port}"
         self.process: Optional[multiprocessing.Process] = None
         self.ctx = zmq.asyncio.Context()
         self.socket: Optional[zmq.asyncio.Socket] = None
@@ -607,8 +203,6 @@ class CheckpointableAsyncLLM(EngineClient):
         # For CRIU TTY forwarding
         self._pty_master_fd: Optional[int] = None
         self._pty_forwarder_thread: Optional[threading.Thread] = None
-        # Track restored process PIDs for cleanup
-        self._restored_pids: set[int] = set()
 
         # Serialize configuration for subprocess
         self.vllm_config_pickle = cloudpickle.dumps(vllm_config)
@@ -671,44 +265,49 @@ class CheckpointableAsyncLLM(EngineClient):
 
     def _connect(self):
         """Connect to the AsyncLLM subprocess."""
-        # Use a synchronous socket for initial connection
+        # Use a synchronous REQ socket for initial connection
         sync_ctx = zmq.Context()
-        sync_socket = sync_ctx.socket(zmq.DEALER)
+        sync_socket = sync_ctx.socket(zmq.REQ)
         sync_socket.connect(self.socket_url)
 
         try:
-            # Send initial hello to establish connection
+            # Send initial hello and wait for acknowledgment
             sync_socket.send(b"HELLO")
             logger.debug("Sent HELLO to subprocess")
+            hello_ack = sync_socket.recv()
+            if hello_ack != b"HELLO_ACK":
+                raise RuntimeError(f"Unexpected HELLO response: {hello_ack}")
+
+            # Now check for readiness
+            sync_socket.send(b"READY_CHECK")
+            logger.debug("Sent READY_CHECK to subprocess")
 
             # Wait for ready signal
-            start_time = time.time()
             timeout = 120  # 2 minutes for initial connection
-            while time.time() - start_time < timeout:
-                if sync_socket.poll(timeout=1000):  # 1 second timeout
-                    msg = sync_socket.recv()
-                    logger.debug("Received message: %s", msg)
-                    if msg == b"READY":
-                        logger.info("Connected to AsyncLLM subprocess")
-                        # Now create the async socket for normal operations
-                        self.socket = self.ctx.socket(zmq.DEALER)
-                        self.socket.connect(self.socket_url)
-                        return
-                # Check if process is still alive
+            # With REQ socket, we just wait for the response
+            if sync_socket.poll(timeout=timeout * 1000):  # Convert to milliseconds
+                msg = sync_socket.recv()
+                logger.debug("Received message: %s", msg)
+                if msg == b"READY":
+                    logger.info("Connected to AsyncLLM subprocess")
+                    # Now create the async socket for normal operations
+                    # Client side of REQ-REP pattern
+                    self.socket = self.ctx.socket(zmq.REQ)
+                    # REQ sockets automatically wait for connection establishment
+                    self.socket.connect(self.socket_url)
+                    return
+                else:
+                    raise RuntimeError(f"Unexpected READY response: {msg}")
+            else:
+                # Poll timed out - check if process is still alive
                 if self.process and not self.process.is_alive():
-                    # Try to get exit code for better error info
                     exit_code = self.process.exitcode
                     raise RuntimeError(
                         f"AsyncLLM subprocess died during startup "
                         f"(exit code: {exit_code})")
-                # Log progress
-                elapsed = time.time() - start_time
-                if int(elapsed) % 10 == 0 and int(elapsed) > 0:
-                    logger.info("Still waiting for AsyncLLM to initialize... "
-                                "(%d seconds elapsed)", int(elapsed))
-            raise TimeoutError(
-                f"Timeout waiting for AsyncLLM subprocess to start "
-                f"after {timeout} seconds")
+                raise TimeoutError(
+                    f"Timeout waiting for AsyncLLM subprocess to start "
+                    f"after {timeout} seconds")
         finally:
             sync_socket.close()
             sync_ctx.term()
@@ -803,16 +402,20 @@ class CheckpointableAsyncLLM(EngineClient):
             is_generator=False
         )
 
-        # Send request
-        await self.socket.send_multipart(
-            [b"RPC", msgspec.msgpack.encode(msg)])
+        # Send request as single message
+        await self.socket.send(b"RPC|" + msgspec.msgpack.encode(msg))
 
         # Wait for response
-        frames = await self.socket.recv_multipart()
-        if frames[0] != b"RPC_RESPONSE":
-            raise RuntimeError(f"Unexpected response type: {frames[0]}")
+        raw_response = await self.socket.recv()
+        # Parse response format: TYPE|PAYLOAD
+        delimiter_idx = raw_response.find(b'|')
+        if delimiter_idx == -1:
+            raise RuntimeError(f"Invalid response format")
+        response_type = raw_response[:delimiter_idx]
+        if response_type != b"RPC_RESPONSE":
+            raise RuntimeError(f"Unexpected response type: {response_type}")
 
-        response = msgspec.msgpack.decode(frames[1], type=RPCResponse)
+        response = msgspec.msgpack.decode(raw_response[delimiter_idx+1:], type=RPCResponse)
         if response.error:
             raise RuntimeError(f"RPC error: {response.error}")
 
@@ -840,15 +443,18 @@ class CheckpointableAsyncLLM(EngineClient):
             is_generator=True
         )
 
-        await self.socket.send_multipart(
-            [b"RPC", msgspec.msgpack.encode(msg)])
+        await self.socket.send(b"RPC|" + msgspec.msgpack.encode(msg))
 
         # Get initial response
-        frames = await self.socket.recv_multipart()
-        if frames[0] != b"RPC_RESPONSE":
-            raise RuntimeError(f"Unexpected response type: {frames[0]}")
+        raw_response = await self.socket.recv()
+        delimiter_idx = raw_response.find(b'|')
+        if delimiter_idx == -1:
+            raise RuntimeError(f"Invalid response format")
+        response_type = raw_response[:delimiter_idx]
+        if response_type != b"RPC_RESPONSE":
+            raise RuntimeError(f"Unexpected response type: {response_type}")
 
-        response = msgspec.msgpack.decode(frames[1], type=RPCResponse)
+        response = msgspec.msgpack.decode(raw_response[delimiter_idx+1:], type=RPCResponse)
         if response.error:
             raise RuntimeError(f"RPC error: {response.error}")
 
@@ -861,14 +467,17 @@ class CheckpointableAsyncLLM(EngineClient):
                 args_pickle=cloudpickle.dumps((request_id,))
             )
 
-            await self.socket.send_multipart(
-                [b"RPC", msgspec.msgpack.encode(next_msg)])
+            await self.socket.send(b"RPC|" + msgspec.msgpack.encode(next_msg))
 
-            frames = await self.socket.recv_multipart()
-            if frames[0] != b"RPC_RESPONSE":
-                raise RuntimeError(f"Unexpected response type: {frames[0]}")
+            raw_response = await self.socket.recv()
+            delimiter_idx = raw_response.find(b'|')
+            if delimiter_idx == -1:
+                raise RuntimeError(f"Invalid response format")
+            response_type = raw_response[:delimiter_idx]
+            if response_type != b"RPC_RESPONSE":
+                raise RuntimeError(f"Unexpected response type: {response_type}")
 
-            response = msgspec.msgpack.decode(frames[1], type=RPCResponse)
+            response = msgspec.msgpack.decode(raw_response[delimiter_idx+1:], type=RPCResponse)
             if response.error:
                 raise RuntimeError(f"RPC error: {response.error}")
 
@@ -891,14 +500,17 @@ class CheckpointableAsyncLLM(EngineClient):
         msg = PropertyRequest(request_id=request_id,
                               property_name=property_name)
 
-        await self.socket.send_multipart(
-            [b"PROPERTY", msgspec.msgpack.encode(msg)])
+        await self.socket.send(b"PROPERTY|" + msgspec.msgpack.encode(msg))
 
-        frames = await self.socket.recv_multipart()
-        if frames[0] != b"PROPERTY_RESPONSE":
-            raise RuntimeError(f"Unexpected response type: {frames[0]}")
+        raw_response = await self.socket.recv()
+        delimiter_idx = raw_response.find(b'|')
+        if delimiter_idx == -1:
+            raise RuntimeError(f"Invalid response format")
+        response_type = raw_response[:delimiter_idx]
+        if response_type != b"PROPERTY_RESPONSE":
+            raise RuntimeError(f"Unexpected response type: {response_type}")
 
-        response = msgspec.msgpack.decode(frames[1], type=PropertyResponse)
+        response = msgspec.msgpack.decode(raw_response[delimiter_idx+1:], type=PropertyResponse)
         if response.error:
             raise RuntimeError(f"Property error: {response.error}")
 
@@ -1100,66 +712,85 @@ class CheckpointableAsyncLLM(EngineClient):
                 "Please delete it before checkpointing."
             ) from err
 
+        # Root of the subprocess tree
+        root_pid = self.process.pid
+
+        # Validate that only leaf processes have CUDA contexts
+        logger.info("Validating CUDA process tree...")
+        valid_cuda_pids, invalid_cuda_pids = validate_cuda_process_tree(root_pid)
+
+        if invalid_cuda_pids:
+            # Collect detailed info about invalid processes
+            invalid_info = []
+            for pid in invalid_cuda_pids:
+                try:
+                    cmdline = read_cmdline(pid)
+                    comm = read_comm(pid)
+                    invalid_info.append(f"PID {pid} ({comm}): {cmdline}")
+                except Exception:
+                    invalid_info.append(f"PID {pid}")
+
+            raise RuntimeError(
+                f"Cannot checkpoint: found {len(invalid_cuda_pids)} non-leaf "
+                f"process(es) with CUDA contexts (mapped /dev/nvidia* FDs). "
+                f"Only leaf processes are allowed to have CUDA contexts.\n"
+                f"Invalid processes:\n" + "\n".join(invalid_info)
+            )
+
+        logger.info("Found %d leaf processes with CUDA contexts: %s",
+                    len(valid_cuda_pids), valid_cuda_pids)
+
         # Sleep the model (level 1) to free GPU memory before checkpointing
         logger.info("Putting model to sleep (level 1) before checkpoint...")
         await self.sleep(level=1)
         logger.info("Model sleep completed")
 
-        # Root of the subprocess tree
-        root_pid = self.process.pid
+        # Attempt CUDA checkpoint on ALL processes with /dev/nvidia* FDs
+        if valid_cuda_pids:
+            logger.info("CUDA checkpoint: attempting cuCheckpoint on PIDs with nvidia FDs: %s",
+                        valid_cuda_pids)
+            succeeded, failed = checkpoint_cuda_processes_from_pids(valid_cuda_pids)
 
-        # Attempt CUDA checkpoint on all PIDs in the process tree. This will
-        # cover workers and any parent process that might hold CUDA contexts.
-        all_pids = sorted(_collect_process_tree_pids(root_pid))
-        logger.info("CUDA checkpoint: attempting cuCheckpoint on PIDs: %s",
-                    all_pids)
-        if not cuda_available:
-            raise RuntimeError(
-                "cuda-python is not installed; install 'cuda-python' to "
-                "enable CUDA API checkpointing")
-        succeeded: list[int] = []
-        failed: list[tuple[int, str]] = []
-        for pid in all_pids:
-            try:
-                checkpoint_cuda_process(pid)
-                succeeded.append(pid)
-            except Exception as e:
-                failed.append((pid, str(e)))
-                logger.debug("cuCheckpoint failed for PID %d: %s", pid, e)
+            # Format and log results
+            results_summary = format_cuda_checkpoint_results(succeeded, failed)
+            logger.info(results_summary)
 
-        logger.info("CUDA checkpoint succeeded for PIDs: %s", succeeded)
-        if failed:
-            logger.warning(
-                "CUDA checkpoint skipped/failed for PIDs (likely no CUDA context): %s",
-                failed)
+            if failed:
+                logger.warning("Some CUDA checkpoints failed. This may prevent successful checkpoint.")
 
-        # Verify device FDs for diagnostics (they may remain open and be
-        # handled by CRIU's CUDA plugin; this is informational only)
-        remaining_nvidia_pids = [pid for pid in succeeded
-                                 if _process_has_nvidia_fd(pid)]
-        if remaining_nvidia_pids:
-            logger.warning(
-                "After CUDA API checkpoint, these PIDs still have /dev/nvidia* "
-                "FDs open: %s. This can be normal; CRIU's CUDA plugin handles "
-                "device FDs.",
-                remaining_nvidia_pids)
+            # Verify that CUDA checkpoint actually worked
+            # After checkpoint, NO processes should have /dev/nvidia* FDs
+            remaining_nvidia_pids = get_processes_with_nvidia_fds(succeeded)
+            if remaining_nvidia_pids:
+                raise RuntimeError(
+                    f"CUDA checkpoint failed: {len(remaining_nvidia_pids)} process(es) "
+                    f"still have /dev/nvidia* FDs after checkpoint. PIDs: {remaining_nvidia_pids}. "
+                    f"This indicates the CUDA checkpoint did not work properly."
+                )
 
-        # Wait until all NVIDIA FDs are closed in the entire process tree.
-        logger.info("Waiting for all /dev/nvidia* FDs in process tree to close...")
-        still_open = _wait_until_no_nvidia_fds(root_pid)
-        if still_open:
-            raise RuntimeError(
-                f"Timeout waiting for NVIDIA FDs to close. PIDs: {still_open}")
+        else:
+            logger.info("No processes with CUDA contexts found")
+
+        # Assert that all NVIDIA FDs are closed in the entire process tree
+        # This is critical - if any process still has NVIDIA FDs, CRIU will fail
+        assert_no_nvidia_fds_in_tree(root_pid)
         logger.info("All /dev/nvidia* FDs closed; proceeding to CRIU dump")
 
-        # Get TTY info from the subprocess and persist it for restore
-        rdev, dev = _get_tty_info(root_pid)
-        tty_external = f"tty[{rdev}:{dev}]" if rdev and dev else ""
-        if tty_external:
-            _save_tty_id(checkpoint_dir, rdev, dev)
+        # Create checkpoint metadata
+        metadata = CheckpointMetadata()
+
+        # Get TTY info from the subprocess
+        rdev, dev = get_tty_info(root_pid)
+        metadata.tty_rdev = rdev
+        metadata.tty_dev = dev
+
+        # Save process tree info
+        metadata.tree_pid = root_pid
+        metadata.zmq_port = self.port
+        metadata.cuda_pids = valid_cuda_pids if valid_cuda_pids else []
 
         # Take a snapshot of the process tree (for post-dump verification)
-        pre_dump_tree = _collect_process_tree_pids(root_pid)
+        pre_dump_tree = collect_process_tree_pids(root_pid)
 
         # Build CRIU dump command
         cmd = [
@@ -1176,8 +807,8 @@ class CheckpointableAsyncLLM(EngineClient):
             "--tree", str(root_pid)
         ]
 
-        if tty_external:
-            cmd.extend(["--external", tty_external])
+        if metadata.tty_external:
+            cmd.extend(["--external", metadata.tty_external])
 
         logger.info("Running CRIU dump: %s", ' '.join(cmd))
 
@@ -1188,8 +819,9 @@ class CheckpointableAsyncLLM(EngineClient):
 
         logger.info(
             "Successfully checkpointed AsyncLLM to %s", checkpoint_dir)
-        # Persist the tree pid so we can wait for its full exit on restore
-        _save_tree_pid(checkpoint_dir, root_pid)
+
+        # Save all metadata to JSON file
+        metadata.save(checkpoint_dir)
 
         # Reap the child process to avoid a zombie holding the PID.
         # This ensures /proc/<pid> disappears if the process is already dead.
@@ -1201,23 +833,7 @@ class CheckpointableAsyncLLM(EngineClient):
 
         # Verify that all processes in the pre-dump tree are gone.
         # This helps catch stray children that might linger due to plugins.
-        deadline = time.time() + 5.0
-        lingering: set[int] = set()
-        while time.time() < deadline:
-            lingering = {
-                pid for pid in pre_dump_tree
-                if os.path.exists(f"/proc/{pid}")
-            }
-            if not lingering:
-                break
-            time.sleep(0.05)
-        if lingering:
-            logger.error(
-                "CRIU dump verification: lingering PIDs: %s",
-                sorted(lingering),
-            )
-        else:
-            logger.info("CRIU dump verification: all pre-dump PIDs exited")
+        lingering_pids = verify_processes_exited(pre_dump_tree)
 
         # The process is now frozen, mark it as not running
         self._is_running = False
@@ -1244,22 +860,30 @@ class CheckpointableAsyncLLM(EngineClient):
             raise RuntimeError(
                 "No checkpoint directory set. Call criu_checkpoint first.")
 
-        # Load the TTY id used during dump (if any)
-        tty_external = _load_tty_id(self.checkpoint_dir)
+        # Load checkpoint metadata
+        metadata = CheckpointMetadata.load(self.checkpoint_dir)
+        if metadata is None:
+            raise RuntimeError(
+                f"Could not load checkpoint metadata from {self.checkpoint_dir}")
+
+        # Use the saved port from checkpoint
+        assert metadata.zmq_port is not None
+        self.port = metadata.zmq_port
+        self.socket_url = f"tcp://127.0.0.1:{self.port}"
+        logger.info("Using saved port %d from checkpoint", self.port)
 
         # Ensure the original tree PID from dump is fully gone to avoid
         # PID collisions when restoring into the same PID namespace.
-        original_pid = _load_tree_pid(self.checkpoint_dir)
-        if original_pid:
+        if metadata.tree_pid:
             start = time.time()
             # Wait up to a short grace period since dump should have killed it
             while time.time() - start < 5.0:
-                if os.system(f"kill -0 {original_pid} >/dev/null 2>&1") != 0:
+                if os.system(f"kill -0 {metadata.tree_pid} >/dev/null 2>&1") != 0:
                     break
                 await asyncio.sleep(0.05)
 
             # Verify root PID is not taken now (PID could be reused by others)
-            pid_path = f"/proc/{original_pid}"
+            pid_path = f"/proc/{metadata.tree_pid}"
             if os.path.exists(pid_path):
                 # Try to read the cmdline of the holder for diagnostics
                 holder = ""
@@ -1272,7 +896,7 @@ class CheckpointableAsyncLLM(EngineClient):
                     holder = ""
                 msg = (
                     "CRIU restore pre-check failed: root PID "
-                    f"{original_pid} is in use in current PID namespace. "
+                    f"{metadata.tree_pid} is in use in current PID namespace. "
                     "Restore will fail with EEXIST. Consider restoring in a "
                     "new PID namespace or wait until the PID is free."
                 )
@@ -1307,13 +931,13 @@ class CheckpointableAsyncLLM(EngineClient):
         pass_fds = ()
         pty_master_fd = None
         pty_slave_fd = None
-        if tty_external:
+        if metadata.tty_external:
             try:
                 pty_master_fd, pty_slave_fd = pty.openpty()
                 os.set_inheritable(pty_slave_fd, True)
                 # Map the saved tty id to the pty slave fd in CRIU
                 cmd.extend([
-                    "--inherit-fd", f"fd[{pty_slave_fd}]:{tty_external}",
+                    "--inherit-fd", f"fd[{pty_slave_fd}]:{metadata.tty_external}",
                 ])
                 pass_fds = (pty_slave_fd,)
             except Exception as e:
@@ -1332,25 +956,35 @@ class CheckpointableAsyncLLM(EngineClient):
 
         logger.info("Successfully restored AsyncLLM from checkpoint")
 
-        # Wait a bit for the process to fully restore
-        await asyncio.sleep(1)
-
-        # Find all processes using our ZMQ port
-        self._restored_pids = self._find_processes_using_port(self.port)
-        if self._restored_pids:
-            logger.info("Found restored processes: %s",
-                        sorted(self._restored_pids))
-        else:
-            logger.warning("Could not find restored processes using port %d",
-                           self.port)
-
         # Re-establish connection to the restored process
         self._is_running = True
         # Mark subprocess as started after restore
         self._subprocess_started = True
-        # Just create socket, don't do handshake (server is already running)
-        self.socket = self.ctx.socket(zmq.DEALER)
+
+        # Create new socket and perform reconnection handshake
+        # Re-establish client side of REQ-REP pattern
+        self.socket = self.ctx.socket(zmq.REQ)
+        # REQ sockets automatically wait for connection establishment
         self.socket.connect(self.socket_url)
+
+        # Send reconnection signal and wait for acknowledgment
+        logger.info("Sending reconnection signal to restored process...")
+
+        # With REQ-REP pattern, the socket will block until connected
+        # This should succeed on the first attempt
+        await self.socket.send(b"RECONNECT")
+        logger.info("Waiting for reconnection acknowledgment...")
+
+        # REQ socket will wait for the response
+        # Use a generous timeout for post-restore initialization
+        if await self.socket.poll(timeout=5000):  # 5 second timeout
+            ack = await self.socket.recv()
+            if ack == b"RECONNECT_ACK":
+                logger.info("Reconnection acknowledged by server")
+            else:
+                raise ValueError(f"Unexpected reconnection response: {ack}")
+        else:
+            raise TimeoutError("No response to reconnection signal after 30 seconds")
 
         # Wake up the model to restore GPU memory
         logger.info("Waking up model after restore...")
@@ -1382,12 +1016,18 @@ class CheckpointableAsyncLLM(EngineClient):
             try:
                 # Create a synchronous context for shutdown
                 sync_ctx = zmq.Context()
-                sync_socket = sync_ctx.socket(zmq.DEALER)
+                sync_socket = sync_ctx.socket(zmq.REQ)
                 sync_socket.connect(self.socket_url)
 
-                # Send shutdown signal
-                sync_socket.send_multipart([b"SHUTDOWN"])
+                # Send shutdown signal and wait for acknowledgment
+                sync_socket.send(b"SHUTDOWN")
                 logger.info("Sent SHUTDOWN signal to AsyncLLM subprocess")
+                # Wait for acknowledgment with timeout
+                if sync_socket.poll(timeout=5000):  # 5 second timeout
+                    ack = sync_socket.recv()
+                    logger.debug("Received shutdown acknowledgment: %s", ack)
+                else:
+                    logger.warning("No shutdown acknowledgment received")
 
                 # If we have a process reference (normal operation), wait for it
                 if self.process and self.process.is_alive():
@@ -1435,51 +1075,6 @@ class CheckpointableAsyncLLM(EngineClient):
     def __del__(self):
         self.shutdown()
 
-    def _find_processes_using_port(self, port: int) -> set[int]:
-        """Find all processes using the given TCP port.
-
-        Returns a set of PIDs that have connections to the port.
-        """
-        pids = set()
-        try:
-            # Use lsof to find processes using the port
-            result = subprocess.run(
-                ['lsof', '-ti', f'tcp:{port}'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0 and result.stdout:
-                for line in result.stdout.strip().split('\n'):
-                    try:
-                        pid = int(line.strip())
-                        pids.add(pid)
-                    except ValueError:
-                        continue
-        except Exception as e:
-            logger.warning("Could not find processes using port %d: %s",
-                           port, e)
-
-        # Alternative: check /proc/*/net/tcp for our port
-        if not pids:
-            try:
-                port_hex = f"{port:04X}"
-                # Check all processes
-                for pid_dir in os.listdir("/proc"):
-                    if not pid_dir.isdigit():
-                        continue
-                    try:
-                        tcp_path = f"/proc/{pid_dir}/net/tcp"
-                        if os.path.exists(tcp_path):
-                            with open(tcp_path) as f:
-                                content = f.read()
-                                if port_hex in content:
-                                    pids.add(int(pid_dir))
-                    except Exception:
-                        continue
-            except Exception as e:
-                logger.debug("Alternative port check failed: %s", e)
-
-        return pids
 
     # ----- Internal helpers for CRIU PTY forwarding -----
     def _start_pty_forwarder(self, master_fd: int) -> None:
@@ -1564,8 +1159,22 @@ class CheckpointableAsyncLLM(EngineClient):
         stat_loggers: Optional[list[StatLoggerFactory]] = None,
         auto_start: bool = True,
     ) -> "CheckpointableAsyncLLM":
-        """Create CheckpointableAsyncLLM from EngineArgs."""
-        vllm_config = engine_args.create_engine_config(usage_context)
+        """Create CheckpointableAsyncLLM from EngineArgs.
+
+        Args:
+            engine_args: Engine configuration arguments
+            start_engine_loop: Whether to start the engine loop
+            usage_context: Usage context for the engine
+            stat_loggers: Optional stat logger factories
+            auto_start: Whether to automatically start the subprocess
+            port: Optional port to use for ZMQ connection (for restore)
+
+        Returns:
+            CheckpointableAsyncLLM instance
+        """
+        assert engine_args.enable_sleep_mode, "Sleep mode must be enabled for omitting KV cache from image."
+        vllm_config = create_engine_config_isolated(engine_args)
+
         return cls(
             vllm_config=vllm_config,
             executor_class=Executor.get_class(vllm_config),
