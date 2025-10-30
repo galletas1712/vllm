@@ -813,3 +813,65 @@ def update_config(config: DataclassInstanceT,
                 value)
         processed_overrides[field_name] = value
     return replace(config, **processed_overrides)
+
+
+@dataclass
+class LiteVllmConfig:
+    """NOTE: quant_config in particular is missing because it initializes the CUDA context.
+    It is created in VllmConfig.__post_init__ anyways.
+    """
+    model_config: ModelConfig
+    cache_config: CacheConfig
+    parallel_config: ParallelConfig
+    scheduler_config: SchedulerConfig
+    device_config: DeviceConfig
+    load_config: LoadConfig
+    lora_config: Optional[LoRAConfig]
+    speculative_config: Optional[SpeculativeConfig]
+    structured_outputs_config: StructuredOutputsConfig
+    observability_config: Optional[ObservabilityConfig]
+    compilation_config: CompilationConfig
+    kv_transfer_config: Optional[KVTransferConfig]
+    kv_events_config: Optional[KVEventsConfig]
+    additional_config: dict[str, Any]
+
+    @classmethod
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> "LiteVllmConfig":
+        return cls(
+            model_config=vllm_config.model_config,
+            cache_config=vllm_config.cache_config,
+            parallel_config=vllm_config.parallel_config,
+            scheduler_config=vllm_config.scheduler_config,
+            device_config=vllm_config.device_config,
+            load_config=vllm_config.load_config,
+            lora_config=vllm_config.lora_config,
+            speculative_config=vllm_config.speculative_config,
+            structured_outputs_config=vllm_config.structured_outputs_config,
+            observability_config=vllm_config.observability_config,
+            compilation_config=vllm_config.compilation_config,
+            kv_transfer_config=vllm_config.kv_transfer_config,
+            kv_events_config=vllm_config.kv_events_config,
+            additional_config=vllm_config.additional_config,
+        )
+
+    def to_vllm_config(self) -> VllmConfig:
+        """Instantiates the actual VllmConfig, which will run __post_init__
+        and instantiate the CUDA context.
+        """
+        return VllmConfig(
+            model_config=self.model_config,
+            cache_config=self.cache_config,
+            parallel_config=self.parallel_config,
+            scheduler_config=self.scheduler_config,
+            device_config=self.device_config,
+            lora_config=self.lora_config,
+            speculative_config=self.speculative_config,
+            load_config=self.load_config,
+            structured_outputs_config=self.structured_outputs_config,
+            observability_config=self.observability_config,
+            compilation_config=self.compilation_config,
+            kv_transfer_config=self.kv_transfer_config,
+            kv_events_config=self.kv_events_config,
+            additional_config=self.additional_config,
+        )
+

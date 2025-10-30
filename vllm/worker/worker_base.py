@@ -203,6 +203,9 @@ class WorkerWrapperBase:
         self.vllm_config = kwargs.get("vllm_config")
         assert self.vllm_config is not None, (
             "vllm_config is required to initialize the worker")
+        if not isinstance(self.vllm_config, VllmConfig):
+            self.vllm_config = self.vllm_config.to_vllm_config()
+            kwargs["vllm_config"] = self.vllm_config
         enable_trace_function_call_for_thread(self.vllm_config)
 
         from vllm.plugins import load_general_plugins

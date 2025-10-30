@@ -584,7 +584,7 @@ class EngineCoreProc(EngineCore):
                 yield addresses
 
         # Update config which may have changed from the handshake
-        vllm_config.__post_init__()
+        # vllm_config.__post_init__()
 
     @contextmanager
     def _perform_handshake(

@@ -637,7 +637,7 @@ class CheckpointableAsyncLLM(EngineClient):
             logger.warning("Subprocess already started")
             return
 
-        ctx = multiprocessing.get_context('fork')
+        ctx = multiprocessing.get_context('spawn')
         # Note: daemon=False is required because AsyncLLM may need to spawn
         # its own child processes (e.g., DPCoordinator for data parallel)
         # Create a private PTY for the child so it can become a session leader
