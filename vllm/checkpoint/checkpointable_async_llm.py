@@ -9,10 +9,8 @@ import os
 import pty
 import subprocess
 import sys
-import termios
 import threading
 import time
-import traceback
 import uuid
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any, Optional, Union
@@ -44,6 +42,11 @@ from vllm.checkpoint.utils import (
     validate_cuda_process_tree, get_processes_with_nvidia_fds,
     assert_no_nvidia_fds_in_tree, format_cuda_checkpoint_results,
     checkpoint_cuda_processes_from_pids,
+    format_cuda_restore_results,
+    restore_cuda_processes_from_pids,
+    ensure_dummy_criu_libdir,
+    snapshot_dev_shm_files_for_tree,
+    precreate_dev_shm_files,
     read_comm, read_cmdline, collect_process_tree_pids,
     verify_processes_exited, get_tty_info,
 )
@@ -789,6 +792,14 @@ class CheckpointableAsyncLLM(EngineClient):
         metadata.zmq_port = self.port
         metadata.cuda_pids = valid_cuda_pids if valid_cuda_pids else []
 
+        # Snapshot of open /dev/shm files across the process tree so we can
+        # pre-create them before CRIU restore. Some libraries (e.g., NCCL/Gloo
+        # or other IPC backends) use POSIX shm segments under /dev/shm, which
+        # CRIU expects to exist when restoring usual regular file descriptors.
+        # If these are absent at restore time, CRIU may fail with messages like
+        # "Can't open file dev/shm/<name>". We record their names/sizes here.
+        metadata.dev_shm_files = snapshot_dev_shm_files_for_tree(root_pid)
+
         # Take a snapshot of the process tree (for post-dump verification)
         pre_dump_tree = collect_process_tree_pids(root_pid)
 
@@ -801,11 +812,19 @@ class CheckpointableAsyncLLM(EngineClient):
             "-v4",
             "--ext-unix-sk",
             "--tcp-established",
-            "--external", "mnt[shm]:/dev/shm",
+            "--external", "mnt[/dev/shm]:shm",
             "--link-remap",
+            "--ghost-limit", "512M",
             "--manage-cgroups=ignore",
             "--tree", str(root_pid)
         ]
+
+        # Force CRIU to skip CUDA plugin discovery by using an empty libdir
+        try:
+            dump_libdir = ensure_dummy_criu_libdir(checkpoint_dir)
+            cmd.extend(["--libdir", dump_libdir])
+        except Exception as e:
+            logger.warning("Failed to configure dummy --libdir for CRIU dump: %s", e)
 
         if metadata.tty_external:
             cmd.extend(["--external", metadata.tty_external])
@@ -925,6 +944,13 @@ class CheckpointableAsyncLLM(EngineClient):
             "--manage-cgroups=ignore",
         ]
 
+        # Force CRIU to skip CUDA plugin discovery by using an empty libdir
+        try:
+            libdir = ensure_dummy_criu_libdir(self.checkpoint_dir)
+            cmd.extend(["--libdir", libdir])
+        except Exception as e:
+            logger.warning("Failed to configure dummy --libdir for CRIU: %s", e)
+
         # Provide a valid TTY to CRIU using a Python-created pty, so we can
         # mirror logs back to this terminal and support non-TTY parents.
         # We pass the pty slave fd to CRIU and map it to the saved TTY id.
@@ -946,6 +972,10 @@ class CheckpointableAsyncLLM(EngineClient):
         logger.info("Running CRIU restore: %s", ' '.join(cmd))
 
         # Run CRIU restore
+        # Pre-create any /dev/shm files that were open at checkpoint time, so
+        # CRIU can reopen them as regular files on the tmpfs mount.
+        precreate_dev_shm_files(getattr(metadata, "dev_shm_files", []) or [])
+
         if pass_fds:
             result = subprocess.run(cmd, capture_output=True, text=True,
                                     pass_fds=pass_fds)
@@ -955,6 +985,21 @@ class CheckpointableAsyncLLM(EngineClient):
             raise RuntimeError(f"CRIU restore failed: {result.stderr}")
 
         logger.info("Successfully restored AsyncLLM from checkpoint")
+
+        # Restore and unlock CUDA contexts via CUDA API, since CRIU CUDA plugin is disabled
+        cuda_pids = getattr(metadata, "cuda_pids", []) or []
+        if cuda_pids:
+            logger.info(
+                "CUDA restore/unlock: attempting cuCheckpoint restore/unlock on PIDs: %s",
+                cuda_pids,
+            )
+            succeeded, failed = restore_cuda_processes_from_pids(cuda_pids)
+            results_summary = format_cuda_restore_results(succeeded, failed)
+            logger.info(results_summary)
+            if failed:
+                logger.warning(
+                    "Some CUDA restore/unlock operations failed; subsequent GPU operations may fail."
+                )
 
         # Re-establish connection to the restored process
         self._is_running = True

@@ -189,6 +189,31 @@ def checkpoint_cuda_process(pid: int) -> None:
     logger.info("CUDA process checkpointed")
 
 
+def restore_cuda_process(pid: int) -> None:
+    """Restore a CUDA process using the CUDA checkpoint API."""
+    if not cuda_available:
+        raise RuntimeError("cuda-python package not available")
+
+    logger.info("Restoring CUDA process (PID: %d)...", pid)
+
+    err, = cuda.cuCheckpointProcessRestore(pid, None)
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        _, name_ptr = cuda.cuGetErrorName(err)
+        error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
+        raise RuntimeError(f"Failed to restore CUDA process: {error_name}")
+    logger.info("CUDA process restored")
+
+    # Unlock the CUDA process
+    logger.info("Unlocking CUDA process (PID: %d)...", pid)
+
+    err, = cuda.cuCheckpointProcessUnlock(pid, None)
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        _, name_ptr = cuda.cuGetErrorName(err)
+        error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
+        raise RuntimeError(f"Failed to unlock CUDA process: {error_name}")
+    logger.info("CUDA process unlocked")
+
+
 def process_has_nvidia_fd(pid: int) -> bool:
     """Check if a process has any NVIDIA device file descriptors open.
 
@@ -355,17 +380,221 @@ def checkpoint_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int]
             "cuda-python is not installed; install 'cuda-python' to "
             "enable CUDA API checkpointing")
 
-    succeeded: list[int] = []
-    failed: list[tuple[int, str]] = []
+    # Two-phase approach for multi-process: lock all, then checkpoint all.
+    # This approximates a cohort-style checkpoint across ranks and avoids
+    # capturing inconsistent cross-process CUDA/NCCL/IPC state.
 
+    locked: list[int] = []
+    lock_failed: list[tuple[int, str]] = []
+
+    # Phase 1: Lock all CUDA processes
     for pid in cuda_pids:
         try:
-            checkpoint_cuda_process(pid)
+            err, = cuda.cuCheckpointProcessLock(pid, None)  # type: ignore[union-attr]
+            if err != cuda.CUresult.CUDA_SUCCESS:  # type: ignore[union-attr]
+                _, name_ptr = cuda.cuGetErrorName(err)  # type: ignore[union-attr]
+                error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
+                raise RuntimeError(f"Failed to lock CUDA process: {error_name}")
+            locked.append(pid)
+        except Exception as e:
+            error_msg = str(e)
+            lock_failed.append((pid, error_msg))
+            logger.debug("cuCheckpoint lock failed for PID %d: %s", pid, error_msg)
+
+    # Phase 2: Checkpoint all locked processes
+    succeeded: list[int] = []
+    failed: list[tuple[int, str]] = list(lock_failed)
+
+    for pid in locked:
+        try:
+            err, = cuda.cuCheckpointProcessCheckpoint(pid, None)  # type: ignore[union-attr]
+            if err != cuda.CUresult.CUDA_SUCCESS:  # type: ignore[union-attr]
+                _, name_ptr = cuda.cuGetErrorName(err)  # type: ignore[union-attr]
+                error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
+                raise RuntimeError(f"Failed to checkpoint CUDA process: {error_name}")
             succeeded.append(pid)
         except Exception as e:
             error_msg = str(e)
             failed.append((pid, error_msg))
-            logger.debug("cuCheckpoint failed for PID %d: %s", pid, error_msg)
+            logger.debug("cuCheckpoint checkpoint failed for PID %d: %s", pid, error_msg)
 
     return succeeded, failed
+
+
+def format_cuda_restore_results(succeeded: list[int],
+                                failed: list[tuple[int, str]]) -> str:
+    """Format CUDA restore/unlock results for logging.
+
+    Args:
+        succeeded: List of PIDs that were successfully restored/unlocked
+        failed: List of (pid, error_message) tuples for failures
+
+    Returns:
+        Formatted string summarizing the results
+    """
+    msg_parts = []
+
+    if succeeded:
+        msg_parts.append(f"CUDA restore/unlock succeeded for {len(succeeded)} PIDs: {succeeded}")
+
+    if failed:
+        msg_parts.append(f"CUDA restore/unlock failed for {len(failed)} PIDs:")
+        for pid, error in failed:
+            msg_parts.append(f"  PID {pid}: {error}")
+
+    return "\n".join(msg_parts)
+
+
+def restore_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int], list[tuple[int, str]]]:
+    """Restore and unlock CUDA processes from a list of PIDs.
+
+    Args:
+        cuda_pids: List of PIDs to restore and unlock
+
+    Returns:
+        Tuple of (succeeded, failed) where:
+        - succeeded: List of PIDs that were successfully restored and unlocked
+        - failed: List of (pid, error_message) tuples for failed operations
+    """
+    if not cuda_pids:
+        return [], []
+
+    if not cuda_available:
+        raise RuntimeError(
+            "cuda-python is not installed; install 'cuda-python' to "
+            "enable CUDA API restore/unlock")
+
+    # Two-phase approach for multi-process restore: restore all, then unlock all.
+    # This mirrors how we checkpoint (lock all, then checkpoint all) and helps
+    # avoid per-rank inconsistencies during restore/unlock.
+
+    restored: list[int] = []
+    restore_failed: list[tuple[int, str]] = []
+
+    # Phase 1: Restore all CUDA processes
+    for pid in cuda_pids:
+        try:
+            err, = cuda.cuCheckpointProcessRestore(pid, None)  # type: ignore[union-attr]
+            if err != cuda.CUresult.CUDA_SUCCESS:  # type: ignore[union-attr]
+                _, name_ptr = cuda.cuGetErrorName(err)  # type: ignore[union-attr]
+                error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
+                raise RuntimeError(f"Failed to restore CUDA process: {error_name}")
+            restored.append(pid)
+        except Exception as e:
+            error_msg = str(e)
+            restore_failed.append((pid, error_msg))
+            logger.debug("cuCheckpoint restore failed for PID %d: %s", pid, error_msg)
+
+    # Phase 2: Unlock all successfully restored processes
+    succeeded: list[int] = []
+    failed: list[tuple[int, str]] = list(restore_failed)
+
+    for pid in restored:
+        try:
+            err, = cuda.cuCheckpointProcessUnlock(pid, None)  # type: ignore[union-attr]
+            if err != cuda.CUresult.CUDA_SUCCESS:  # type: ignore[union-attr]
+                _, name_ptr = cuda.cuGetErrorName(err)  # type: ignore[union-attr]
+                error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
+                raise RuntimeError(f"Failed to unlock CUDA process: {error_name}")
+            succeeded.append(pid)
+        except Exception as e:
+            error_msg = str(e)
+            failed.append((pid, error_msg))
+            logger.debug("cuCheckpoint unlock failed for PID %d: %s", pid, error_msg)
+
+    return succeeded, failed
+
+
+# CRIU helper utilities
+
+def ensure_dummy_criu_libdir(base_dir: str, dir_name: str = "noop-criu-libdir") -> str:
+    """Ensure a dummy libdir exists to prevent CRIU from loading plugins.
+
+    Returns the path to a directory that can be passed via --libdir to CRIU
+    to avoid discovering system-wide plugins such as the CUDA plugin.
+    """
+    path = os.path.join(base_dir, dir_name)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception as e:
+        logger.warning("Failed to create dummy CRIU libdir %s: %s", path, e)
+    return path
+
+
+def snapshot_dev_shm_files_for_tree(root_pid: int) -> list[dict]:
+    """Snapshot open /dev/shm files across a process tree.
+
+    Returns a list of dict entries with keys: name, size, mode.
+    For files opened multiple times with different sizes, the largest size
+    is kept.
+    """
+    dev_shm_files: dict[str, dict] = {}
+    try:
+        tree_pids = collect_process_tree_pids(root_pid)
+        for pid in tree_pids:
+            fd_dir = f"/proc/{pid}/fd"
+            if not os.path.isdir(fd_dir):
+                continue
+            for fd in os.listdir(fd_dir):
+                fd_path = os.path.join(fd_dir, fd)
+                try:
+                    link = os.readlink(fd_path)
+                except Exception:
+                    continue
+                # Normalize deleted marker appended by the kernel
+                if link.endswith(" (deleted)"):
+                    link = link[:-10]
+                if not link.startswith("/dev/shm/"):
+                    continue
+                name = os.path.basename(link)
+                # Stat via fd path to obtain mode/size of the opened file
+                try:
+                    st = os.stat(fd_path)
+                    size = int(getattr(st, "st_size", 0))
+                    mode = int(getattr(st, "st_mode", 0))
+                except Exception:
+                    size = 0
+                    mode = 0o600
+                entry = dev_shm_files.get(name)
+                if entry is None or size > entry.get("size", 0):
+                    dev_shm_files[name] = {"name": name, "size": size, "mode": mode}
+        if dev_shm_files:
+            logger.info("Captured %d /dev/shm files for restore: %s",
+                        len(dev_shm_files), [f["name"] for f in dev_shm_files.values()])
+    except Exception as e:
+        logger.warning("Failed to snapshot /dev/shm files: %s", e)
+    return list(dev_shm_files.values())
+
+
+def precreate_dev_shm_files(files: list[dict]) -> None:
+    """Pre-create /dev/shm files described by snapshot entries.
+
+    Each entry should contain keys: name, size, mode.
+    """
+    try:
+        if files:
+            if not os.path.isdir("/dev/shm"):
+                os.makedirs("/dev/shm", exist_ok=True)
+            for shm in files:
+                name = shm.get("name")
+                if not name:
+                    continue
+                path = os.path.join("/dev/shm", name)
+                # Skip if already exists
+                if os.path.exists(path):
+                    continue
+                mode = int(shm.get("mode", 0o600)) & 0o777
+                size = int(shm.get("size", 0))
+                try:
+                    fd = os.open(path, os.O_CREAT | os.O_RDWR, mode)
+                    if size > 0:
+                        try:
+                            os.ftruncate(fd, size)
+                        except Exception:
+                            pass
+                    os.close(fd)
+                except Exception as e:
+                    logger.warning("Failed to pre-create /dev/shm/%s: %s", name, e)
+    except Exception as e:
+        logger.warning("Error while preparing /dev/shm files: %s", e)
 
