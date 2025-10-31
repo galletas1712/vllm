@@ -15,13 +15,11 @@ Run with: sudo -E python3 test_checkpoint_restore.py
 Or use the provided script: ./test_checkpoint_restore_sudo.sh
 """
 
+import argparse
 import asyncio
 import logging
 import os
 import tempfile
-
-# Use GPU 1
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 # Disable custom all-reduce to avoid CUDA IPC issues with CRIU
 os.environ["VLLM_DISABLE_CUSTOM_ALL_REDUCE"] = "1"
@@ -38,6 +36,86 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_engine_args():
+    """Get standard engine arguments."""
+    return AsyncEngineArgs(
+        model="Qwen/Qwen3-0.6B-FP8",
+        max_model_len=512,
+        disable_custom_all_reduce=True,
+        enable_sleep_mode=True,
+    )
+
+
+async def test_restore_only(checkpoint_dir):
+    """Test restore-only functionality from an existing checkpoint."""
+    print("\n=== Testing Restore-Only Functionality ===\n")
+    print(f"Restoring from checkpoint directory: {checkpoint_dir}")
+
+    if not os.path.exists(checkpoint_dir):
+        raise ValueError(f"Checkpoint directory does not exist: {checkpoint_dir}")
+
+    try:
+        # Phase 1: Create new instance and restore
+        print("\n--- Phase 1: Restoring from checkpoint ---")
+        engine_args = get_engine_args()
+
+        # Create a new instance without auto-starting
+        llm_restored = CheckpointableAsyncLLM.from_engine_args(
+            engine_args,
+            auto_start=False
+        )
+
+        # Set the checkpoint directory
+        llm_restored.checkpoint_dir = checkpoint_dir
+
+        print(f"Restoring from: {checkpoint_dir}")
+        # This internally runs CRIU restore and cuda-checkpoint restore/unlock
+        await llm_restored.criu_resume()
+        print("Restore completed successfully!")
+
+        # Phase 2: Test generation after restore
+        print("\n--- Phase 2: Testing generation after restore ---")
+        test_prompt = "The capital of France is"
+        sampling_params = SamplingParams(
+            temperature=0.0,  # Deterministic
+            max_tokens=10,
+        )
+
+        print(f"Prompt: {test_prompt}")
+        print("Generating...")
+
+        outputs_after = []
+        async for output in llm_restored.generate(
+            test_prompt,
+            sampling_params,
+            request_id="test-after-restore"
+        ):
+            if output.finished:
+                outputs_after.append(output)
+
+        if outputs_after:
+            generated_text_after = outputs_after[-1].outputs[0].text
+            print(f"Generated: {generated_text_after}")
+            assert len(generated_text_after.strip()) > 0, \
+                "No output generated after restore"
+        else:
+            raise RuntimeError("No output received after restore")
+
+        # Cleanup
+        print("\n--- Phase 3: Cleanup ---")
+        llm_restored.shutdown()
+        print("Shutdown complete")
+
+        print("\n=== Test Passed! ===")
+        print("Successfully:")
+        print("- Restored from checkpoint")
+        print("- Generated text after restore")
+        print("- Verified engine remains functional after restore")
+
+    except Exception:
+        raise
+
+
 async def test_checkpoint_restore():
     """Test full checkpoint/restore cycle."""
     print("\n=== Testing Checkpoint/Restore Functionality ===\n")
@@ -51,12 +129,7 @@ async def test_checkpoint_restore():
 
         # Phase 1: Start engine and verify it works
         print("\n--- Phase 1: Starting engine ---")
-        engine_args = AsyncEngineArgs(
-            model="Qwen/Qwen3-0.6B-FP8",
-            max_model_len=512,
-            disable_custom_all_reduce=True,
-            enable_sleep_mode=True
-        )
+        engine_args = get_engine_args()
 
         llm = CheckpointableAsyncLLM.from_engine_args(engine_args)
 
@@ -181,9 +254,34 @@ async def test_checkpoint_restore():
 
 async def main():
     """Run all tests."""
+    parser = argparse.ArgumentParser(
+        description="Test checkpoint/restore functionality of CheckpointableAsyncLLM"
+    )
+    parser.add_argument(
+        "--restore-only",
+        action="store_true",
+        help="Only restore from an existing checkpoint (skip checkpoint creation)"
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        help="Checkpoint directory to restore from (required when --restore-only is used)"
+    )
+
+    args = parser.parse_args()
+
+    # Validate arguments
+    if args.restore_only:
+        if not args.checkpoint_dir:
+            parser.error("--checkpoint-dir is required when --restore-only is used")
+
     try:
-        # Basic checkpoint/restore test
-        await test_checkpoint_restore()
+        if args.restore_only:
+            # Restore-only mode
+            await test_restore_only(args.checkpoint_dir)
+        else:
+            # Full checkpoint/restore test
+            await test_checkpoint_restore()
 
         print("\n🎉 All tests passed!")
 
