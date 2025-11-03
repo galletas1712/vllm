@@ -3,6 +3,7 @@
 """General utilities for checkpoint/restore operations."""
 
 import os
+import subprocess
 import time
 from typing import Optional
 
@@ -10,12 +11,12 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Try to import cuda-python
+# Try to import cuda-python for UUID queries only
 try:
     from cuda import cuda
     cuda_available = True
 except Exception:  # pragma: no cover
-    logger.warning("cuda-python package not found. CUDA checkpointing will not be available. "
+    logger.warning("cuda-python package not found. GPU UUID queries will not be available. "
                    "Install with: pip install cuda-python")
     cuda = None
     cuda_available = False
@@ -165,52 +166,65 @@ def get_tty_info(pid: int) -> tuple[str, str]:
 # CUDA checkpoint utilities
 
 def checkpoint_cuda_process(pid: int) -> None:
-    """Lock and checkpoint a CUDA process using the CUDA checkpoint API."""
-    if not cuda_available:
-        raise RuntimeError("cuda-python package not available")
+    """Lock and checkpoint a CUDA process using the cuda-checkpoint CLI tool."""
+    import subprocess
 
     logger.info("Locking CUDA process (PID: %d)...", pid)
 
     # Lock the CUDA process
-    err, = cuda.cuCheckpointProcessLock(pid, None)
-    if err != cuda.CUresult.CUDA_SUCCESS:
-        _, name_ptr = cuda.cuGetErrorName(err)
-        error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
-        raise RuntimeError(f"Failed to lock CUDA process: {error_name}")
+    result = subprocess.run(
+        ["cuda-checkpoint", "--action", "lock", "--pid", str(pid)],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to lock CUDA process: {result.stderr}")
     logger.info("CUDA process locked")
 
     # Checkpoint the CUDA process
     logger.info("Checkpointing CUDA process (PID: %d)...", pid)
-    err, = cuda.cuCheckpointProcessCheckpoint(pid, None)
-    if err != cuda.CUresult.CUDA_SUCCESS:
-        _, name_ptr = cuda.cuGetErrorName(err)
-        error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
-        raise RuntimeError(f"Failed to checkpoint CUDA process: {error_name}")
+    result = subprocess.run(
+        ["cuda-checkpoint", "--action", "checkpoint", "--pid", str(pid)],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to checkpoint CUDA process: {result.stderr}")
     logger.info("CUDA process checkpointed")
 
 
-def restore_cuda_process(pid: int) -> None:
-    """Restore a CUDA process using the CUDA checkpoint API."""
-    if not cuda_available:
-        raise RuntimeError("cuda-python package not available")
+def restore_cuda_process(pid: int, device_map: Optional[str] = None) -> None:
+    """Restore a CUDA process using the cuda-checkpoint CLI tool.
+
+    Args:
+        pid: Process ID to restore
+        device_map: Optional device map string in format "oldUuid1=newUuid1,oldUuid2=newUuid2,..."
+    """
+    import subprocess
 
     logger.info("Restoring CUDA process (PID: %d)...", pid)
 
-    err, = cuda.cuCheckpointProcessRestore(pid, None)
-    if err != cuda.CUresult.CUDA_SUCCESS:
-        _, name_ptr = cuda.cuGetErrorName(err)
-        error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
-        raise RuntimeError(f"Failed to restore CUDA process: {error_name}")
+    # Build restore command
+    cmd = ["cuda-checkpoint", "--action", "restore", "--pid", str(pid)]
+    if device_map:
+        cmd.extend(["--device-map", device_map])
+        logger.info("Using device map for GPU migration: %s", device_map)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to restore CUDA process: {result.stderr}")
     logger.info("CUDA process restored")
 
     # Unlock the CUDA process
     logger.info("Unlocking CUDA process (PID: %d)...", pid)
 
-    err, = cuda.cuCheckpointProcessUnlock(pid, None)
-    if err != cuda.CUresult.CUDA_SUCCESS:
-        _, name_ptr = cuda.cuGetErrorName(err)
-        error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
-        raise RuntimeError(f"Failed to unlock CUDA process: {error_name}")
+    result = subprocess.run(
+        ["cuda-checkpoint", "--action", "unlock", "--pid", str(pid)],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to unlock CUDA process: {result.stderr}")
     logger.info("CUDA process unlocked")
 
 
@@ -359,7 +373,7 @@ def format_cuda_checkpoint_results(succeeded: list[int],
 
 
 def checkpoint_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int], list[tuple[int, str]]]:
-    """Checkpoint CUDA processes from a list of PIDs.
+    """Checkpoint CUDA processes from a list of PIDs using cuda-checkpoint CLI.
 
     This function attempts to checkpoint each CUDA process and returns
     success/failure results.
@@ -375,10 +389,7 @@ def checkpoint_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int]
     if not cuda_pids:
         return [], []
 
-    if not cuda_available:
-        raise RuntimeError(
-            "cuda-python is not installed; install 'cuda-python' to "
-            "enable CUDA API checkpointing")
+    import subprocess
 
     # Two-phase approach for multi-process: lock all, then checkpoint all.
     # This approximates a cohort-style checkpoint across ranks and avoids
@@ -390,16 +401,18 @@ def checkpoint_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int]
     # Phase 1: Lock all CUDA processes
     for pid in cuda_pids:
         try:
-            err, = cuda.cuCheckpointProcessLock(pid, None)  # type: ignore[union-attr]
-            if err != cuda.CUresult.CUDA_SUCCESS:  # type: ignore[union-attr]
-                _, name_ptr = cuda.cuGetErrorName(err)  # type: ignore[union-attr]
-                error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
-                raise RuntimeError(f"Failed to lock CUDA process: {error_name}")
+            result = subprocess.run(
+                ["cuda-checkpoint", "--action", "lock", "--pid", str(pid)],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to lock CUDA process: {result.stderr}")
             locked.append(pid)
         except Exception as e:
             error_msg = str(e)
             lock_failed.append((pid, error_msg))
-            logger.debug("cuCheckpoint lock failed for PID %d: %s", pid, error_msg)
+            logger.debug("cuda-checkpoint lock failed for PID %d: %s", pid, error_msg)
 
     # Phase 2: Checkpoint all locked processes
     succeeded: list[int] = []
@@ -407,16 +420,18 @@ def checkpoint_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int]
 
     for pid in locked:
         try:
-            err, = cuda.cuCheckpointProcessCheckpoint(pid, None)  # type: ignore[union-attr]
-            if err != cuda.CUresult.CUDA_SUCCESS:  # type: ignore[union-attr]
-                _, name_ptr = cuda.cuGetErrorName(err)  # type: ignore[union-attr]
-                error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
-                raise RuntimeError(f"Failed to checkpoint CUDA process: {error_name}")
+            result = subprocess.run(
+                ["cuda-checkpoint", "--action", "checkpoint", "--pid", str(pid)],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to checkpoint CUDA process: {result.stderr}")
             succeeded.append(pid)
         except Exception as e:
             error_msg = str(e)
             failed.append((pid, error_msg))
-            logger.debug("cuCheckpoint checkpoint failed for PID %d: %s", pid, error_msg)
+            logger.debug("cuda-checkpoint checkpoint failed for PID %d: %s", pid, error_msg)
 
     return succeeded, failed
 
@@ -445,11 +460,12 @@ def format_cuda_restore_results(succeeded: list[int],
     return "\n".join(msg_parts)
 
 
-def restore_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int], list[tuple[int, str]]]:
-    """Restore and unlock CUDA processes from a list of PIDs.
+def restore_cuda_processes_from_pids(cuda_pids: list[int], device_map: Optional[str] = None) -> tuple[list[int], list[tuple[int, str]]]:
+    """Restore and unlock CUDA processes from a list of PIDs using cuda-checkpoint CLI.
 
     Args:
         cuda_pids: List of PIDs to restore and unlock
+        device_map: Optional device map string for GPU migration
 
     Returns:
         Tuple of (succeeded, failed) where:
@@ -459,10 +475,7 @@ def restore_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int], l
     if not cuda_pids:
         return [], []
 
-    if not cuda_available:
-        raise RuntimeError(
-            "cuda-python is not installed; install 'cuda-python' to "
-            "enable CUDA API restore/unlock")
+    import subprocess
 
     # Two-phase approach for multi-process restore: restore all, then unlock all.
     # This mirrors how we checkpoint (lock all, then checkpoint all) and helps
@@ -474,16 +487,18 @@ def restore_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int], l
     # Phase 1: Restore all CUDA processes
     for pid in cuda_pids:
         try:
-            err, = cuda.cuCheckpointProcessRestore(pid, None)  # type: ignore[union-attr]
-            if err != cuda.CUresult.CUDA_SUCCESS:  # type: ignore[union-attr]
-                _, name_ptr = cuda.cuGetErrorName(err)  # type: ignore[union-attr]
-                error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
-                raise RuntimeError(f"Failed to restore CUDA process: {error_name}")
+            cmd = ["cuda-checkpoint", "--action", "restore", "--pid", str(pid)]
+            if device_map:
+                cmd.extend(["--device-map", device_map])
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to restore CUDA process: {result.stderr}")
             restored.append(pid)
         except Exception as e:
             error_msg = str(e)
             restore_failed.append((pid, error_msg))
-            logger.debug("cuCheckpoint restore failed for PID %d: %s", pid, error_msg)
+            logger.debug("cuda-checkpoint restore failed for PID %d: %s", pid, error_msg)
 
     # Phase 2: Unlock all successfully restored processes
     succeeded: list[int] = []
@@ -491,16 +506,18 @@ def restore_cuda_processes_from_pids(cuda_pids: list[int]) -> tuple[list[int], l
 
     for pid in restored:
         try:
-            err, = cuda.cuCheckpointProcessUnlock(pid, None)  # type: ignore[union-attr]
-            if err != cuda.CUresult.CUDA_SUCCESS:  # type: ignore[union-attr]
-                _, name_ptr = cuda.cuGetErrorName(err)  # type: ignore[union-attr]
-                error_name = name_ptr.decode() if isinstance(name_ptr, bytes) else str(name_ptr)
-                raise RuntimeError(f"Failed to unlock CUDA process: {error_name}")
+            result = subprocess.run(
+                ["cuda-checkpoint", "--action", "unlock", "--pid", str(pid)],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to unlock CUDA process: {result.stderr}")
             succeeded.append(pid)
         except Exception as e:
             error_msg = str(e)
             failed.append((pid, error_msg))
-            logger.debug("cuCheckpoint unlock failed for PID %d: %s", pid, error_msg)
+            logger.debug("cuda-checkpoint unlock failed for PID %d: %s", pid, error_msg)
 
     return succeeded, failed
 
@@ -597,4 +614,95 @@ def precreate_dev_shm_files(files: list[dict]) -> None:
                     logger.warning("Failed to pre-create /dev/shm/%s: %s", name, e)
     except Exception as e:
         logger.warning("Error while preparing /dev/shm files: %s", e)
+
+
+# GPU UUID helper functions
+
+def get_gpu_uuids() -> list[str]:
+    """Get UUIDs of all visible GPUs.
+
+    Returns:
+        List of GPU UUIDs as strings in cuda-checkpoint format:
+        "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        Empty list if no GPUs available or error occurs.
+    """
+    if not cuda_available:
+        logger.warning("cuda-python not available, cannot get GPU UUIDs")
+        return []
+
+    try:
+        # Initialize CUDA
+        err, = cuda.cuInit(0)
+        if err != cuda.CUresult.CUDA_SUCCESS:
+            logger.warning("Failed to initialize CUDA: %s", err)
+            return []
+
+        # Get device count
+        err, device_count = cuda.cuDeviceGetCount()
+        if err != cuda.CUresult.CUDA_SUCCESS:
+            logger.warning("Failed to get CUDA device count: %s", err)
+            return []
+
+        uuids = []
+        for i in range(device_count):
+            # Get device UUID
+            err, uuid = cuda.cuDeviceGetUuid(i)
+            if err != cuda.CUresult.CUDA_SUCCESS:
+                logger.warning("Failed to get UUID for device %d: %s", i, err)
+                continue
+
+            # Convert UUID bytes to cuda-checkpoint format
+            # Format: GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+            b = uuid.bytes
+            uuid_str = (
+                f"GPU-{b[0]:02x}{b[1]:02x}{b[2]:02x}{b[3]:02x}-"
+                f"{b[4]:02x}{b[5]:02x}-{b[6]:02x}{b[7]:02x}-"
+                f"{b[8]:02x}{b[9]:02x}-{b[10]:02x}{b[11]:02x}{b[12]:02x}{b[13]:02x}{b[14]:02x}{b[15]:02x}"
+            )
+            uuids.append(uuid_str)
+
+        return uuids
+    except Exception as e:
+        logger.warning("Error getting GPU UUIDs: %s", e)
+        return []
+
+
+def create_gpu_device_map(old_uuids: list[str],
+                         new_uuids: list[str]) -> Optional[str]:
+    """Create GPU device map string for cuda-checkpoint restore.
+
+    This function maps old GPU UUIDs to new GPU UUIDs for migration.
+    The mapping preserves the device index order.
+
+    Args:
+        old_uuids: List of GPU UUIDs from checkpoint time (in cuda-checkpoint format)
+        new_uuids: List of current GPU UUIDs (in cuda-checkpoint format)
+
+    Returns:
+        Device map string in format "oldUuid1=newUuid1,oldUuid2=newUuid2,..."
+        suitable for cuda-checkpoint --device-map option, or None if mapping
+        cannot be created.
+    """
+    if len(old_uuids) != len(new_uuids):
+        logger.error("GPU count mismatch: checkpoint had %d GPUs, current has %d",
+                    len(old_uuids), len(new_uuids))
+        return None
+
+    if not old_uuids:
+        logger.warning("No GPUs to migrate")
+        return None
+
+    # Build device map string
+    pairs = []
+    for i, (old_uuid, new_uuid) in enumerate(zip(old_uuids, new_uuids)):
+        pairs.append(f"{old_uuid}={new_uuid}")
+
+        if old_uuid != new_uuid:
+            logger.info("GPU migration: device %d %s -> %s",
+                       i, old_uuid, new_uuid)
+
+    return ",".join(pairs)
+
+
+# This function is now replaced by restore_cuda_processes_from_pids with device_map parameter
 

@@ -24,6 +24,8 @@ class CheckpointMetadata:
         # by the process tree at checkpoint time. Each entry is a dict with
         # keys: name (basename in /dev/shm), size (bytes), mode (int file mode).
         self.dev_shm_files: list[dict] = []
+        # List of GPU UUIDs in the order they appear to CUDA at checkpoint time
+        self.gpu_uuids: list[str] = []
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -34,6 +36,7 @@ class CheckpointMetadata:
             "zmq_port": self.zmq_port,
             "cuda_pids": self.cuda_pids,
             "dev_shm_files": self.dev_shm_files,
+            "gpu_uuids": self.gpu_uuids,
         }
 
     @classmethod
@@ -46,6 +49,7 @@ class CheckpointMetadata:
         meta.zmq_port = data.get("zmq_port")
         meta.cuda_pids = data.get("cuda_pids", [])
         meta.dev_shm_files = data.get("dev_shm_files", [])
+        meta.gpu_uuids = data.get("gpu_uuids", [])
         return meta
 
     def save(self, checkpoint_dir: str) -> None:

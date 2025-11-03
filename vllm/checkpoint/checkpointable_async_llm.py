@@ -49,6 +49,7 @@ from vllm.checkpoint.utils import (
     precreate_dev_shm_files,
     read_comm, read_cmdline, collect_process_tree_pids,
     verify_processes_exited, get_tty_info,
+    get_gpu_uuids, create_gpu_device_map,
 )
 from vllm.checkpoint.metadata import CheckpointMetadata
 from vllm.checkpoint.zmq_async_llm_server import (
@@ -792,6 +793,11 @@ class CheckpointableAsyncLLM(EngineClient):
         metadata.zmq_port = self.port
         metadata.cuda_pids = valid_cuda_pids if valid_cuda_pids else []
 
+        # Save GPU UUIDs for potential cross-GPU restore
+        gpu_uuids = get_gpu_uuids()
+        metadata.gpu_uuids = gpu_uuids
+        logger.info("Captured %d GPU UUIDs at checkpoint time", len(gpu_uuids))
+
         # Snapshot of open /dev/shm files across the process tree so we can
         # pre-create them before CRIU restore. Some libraries (e.g., NCCL/Gloo
         # or other IPC backends) use POSIX shm segments under /dev/shm, which
@@ -989,11 +995,29 @@ class CheckpointableAsyncLLM(EngineClient):
         # Restore and unlock CUDA contexts via CUDA API, since CRIU CUDA plugin is disabled
         cuda_pids = getattr(metadata, "cuda_pids", []) or []
         if cuda_pids:
+            # Check if we need GPU migration
+            old_gpu_uuids = getattr(metadata, "gpu_uuids", [])
+            new_gpu_uuids = get_gpu_uuids()
+
+            device_map = None
+            if old_gpu_uuids and new_gpu_uuids:
+                if old_gpu_uuids != new_gpu_uuids:
+                    logger.info("GPU configuration changed - attempting migration")
+                    logger.info("Old GPUs: %s", old_gpu_uuids)
+                    logger.info("New GPUs: %s", new_gpu_uuids)
+                    device_map = create_gpu_device_map(old_gpu_uuids, new_gpu_uuids)
+                    if device_map is None:
+                        logger.error("Failed to create GPU device map")
+                else:
+                    logger.info("GPU configuration unchanged - standard restore")
+
             logger.info(
-                "CUDA restore/unlock: attempting cuCheckpoint restore/unlock on PIDs: %s",
+                "CUDA restore/unlock: attempting cuda-checkpoint restore/unlock on PIDs: %s",
                 cuda_pids,
             )
-            succeeded, failed = restore_cuda_processes_from_pids(cuda_pids)
+
+            succeeded, failed = restore_cuda_processes_from_pids(cuda_pids, device_map)
+
             results_summary = format_cuda_restore_results(succeeded, failed)
             logger.info(results_summary)
             if failed:
