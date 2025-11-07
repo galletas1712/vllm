@@ -253,28 +253,6 @@ def process_has_nvidia_fd(pid: int) -> bool:
     return False
 
 
-def find_gpu_worker_pids(root_pid: int) -> list[int]:
-    """Find all GPU worker processes in the process tree.
-
-    Returns PIDs of leaf processes that use GPU (workers).
-    """
-    all_pids = collect_process_tree_pids(root_pid)
-
-    # Find leaf processes (no children)
-    leaf_pids = []
-    for pid in all_pids:
-        if process_is_leaf(pid):
-            leaf_pids.append(pid)
-
-    # Filter for GPU-using processes
-    gpu_pids = []
-    for pid in leaf_pids:
-        if process_has_nvidia_fd(pid):
-            gpu_pids.append(pid)
-
-    return gpu_pids
-
-
 def validate_cuda_process_tree(root_pid: int) -> tuple[list[int], list[int]]:
     """Validate that all processes with NVIDIA fds are leaf processes.
 
@@ -704,5 +682,35 @@ def create_gpu_device_map(old_uuids: list[str],
     return ",".join(pairs)
 
 
-# This function is now replaced by restore_cuda_processes_from_pids with device_map parameter
+# PID mapping utilities
+
+def map_cuda_pids_after_restore(root_pid: int, expected_cuda_count: int) -> list[int]:
+    """Map CUDA process PIDs after CRIU restore based on tree structure.
+    
+    After CRIU restore with criu-ns, all PIDs change but the tree structure
+    is preserved. Since CUDA processes are leaf processes, we can map them
+    by finding the same number of leaf processes in the restored tree.
+    
+    Args:
+        root_pid: Root PID of the restored process tree
+        expected_cuda_count: Number of CUDA processes expected
+        
+    Returns:
+        List of new PIDs for CUDA processes, empty if mapping fails
+    """
+    try:
+        all_pids = collect_process_tree_pids(root_pid)
+        leaf_pids = [pid for pid in all_pids if process_is_leaf(pid)]
+        
+        if len(leaf_pids) == expected_cuda_count:
+            logger.info("Successfully mapped %d CUDA processes to new PIDs: %s", 
+                       expected_cuda_count, leaf_pids)
+            return leaf_pids
+        else:
+            logger.error("PID mapping failed: expected %d CUDA processes but found %d leaves",
+                        expected_cuda_count, len(leaf_pids))
+            return []
+    except Exception as e:
+        logger.error("Failed to map CUDA PIDs: %s", e)
+        return []
 

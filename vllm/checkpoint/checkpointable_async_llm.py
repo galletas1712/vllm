@@ -50,6 +50,7 @@ from vllm.checkpoint.utils import (
     read_comm, read_cmdline, collect_process_tree_pids,
     verify_processes_exited, get_tty_info,
     get_gpu_uuids, create_gpu_device_map,
+    map_cuda_pids_after_restore,
 )
 from vllm.checkpoint.metadata import CheckpointMetadata
 from vllm.checkpoint.zmq_async_llm_server import (
@@ -897,49 +898,21 @@ class CheckpointableAsyncLLM(EngineClient):
         self.socket_url = f"tcp://127.0.0.1:{self.port}"
         logger.info("Using saved port %d from checkpoint", self.port)
 
-        # Ensure the original tree PID from dump is fully gone to avoid
-        # PID collisions when restoring into the same PID namespace.
-        if metadata.tree_pid:
-            start = time.time()
-            # Wait up to a short grace period since dump should have killed it
-            while time.time() - start < 5.0:
-                if os.system(f"kill -0 {metadata.tree_pid} >/dev/null 2>&1") != 0:
-                    break
-                await asyncio.sleep(0.05)
+        # Since we're using criu-ns which creates a new PID namespace,
+        # we don't need to worry about PID conflicts. The kernel will
+        # assign new PIDs to all restored processes.
+        logger.info("Using criu-ns for restore - PIDs will be reassigned in new namespace")
 
-            # Verify root PID is not taken now (PID could be reused by others)
-            pid_path = f"/proc/{metadata.tree_pid}"
-            if os.path.exists(pid_path):
-                # Try to read the cmdline of the holder for diagnostics
-                holder = ""
-                try:
-                    cmd_path = os.path.join(pid_path, "cmdline")
-                    with open(cmd_path, "rb") as f:
-                        raw = f.read().replace(b"\x00", b" ")
-                        holder = raw.decode("utf-8", "ignore").strip()
-                except Exception:
-                    holder = ""
-                msg = (
-                    "CRIU restore pre-check failed: root PID "
-                    f"{metadata.tree_pid} is in use in current PID namespace. "
-                    "Restore will fail with EEXIST. Consider restoring in a "
-                    "new PID namespace or wait until the PID is free."
-                )
-                if holder:
-                    logger.error(
-                        "%s Holder cmdline: %s",
-                        msg,
-                        holder,
-                    )
-                else:
-                    logger.error("%s", msg)
-                raise RuntimeError(msg)
-
-        # Build CRIU restore command
+        # Build CRIU restore command using criu-ns to avoid PID conflicts
+        # criu-ns creates a new PID namespace allowing the kernel to assign new PIDs
+        pidfile_path = os.path.join(self.checkpoint_dir, "restored_root_pid.txt")
+        
+        # Note: We use --restore-detached so criu-ns returns immediately after
+        # starting the restore, rather than waiting for the restored processes to exit
         cmd = [
-            "criu", "restore",
+            "criu-ns", "restore",
             "--shell-job",
-            "--restore-detached",
+            "--restore-detached",  # Required for criu-ns to return after restore
             "--images-dir", self.checkpoint_dir,
             "-o", "criu-restore.log",
             "-v4",
@@ -948,6 +921,7 @@ class CheckpointableAsyncLLM(EngineClient):
             "--external", "mnt[shm]:/dev/shm",
             "--link-remap",
             "--manage-cgroups=ignore",
+            "--pidfile", pidfile_path,  # Capture the new root PID
         ]
 
         # Force CRIU to skip CUDA plugin discovery by using an empty libdir
@@ -982,18 +956,55 @@ class CheckpointableAsyncLLM(EngineClient):
         # CRIU can reopen them as regular files on the tmpfs mount.
         precreate_dev_shm_files(getattr(metadata, "dev_shm_files", []) or [])
 
+        # Run CRIU restore - with --restore-detached, criu-ns exits quickly
         if pass_fds:
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                    pass_fds=pass_fds)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                   stderr=subprocess.PIPE, text=True,
+                                   pass_fds=pass_fds)
+            # Close the slave fd in parent; it's been passed to criu-ns
+            if pty_slave_fd is not None:
+                with contextlib.suppress(Exception):
+                    os.close(pty_slave_fd)
         else:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"CRIU restore failed: {result.stderr}")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        
+        # Wait for criu-ns to complete
+        stdout, stderr = proc.communicate()
+        
+        if proc.returncode != 0:
+            raise RuntimeError(f"CRIU restore failed: {stderr}")
 
         logger.info("Successfully restored AsyncLLM from checkpoint")
 
+        # Read the new root PID from the pidfile created by criu-ns
+        new_root_pid = None
+        try:
+            if os.path.exists(pidfile_path):
+                with open(pidfile_path, 'r') as f:
+                    new_root_pid = int(f.read().strip())
+                logger.info("Restored process tree root PID: %d (was %d)",
+                           new_root_pid, metadata.tree_pid)
+        except Exception as e:
+            logger.warning("Failed to read new root PID from pidfile: %s", e)
+
+        # Map CUDA PIDs based on tree structure (preserved by CRIU)
+        new_cuda_pids = []
+        if new_root_pid and metadata.cuda_pids:
+            new_cuda_pids = map_cuda_pids_after_restore(
+                new_root_pid, len(metadata.cuda_pids))
+
+        # Update metadata with restored PIDs
+        if new_root_pid:
+            metadata.restored_tree_pid = new_root_pid
+            metadata.restored_cuda_pids = new_cuda_pids
+            try:
+                metadata.save(self.checkpoint_dir)
+            except Exception as e:
+                logger.debug("Failed to update metadata: %s", e)
+
         # Restore and unlock CUDA contexts via CUDA API, since CRIU CUDA plugin is disabled
-        cuda_pids = getattr(metadata, "cuda_pids", []) or []
+        cuda_pids = new_cuda_pids if new_cuda_pids else []
         if cuda_pids:
             # Check if we need GPU migration
             old_gpu_uuids = getattr(metadata, "gpu_uuids", [])

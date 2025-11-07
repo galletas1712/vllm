@@ -26,6 +26,10 @@ class CheckpointMetadata:
         self.dev_shm_files: list[dict] = []
         # List of GPU UUIDs in the order they appear to CUDA at checkpoint time
         self.gpu_uuids: list[str] = []
+        # PID of the restored root process (after criu-ns restore with new PIDs)
+        self.restored_tree_pid: Optional[int] = None
+        # New PIDs of CUDA processes after restore
+        self.restored_cuda_pids: list[int] = []
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -37,6 +41,8 @@ class CheckpointMetadata:
             "cuda_pids": self.cuda_pids,
             "dev_shm_files": self.dev_shm_files,
             "gpu_uuids": self.gpu_uuids,
+            "restored_tree_pid": self.restored_tree_pid,
+            "restored_cuda_pids": self.restored_cuda_pids,
         }
 
     @classmethod
@@ -50,6 +56,8 @@ class CheckpointMetadata:
         meta.cuda_pids = data.get("cuda_pids", [])
         meta.dev_shm_files = data.get("dev_shm_files", [])
         meta.gpu_uuids = data.get("gpu_uuids", [])
+        meta.restored_tree_pid = data.get("restored_tree_pid")
+        meta.restored_cuda_pids = data.get("restored_cuda_pids", [])
         return meta
 
     def save(self, checkpoint_dir: str) -> None:
