@@ -57,6 +57,11 @@ class TPUWorker:
     ):
         self.is_driver_worker = is_driver_worker
         self.vllm_config = vllm_config
+
+        # Populate quantization config, which only occurs in worker process
+        # as it creates a CUDA context.
+        self.vllm_config.__post_init__()
+
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config

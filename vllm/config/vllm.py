@@ -356,7 +356,13 @@ class VllmConfig:
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 
-        if self.quant_config is None and self.model_config is not None:
+        if (
+            os.environ.get("VLLM_IS_WORKER_PROCESS") == "1"
+            and self.quant_config is None
+            and self.model_config is not None
+        ):
+            # Only populate quant_config in worker process as it creates a CUDA context.
+            self.model_config.verify_quantization()
             self.quant_config = VllmConfig._get_quantization_config(
                 self.model_config, self.load_config
             )

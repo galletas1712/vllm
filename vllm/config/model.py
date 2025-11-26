@@ -711,7 +711,6 @@ class ModelConfig:
         # Avoid running try_verify_and_update_config multiple times
         self.config_updated = False
 
-        self._verify_quantization()
         self._verify_cuda_graph()
         self._verify_bnb_config()
 
@@ -967,7 +966,8 @@ class ModelConfig:
 
         return quant_cfg
 
-    def _verify_quantization(self) -> None:
+    def verify_quantization(self) -> None:
+        """NOTE: This method creates a CUDA context and should only be called in the worker process."""
         supported_quantization = me_quant.QUANTIZATION_METHODS
         if self.quantization is not None:
             self.quantization = cast(me_quant.QuantizationMethods, self.quantization)
