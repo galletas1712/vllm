@@ -886,3 +886,5 @@ def set_multiprocessing_worker_envs():
         )
         os.environ["OMP_NUM_THREADS"] = str(default_omp_num_threads)
         torch.set_num_threads(default_omp_num_threads)
+
+        os.environ["VLLM_IS_WORKER_PROCESS"] = "1"

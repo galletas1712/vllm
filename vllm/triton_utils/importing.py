@@ -13,7 +13,7 @@ HAS_TRITON = (
     find_spec("triton") is not None
     or find_spec("pytorch-triton-xpu") is not None  # Not compatible
 )
-if HAS_TRITON:
+if HAS_TRITON and os.environ.get("VLLM_IS_WORKER_PROCESS") == "1":
     try:
         from triton.backends import backends
 

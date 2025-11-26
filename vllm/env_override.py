@@ -363,7 +363,7 @@ def _update_scheduler_patched(self) -> None:
         self.scheduler = Scheduler(self.operations)
 
 
-if is_torch_equal("2.9.0"):
+if os.environ.get("VLLM_IS_WORKER_PROCESS") == "1" and is_torch_equal("2.9.0"):
     from torch._inductor.codegen.wrapper import PythonWrapperCodegen
     from torch._inductor.graph import GraphLowering
     from torch.utils._config_module import _Config, _ConfigEntry

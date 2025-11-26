@@ -312,6 +312,7 @@ class RayDistributedExecutor(Executor):
                 current_platform.device_control_env_var: ",".join(
                     map(str, node_gpus[node_id])
                 ),
+                "VLLM_IS_WORKER_PROCESS": "1",
             }
             for (node_id, _) in worker_node_and_gpu_ids
         ]

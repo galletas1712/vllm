@@ -22,6 +22,7 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
+os.environ["VLLM_IS_WORKER_PROCESS"] = "1"
 
 class UniProcExecutor(Executor):
     def _init_executor(self) -> None:

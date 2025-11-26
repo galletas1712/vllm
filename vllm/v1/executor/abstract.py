@@ -70,6 +70,7 @@ class Executor(ABC):
         elif distributed_executor_backend == "external_launcher":
             # TODO: make v1 scheduling deterministic
             # to support external launcher
+            from vllm.v1.executor.uniproc_executor import ExecutorWithExternalLauncher
             executor_class = ExecutorWithExternalLauncher
         elif isinstance(distributed_executor_backend, str):
             executor_class = resolve_obj_by_qualname(distributed_executor_backend)
@@ -340,13 +341,3 @@ class Executor(ABC):
         raise NotImplementedError
 
 
-from vllm.v1.executor.uniproc_executor import (  # noqa: E402
-    ExecutorWithExternalLauncher as _ExecutorWithExternalLauncher,
-)
-from vllm.v1.executor.uniproc_executor import (  # noqa: E402
-    UniProcExecutor as _UniProcExecutor,
-)
-
-# For backwards compatibility.
-UniProcExecutor = _UniProcExecutor
-ExecutorWithExternalLauncher = _ExecutorWithExternalLauncher
