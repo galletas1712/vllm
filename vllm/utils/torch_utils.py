@@ -437,12 +437,7 @@ def _cuda_device_count_stateless(cuda_visible_devices: str | None = None) -> int
     # Note: cuda_visible_devices is not used, but we keep it as an argument for
     # LRU Cache purposes.
 
-    # Code below is based on
-    # https://github.com/pytorch/pytorch/blob/
-    # c1cd946818442aca8c7f812b16d187ce1586c3bc/
-    # torch/cuda/__init__.py#L831C1-L831C17
     import torch.cuda
-    import torch.version
 
     from vllm.platforms import current_platform
 
@@ -457,7 +452,16 @@ def _cuda_device_count_stateless(cuda_visible_devices: str | None = None) -> int
             else -1
         )
     else:
-        raw_count = torch.cuda._device_count_nvml()
+        # Use pynvml directly instead of torch.cuda._device_count_nvml()
+        # because torch doesn't properly shutdown NVML, leaving
+        # /dev/nvidia* file descriptors open.
+        try:
+            from vllm.platforms.cuda import with_nvml_context
+            from vllm.utils.import_utils import import_pynvml
+            pynvml = import_pynvml()
+            raw_count = with_nvml_context(pynvml.nvmlDeviceGetCount)()
+        except Exception:
+            raw_count = -1
     r = torch._C._cuda_getDeviceCount() if raw_count < 0 else raw_count
     return r
 

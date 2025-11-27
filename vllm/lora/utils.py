@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from functools import cache
 from typing import TYPE_CHECKING, Optional
 
 import huggingface_hub
@@ -18,57 +19,61 @@ from transformers import PretrainedConfig
 from vllm.config.lora import LoRAConfig
 from vllm.logger import init_logger
 
-# being imported for _all_lora_classes below
-from vllm.lora.layers import (
-    BaseLayerWithLoRA,
-    ColumnParallelLinearWithLoRA,
-    ColumnParallelLinearWithShardedLoRA,
-    FusedMoE3DWithLoRA,
-    FusedMoEWithLoRA,
-    LogitsProcessorWithLoRA,
-    MergedColumnParallelLinearWithLoRA,
-    MergedColumnParallelLinearWithShardedLoRA,
-    MergedQKVParallelLinearWithLoRA,
-    MergedQKVParallelLinearWithShardedLoRA,
-    QKVParallelLinearWithLoRA,
-    QKVParallelLinearWithShardedLoRA,
-    ReplicatedLinearWithLoRA,
-    RowParallelLinearWithLoRA,
-    RowParallelLinearWithShardedLoRA,
-    VocabParallelEmbeddingWithLoRA,
-)
-from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.utils import get_moe_expert_mapping, get_packed_modules_mapping
-
 if TYPE_CHECKING:
+    from vllm.lora.layers import BaseLayerWithLoRA, LogitsProcessorWithLoRA
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
 
-_all_lora_classes: set[type[BaseLayerWithLoRA]] = {
-    VocabParallelEmbeddingWithLoRA,
-    ColumnParallelLinearWithLoRA,
-    MergedColumnParallelLinearWithLoRA,
-    QKVParallelLinearWithLoRA,
-    MergedQKVParallelLinearWithLoRA,
-    RowParallelLinearWithLoRA,
-    ReplicatedLinearWithLoRA,
-    LogitsProcessorWithLoRA,
-    ColumnParallelLinearWithShardedLoRA,
-    QKVParallelLinearWithShardedLoRA,
-    MergedColumnParallelLinearWithShardedLoRA,
-    MergedQKVParallelLinearWithShardedLoRA,
-    RowParallelLinearWithShardedLoRA,
-    FusedMoEWithLoRA,
-    FusedMoE3DWithLoRA,
-}
+
+@cache
+def _get_all_lora_classes() -> set[type["BaseLayerWithLoRA"]]:
+    """Lazily import and return all LoRA layer classes.
+
+    This is cached to avoid repeated imports.
+    """
+    from vllm.lora.layers import (
+        ColumnParallelLinearWithLoRA,
+        ColumnParallelLinearWithShardedLoRA,
+        FusedMoE3DWithLoRA,
+        FusedMoEWithLoRA,
+        LogitsProcessorWithLoRA,
+        MergedColumnParallelLinearWithLoRA,
+        MergedColumnParallelLinearWithShardedLoRA,
+        MergedQKVParallelLinearWithLoRA,
+        MergedQKVParallelLinearWithShardedLoRA,
+        QKVParallelLinearWithLoRA,
+        QKVParallelLinearWithShardedLoRA,
+        ReplicatedLinearWithLoRA,
+        RowParallelLinearWithLoRA,
+        RowParallelLinearWithShardedLoRA,
+        VocabParallelEmbeddingWithLoRA,
+    )
+    return {
+        VocabParallelEmbeddingWithLoRA,
+        ColumnParallelLinearWithLoRA,
+        MergedColumnParallelLinearWithLoRA,
+        QKVParallelLinearWithLoRA,
+        MergedQKVParallelLinearWithLoRA,
+        RowParallelLinearWithLoRA,
+        ReplicatedLinearWithLoRA,
+        LogitsProcessorWithLoRA,
+        ColumnParallelLinearWithShardedLoRA,
+        QKVParallelLinearWithShardedLoRA,
+        MergedColumnParallelLinearWithShardedLoRA,
+        MergedQKVParallelLinearWithShardedLoRA,
+        RowParallelLinearWithShardedLoRA,
+        FusedMoEWithLoRA,
+        FusedMoE3DWithLoRA,
+    }
 
 
 def is_moe_model(model: nn.Module) -> bool:
     """Checks if the model contains FusedMoE layers and warns the user."""
+    from vllm.model_executor.layers.fused_moe import FusedMoE
+
     if any(isinstance(module, FusedMoE) for module in model.modules()):
         logger.info_once("MoE model detected. Using fused MoE LoRA implementation.")
         return True
@@ -82,7 +87,7 @@ def from_layer(
     packed_modules_list: list,
     model_config: PretrainedConfig | None = None,
 ) -> nn.Module:
-    for lora_cls in _all_lora_classes:
+    for lora_cls in _get_all_lora_classes():
         # specifying kwargs so they can be easily accessed in decorator
         if lora_cls.can_replace_layer(
             source_layer=layer,
@@ -102,7 +107,9 @@ def from_layer_logits_processor(
     max_loras: int,
     lora_config: LoRAConfig,
     model_config: PretrainedConfig | None = None,
-) -> LogitsProcessorWithLoRA:
+) -> "LogitsProcessorWithLoRA":
+    from vllm.lora.layers import LogitsProcessorWithLoRA
+
     ret = LogitsProcessorWithLoRA(
         layer,
         lm_head.embedding_dim,
@@ -215,6 +222,8 @@ def get_supported_lora_modules(model: nn.Module) -> list[str]:
     """
     In vLLM, all linear layers support LoRA.
     """
+    from vllm.model_executor.layers.fused_moe import FusedMoE
+    from vllm.model_executor.layers.linear import LinearBase
 
     supported_lora_modules: set[str] = set()
     for name, module in model.named_modules():
@@ -282,6 +291,11 @@ def get_adapter_absolute_path(lora_path: str) -> str:
 
 
 def process_packed_modules_mapping(model: nn.Module) -> dict[str, list[str]]:
+    from vllm.model_executor.utils import (
+        get_moe_expert_mapping,
+        get_packed_modules_mapping,
+    )
+
     if is_moe_model(model):
         if moe_packed_mapping := get_moe_expert_mapping(model):
             # This method generates and returns a dictionary mapping packed module
