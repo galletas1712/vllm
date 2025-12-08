@@ -52,6 +52,8 @@ class LoadConfig:
     - Other custom values can be supported via plugins."""
     enable_companion_process: bool = False
     """Whether to enable the companion process for loading the model weights."""
+    companion_port: int = 5555
+    """Base port for companion server. Actual port = companion_port + local_rank."""
     download_dir: str | None = None
     """Directory to download and load the weights, default to the default
     cache directory of Hugging Face."""
