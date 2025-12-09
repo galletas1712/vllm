@@ -11,7 +11,7 @@ import os
 
 import torch
 
-from shared_types import TensorIPCInfo, compute_checksum
+from shared_types import TensorIPCInfo, compute_checksum, compute_aggregate_checksum
 
 
 # CUDA constants and types
@@ -179,22 +179,28 @@ def copy_to_vmm(tensor: torch.Tensor, alloc: ServerAllocation):
     torch.cuda.synchronize()
 
 
-def create_test_tensors(device: int) -> Dict[str, torch.Tensor]:
-    """Create test tensors of various types and sizes."""
+def create_test_tensors(device: int, stress: bool = True) -> Dict[str, torch.Tensor]:
+    """Create test tensors of various types and sizes.
+
+    Args:
+        device: CUDA device ID
+        stress: If True, create many more tensors for stress testing
+    """
     d = torch.device(f"cuda:{device}")
-    tensors = {
-        "small_f32": torch.randn(64, 64, dtype=torch.float32, device=d),
-        "medium_f16": torch.randn(256, 256, dtype=torch.float16, device=d),
-        "large_f32": torch.randn(1024, 1024, dtype=torch.float32, device=d),
-        "vector_i64": torch.randint(0, 1000, (10000,), dtype=torch.int64, device=d),
-    }
+    tensors = {}
+
+    # Basic tensors - always included
+    tensors["small_f32"] = torch.randn(64, 64, dtype=torch.float32, device=d)
+    tensors["medium_f16"] = torch.randn(256, 256, dtype=torch.float16, device=d)
+    tensors["large_f32"] = torch.randn(1024, 1024, dtype=torch.float32, device=d)
+    tensors["vector_i64"] = torch.randint(0, 1000, (10000,), dtype=torch.int64, device=d)
+
     if torch.cuda.is_bf16_supported():
         tensors["tiny_bf16"] = torch.randn(32, 32, dtype=torch.bfloat16, device=d)
 
-    # FP8 types (PyTorch 2.1+, requires Hopper or later for native support)
+    # FP8 types
     if hasattr(torch, 'float8_e4m3fn'):
         try:
-            # Create FP8 tensor - cast from float16 to preserve reasonable values
             fp8_data = torch.randn(128, 128, dtype=torch.float16, device=d)
             tensors["fp8_e4m3"] = fp8_data.to(torch.float8_e4m3fn)
             print(f"[Server] FP8 E4M3 tensor created successfully")
@@ -209,10 +215,49 @@ def create_test_tensors(device: int) -> Dict[str, torch.Tensor]:
         except Exception as e:
             print(f"[Server] FP8 E5M2 not supported: {e}")
 
-    # Packed INT4 simulation (stored as uint8, 2 values per byte)
-    # This demonstrates how quantized weights would be transferred
-    packed_shape = (64, 32)  # Represents 64x64 INT4 values packed into 64x32 uint8
-    tensors["packed_int4"] = torch.randint(0, 256, packed_shape, dtype=torch.uint8, device=d)
+    # Packed INT4 simulation
+    tensors["packed_int4"] = torch.randint(0, 256, (64, 32), dtype=torch.uint8, device=d)
+
+    if stress:
+        # Add many more tensors for stress testing
+        print("[Server] Creating stress test tensors...")
+
+        # Various f32 shapes (simulating different layer sizes)
+        for i, shape in enumerate([
+            (512, 512), (768, 768), (1024, 256), (256, 1024),
+            (2048, 512), (512, 2048), (384, 384), (640, 640),
+        ]):
+            tensors[f"layer_{i}_f32"] = torch.randn(*shape, dtype=torch.float32, device=d)
+
+        # Various f16 shapes (common for inference)
+        for i, shape in enumerate([
+            (512, 512), (1024, 1024), (768, 3072), (3072, 768),
+            (1024, 4096), (4096, 1024), (2048, 2048),
+        ]):
+            tensors[f"weight_{i}_f16"] = torch.randn(*shape, dtype=torch.float16, device=d)
+
+        # BF16 tensors (common for training)
+        if torch.cuda.is_bf16_supported():
+            for i, shape in enumerate([
+                (256, 256), (512, 512), (1024, 512), (512, 1024),
+            ]):
+                tensors[f"grad_{i}_bf16"] = torch.randn(*shape, dtype=torch.bfloat16, device=d)
+
+        # Integer tensors (embedding indices, attention masks)
+        tensors["embed_ids"] = torch.randint(0, 50000, (32, 512), dtype=torch.int64, device=d)
+        tensors["attn_mask"] = torch.randint(0, 2, (32, 512), dtype=torch.int32, device=d)
+
+        # 1D vectors (biases, norms)
+        for i, size in enumerate([256, 512, 768, 1024, 2048, 4096]):
+            tensors[f"bias_{i}"] = torch.randn(size, dtype=torch.float32, device=d)
+
+        # 3D tensors (batch of matrices)
+        tensors["batched_3d"] = torch.randn(8, 256, 256, dtype=torch.float16, device=d)
+
+        # 4D tensors (conv-like)
+        tensors["conv_4d"] = torch.randn(64, 64, 3, 3, dtype=torch.float32, device=d)
+
+        print(f"[Server] Created {len(tensors)} tensors for stress test")
 
     return tensors
 
@@ -281,7 +326,23 @@ def server_main(send_fn, recv_fn, device: int = 0):
             ack = recv_fn()
             print(f"[Server]   Client: {ack}")
 
-        # Signal done with initial phase
+        # Compute aggregate checksum across ALL tensors
+        print("\n[Server] Computing aggregate checksum...")
+        aggregate = compute_aggregate_checksum(tensors)
+        print(f"[Server] Aggregate checksum (sum of squares): {aggregate}")
+
+        # Signal done with initial phase, send aggregate checksum
+        send_fn("__aggregate__", TensorIPCInfo(
+            shape=(), strides=(), dtype=torch.float64,
+            storage_size_bytes=0, storage_offset=0, allocation_size=0,
+            checksum=aggregate
+        ), -1)
+
+        # Wait for client verification
+        verify_ack = recv_fn()
+        print(f"[Server] Client aggregate verification: {verify_ack}")
+
+        # Signal done
         send_fn(None, None, -1)
 
         # Wait for client to signal sleep complete
@@ -321,6 +382,21 @@ def server_main(send_fn, recv_fn, device: int = 0):
                 # Wait for ack
                 ack = recv_fn()
                 print(f"[Server]   Client: {ack}")
+
+            # Send aggregate checksum again for post-wake verification
+            print("\n[Server] Computing post-wake aggregate checksum...")
+            aggregate = compute_aggregate_checksum(tensors)
+            print(f"[Server] Post-wake aggregate: {aggregate}")
+
+            send_fn("__aggregate__", TensorIPCInfo(
+                shape=(), strides=(), dtype=torch.float64,
+                storage_size_bytes=0, storage_offset=0, allocation_size=0,
+                checksum=aggregate
+            ), -1)
+
+            # Wait for client verification
+            verify_ack = recv_fn()
+            print(f"[Server] Client post-wake verification: {verify_ack}")
 
             # Signal wake phase done
             send_fn(None, None, -1)

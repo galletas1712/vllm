@@ -9,7 +9,7 @@ Flow:
 """
 
 import torch
-from shared_types import TensorIPCInfo, compute_checksum
+from shared_types import TensorIPCInfo, compute_checksum, compute_aggregate_checksum
 from shareable_cumem_allocator import get_allocator
 
 
@@ -33,6 +33,23 @@ def client_main(recv_fn, send_fn, device: int = 0):
 
         while True:
             name, info, fd = recv_fn()
+
+            # Check for aggregate checksum verification signal
+            if name == "__aggregate__":
+                print("\n[Client] --- Aggregate Checksum Verification ---")
+                server_aggregate = info.checksum
+                client_aggregate = compute_aggregate_checksum(tensors)
+                tol = abs(server_aggregate) * 1e-5 + 1e-5
+                match = abs(client_aggregate - server_aggregate) < tol
+
+                print(f"[Client] Server aggregate: {server_aggregate}")
+                print(f"[Client] Client aggregate: {client_aggregate}")
+                print(f"[Client] Aggregate {'MATCH!' if match else 'MISMATCH!'}")
+
+                results.append({"name": "aggregate", "phase": "import", "match": match})
+                send_fn({"status": "ok", "aggregate_match": match})
+                continue
+
             if name is None:
                 print("[Client] Done signal received", flush=True)
                 break
@@ -54,7 +71,7 @@ def client_main(recv_fn, send_fn, device: int = 0):
             handle = allocator.import_and_map(va, fd, info.allocation_size)
             print(f"[Client]   Imported and mapped! handle={handle}")
 
-            # Verify checksum (outside deferred pool to avoid suballocation)
+            # Verify individual checksum (outside deferred pool to avoid suballocation)
             client_sum = compute_checksum(tensor)
             server_sum = info.checksum
             tol = abs(server_sum) * 1e-5 + 1e-5
@@ -89,6 +106,23 @@ def client_main(recv_fn, send_fn, device: int = 0):
 
         while True:
             name, info, fd = recv_fn()
+
+            # Check for post-wake aggregate verification
+            if name == "__aggregate__":
+                print("\n[Client] --- Post-Wake Aggregate Verification ---")
+                server_aggregate = info.checksum
+                client_aggregate = compute_aggregate_checksum(tensors)
+                tol = abs(server_aggregate) * 1e-5 + 1e-5
+                match = abs(client_aggregate - server_aggregate) < tol
+
+                print(f"[Client] Server aggregate: {server_aggregate}")
+                print(f"[Client] Client aggregate: {client_aggregate}")
+                print(f"[Client] Post-wake aggregate {'MATCH!' if match else 'MISMATCH!'}")
+
+                results.append({"name": "aggregate", "phase": "wake", "match": match})
+                send_fn({"status": "ok", "aggregate_match": match})
+                continue
+
             if name is None:
                 print("[Client] Wake phase complete")
                 break
