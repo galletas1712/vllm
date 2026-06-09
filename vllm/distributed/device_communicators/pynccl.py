@@ -88,6 +88,7 @@ class PyNcclCommunicator:
             self.world_size = group.world_size
 
         self.group = group
+        self._checkpoint_prepared = False
 
         # if world_size == 1, no need to create communicator
         if self.world_size == 1 or envs.VLLM_DISABLE_PYNCCL:
@@ -107,6 +108,18 @@ class PyNcclCommunicator:
         self.disabled = False
 
         self.nccl_version = self.nccl.ncclGetRawVersion()
+        self.device = self._normalize_device(device)
+        self._init_comm()
+
+    def _normalize_device(self, device: int | str | torch.device) -> torch.device:
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        assert isinstance(device, torch.device)
+        return device
+
+    def _init_comm(self) -> None:
         if self.rank == 0:
             # get the unique id from NCCL
             self.unique_id = self.nccl.ncclGetUniqueId()
@@ -115,32 +128,27 @@ class PyNcclCommunicator:
             # construct an empty unique id
             self.unique_id = ncclUniqueId()
 
-        if not isinstance(group, StatelessProcessGroup):
+        if not isinstance(self.group, StatelessProcessGroup):
             tensor = torch.ByteTensor(list(self.unique_id.internal))
-            ranks = dist.get_process_group_ranks(group)
+            ranks = dist.get_process_group_ranks(self.group)
             # arg `src` in `broadcast` is the global rank
-            dist.broadcast(tensor, src=ranks[0], group=group)
+            dist.broadcast(tensor, src=ranks[0], group=self.group)
             byte_list = tensor.tolist()
             for i, byte in enumerate(byte_list):
                 self.unique_id.internal[i] = byte
         else:
-            self.unique_id = group.broadcast_obj(self.unique_id, src=0)
-        if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        # now `device` is a `torch.device` object
-        assert isinstance(device, torch.device)
-        self.device = device
+            self.unique_id = self.group.broadcast_obj(self.unique_id, src=0)
         # nccl communicator and stream will use this device
-        with torch.accelerator.device_index(device.index):
+        with torch.accelerator.device_index(self.device.index):
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank
             )
+            self.available = True
+            self.disabled = False
 
             stream = current_stream()
             # A small all_reduce for warmup.
-            data = torch.zeros(1, device=device)
+            data = torch.zeros(1, device=self.device)
             self.all_reduce(data)
             stream.synchronize()
             del data
@@ -162,6 +170,69 @@ class PyNcclCommunicator:
             abort_thread.join(timeout=5.0)
             self.available = False
             self.disabled = True
+
+    def snapshot_checkpoint_prepare(self) -> None:
+        if not self.available or self.disabled:
+            logger.warning(
+                "PyNCCL checkpoint prepare: no replayable comms "
+                "rank=%s world_size=%s device=%s",
+                self.rank,
+                self.world_size,
+                getattr(self, "device", None),
+            )
+            return
+        self._checkpoint_prepared = True
+        logger.info(
+            "PyNCCL checkpoint prepare: shim replay prepare "
+            "rank=%s world_size=%s device=%s comm=%s",
+            self.rank,
+            self.world_size,
+            self.device,
+            self.comm,
+        )
+
+    def snapshot_checkpoint_restore(self) -> None:
+        if not self._checkpoint_prepared:
+            if self.available and not self.disabled:
+                logger.info(
+                    "PyNCCL checkpoint restore: no replayable comm restore "
+                    "needed rank=%s world_size=%s device=%s",
+                    self.rank,
+                    self.world_size,
+                    getattr(self, "device", None),
+                )
+            else:
+                logger.warning(
+                    "PyNCCL checkpoint restore: no replayable comms "
+                    "rank=%s world_size=%s device=%s",
+                    self.rank,
+                    self.world_size,
+                    getattr(self, "device", None),
+                )
+            return
+
+        if not self.available or self.disabled:
+            raise RuntimeError(
+                "PyNCCL checkpoint restore expected a replayable communicator, "
+                "but the communicator was destroyed or disabled "
+                f"rank={self.rank} world_size={self.world_size} device={self.device}"
+            )
+
+        with torch.accelerator.device_index(self.device.index):
+            stream = current_stream()
+            data = torch.zeros(1, device=self.device)
+            self.all_reduce(data)
+            stream.synchronize()
+            del data
+        logger.info(
+            "PyNCCL checkpoint restore: shim replay restore validated "
+            "rank=%s world_size=%s device=%s comm=%s",
+            self.rank,
+            self.world_size,
+            self.device,
+            self.comm,
+        )
+        self._checkpoint_prepared = False
 
     def all_reduce(
         self,

@@ -24,6 +24,7 @@
 
 import ctypes
 import functools
+import os
 import platform
 from dataclasses import dataclass
 from typing import Any
@@ -327,14 +328,54 @@ class NCCLLibrary:
     #  to the corresponding dictionary
     path_to_dict_mapping: dict[str, dict[str, Any]] = {}
 
+    checkpoint_shim_functions = {
+        "ncclCommInitRank",
+        "ncclAllReduce",
+        "ncclReduce",
+        "ncclAllGather",
+        "ncclReduceScatter",
+        "ncclSend",
+        "ncclRecv",
+        "ncclBroadcast",
+        "ncclCommDestroy",
+        "ncclCommAbort",
+        "ncclCommWindowRegister",
+        "ncclCommWindowDeregister",
+    }
+
+    @staticmethod
+    def find_preloaded_checkpoint_shim() -> str | None:
+        for entry in os.environ.get("LD_PRELOAD", "").replace(":", " ").split():
+            if os.path.basename(entry) == "libnccl-checkpoint-shim.so":
+                return entry
+        return None
+
     def __init__(self, so_file: str | None = None):
         so_file = so_file or find_nccl_library()
+        shim_file = self.find_preloaded_checkpoint_shim()
+        funcs_key = (
+            so_file
+            if shim_file is None
+            else f"{so_file}|checkpoint-shim:{shim_file}"
+        )
 
         try:
-            if so_file not in NCCLLibrary.path_to_dict_mapping:
+            if so_file not in NCCLLibrary.path_to_library_cache:
                 lib = ctypes.CDLL(so_file)
                 NCCLLibrary.path_to_library_cache[so_file] = lib
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
+            self.shim_lib = None
+            if shim_file is not None:
+                if shim_file not in NCCLLibrary.path_to_library_cache:
+                    NCCLLibrary.path_to_library_cache[shim_file] = ctypes.CDLL(
+                        shim_file
+                    )
+                self.shim_lib = NCCLLibrary.path_to_library_cache[shim_file]
+                logger.info_once(
+                    "PyNCCL is binding NCCL communicator symbols through "
+                    "checkpoint shim %s",
+                    shim_file,
+                )
         except Exception as e:
             logger.error(
                 "Failed to load NCCL library from %s. "
@@ -349,11 +390,17 @@ class NCCLLibrary:
             )
             raise e
 
-        if so_file not in NCCLLibrary.path_to_dict_mapping:
+        if funcs_key not in NCCLLibrary.path_to_dict_mapping:
             _funcs: dict[str, Any] = {}
             for func in NCCLLibrary.exported_functions:
                 try:
-                    f = getattr(self.lib, func.name)
+                    lib = (
+                        self.shim_lib
+                        if self.shim_lib is not None
+                        and func.name in self.checkpoint_shim_functions
+                        else self.lib
+                    )
+                    f = getattr(lib, func.name)
                     f.restype = func.restype
                     f.argtypes = func.argtypes
                     _funcs[func.name] = f
@@ -376,8 +423,8 @@ class NCCLLibrary:
                             # not allowed during graph capturing
                             continue
                     raise
-            NCCLLibrary.path_to_dict_mapping[so_file] = _funcs
-        self._funcs = NCCLLibrary.path_to_dict_mapping[so_file]
+            NCCLLibrary.path_to_dict_mapping[funcs_key] = _funcs
+        self._funcs = NCCLLibrary.path_to_dict_mapping[funcs_key]
 
     def ncclGetErrorString(self, result: ncclResult_t) -> str:
         return self._funcs["ncclGetErrorString"](result).decode("utf-8")

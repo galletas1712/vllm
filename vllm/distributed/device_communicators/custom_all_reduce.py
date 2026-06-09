@@ -322,4 +322,8 @@ class CustomAllreduce:
         if rank is None:
             rank = dist.get_rank(group=group)
         if ops is not None:
-            ops.free_shared_buffer(pointers[rank])
+            for i, pointer in enumerate(pointers):
+                if i == rank:
+                    ops.free_shared_buffer(pointer)
+                else:
+                    ops.close_mem_handle(pointer)

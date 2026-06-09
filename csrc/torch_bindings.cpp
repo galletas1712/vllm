@@ -636,6 +636,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def("open_mem_handle(Tensor mem_handle) -> int", &open_mem_handle);
   custom_ar.impl("open_mem_handle", torch::kCPU, &open_mem_handle);
 
+  custom_ar.def("close_mem_handle", &close_mem_handle);
   custom_ar.def("free_shared_buffer", &free_shared_buffer);
 #ifdef USE_ROCM
   // Quick Reduce all-reduce kernels

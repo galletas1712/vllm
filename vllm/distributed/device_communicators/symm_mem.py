@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -38,6 +40,7 @@ class SymmMemCommunicator:
         max_size_override: int | None = None,
     ):
         self.disabled = True
+        self.buffer: torch.Tensor | None = None
 
         if not symm_mem_available:
             return
@@ -112,6 +115,16 @@ class SymmMemCommunicator:
         self.disabled = False
         if envs.VLLM_BATCH_INVARIANT:
             self.disabled = True
+
+    def close(self) -> None:
+        self.disabled = True
+        if self.buffer is None:
+            return
+
+        torch.accelerator.synchronize()
+        self.buffer = None
+        gc.collect()
+        torch.accelerator.empty_cache()
 
     def should_use_symm_mem(self, inp: torch.Tensor):
         if self.disabled:

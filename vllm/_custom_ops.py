@@ -2994,6 +2994,10 @@ def open_mem_handle(mem_handle: torch.Tensor):
     return torch.ops._C_custom_ar.open_mem_handle(mem_handle)
 
 
+def close_mem_handle(ptr: int) -> None:
+    torch.ops._C_custom_ar.close_mem_handle(ptr)
+
+
 def free_shared_buffer(ptr: int) -> None:
     torch.ops._C_custom_ar.free_shared_buffer(ptr)
 

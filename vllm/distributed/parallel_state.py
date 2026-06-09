@@ -310,7 +310,7 @@ class GroupCoordinator:
     #   3     |   1  |  3   |     1      |       3
     local_rank: int  # local rank used to assign devices
     rank_in_group: int  # rank inside the group
-    cpu_group: ProcessGroup  # group for CPU communication
+    cpu_group: ProcessGroup | None  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
     # device communicator (if use_device_communicator=True)
     device_communicator: DeviceCommunicatorBase | None
@@ -331,6 +331,10 @@ class GroupCoordinator:
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
+        self._group_ranks = [list(ranks) for ranks in group_ranks]
+        self._snapshot_cpu_group_prepared = False
+        self._use_message_queue_broadcaster = use_message_queue_broadcaster
+        self._snapshot_mq_broadcaster_prepared = False
 
         self_device_group = None
         self_cpu_group = None
@@ -401,7 +405,11 @@ class GroupCoordinator:
         )
 
     def create_mq_broadcaster(
-        self, writer_rank=0, external_writer_handle=None, blocking=True
+        self,
+        writer_rank=0,
+        external_writer_handle=None,
+        blocking=True,
+        connect_ip=None,
     ):
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
@@ -412,10 +420,11 @@ class GroupCoordinator:
             writer_rank=writer_rank,
             external_writer_handle=external_writer_handle,
             blocking=blocking,
+            connect_ip=connect_ip,
         )
 
     def create_single_reader_mq_broadcasters(
-        self, reader_rank_in_group=0, blocking=False
+        self, reader_rank_in_group=0, blocking=False, connect_ip=None
     ):
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
@@ -425,6 +434,7 @@ class GroupCoordinator:
             6,
             reader_rank=self.ranks[reader_rank_in_group],
             blocking=blocking,
+            connect_ip=connect_ip,
         )
 
     @property
@@ -1044,6 +1054,10 @@ class GroupCoordinator:
         secretly created GPU tensors. It is easy to mess up the current
         device. Use the CPU group instead.
         """
+        if self.cpu_group is None:
+            raise RuntimeError(
+                f"CPU process group for {self.unique_name} is not available"
+            )
         torch.distributed.barrier(group=self.cpu_group)
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
@@ -1063,16 +1077,175 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        if self.mq_broadcaster is not None:
+            self.mq_broadcaster.close()
+            self.mq_broadcaster = None
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
-        if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
-            del self.cpu_group
+        cpu_group = getattr(self, "cpu_group", None)
+        if cpu_group is not None:
+            torch.distributed.destroy_process_group(cpu_group)
+            self.cpu_group = None
         if self.device_communicator is not None:
             self.device_communicator.destroy()
-        if self.mq_broadcaster is not None:
+
+    def snapshot_checkpoint_prepare_cpu_group(
+        self, seen_process_groups: set[int]
+    ) -> None:
+        mq_broadcaster = getattr(self, "mq_broadcaster", None)
+        self._snapshot_mq_broadcaster_prepared = False
+        if mq_broadcaster is not None:
+            logger.info(
+                "MessageQueue checkpoint prepare: closing CPU broadcaster "
+                "group=%s rank=%s world_size=%s remote_addr=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                getattr(mq_broadcaster, "remote_subscribe_addr", None),
+            )
+            mq_broadcaster.close()
             self.mq_broadcaster = None
+            self._snapshot_mq_broadcaster_prepared = True
+            logger.info(
+                "MessageQueue checkpoint prepare: closed CPU broadcaster "
+                "group=%s rank=%s world_size=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+            )
+
+        cpu_group = getattr(self, "cpu_group", None)
+        if cpu_group is None:
+            logger.info(
+                "Gloo checkpoint prepare: CPU communicator already absent "
+                "group=%s rank=%s world_size=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+            )
+            self._snapshot_cpu_group_prepared = True
+            return
+
+        backend = str(torch.distributed.get_backend(cpu_group)).lower()
+        if "gloo" not in backend:
+            logger.warning(
+                "Gloo checkpoint prepare: refusing to destroy non-Gloo CPU "
+                "communicator group=%s rank=%s world_size=%s backend=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                backend,
+            )
+            return
+
+        process_group_id = id(cpu_group)
+        logger.info(
+            "Gloo checkpoint prepare: destroying CPU communicator "
+            "group=%s rank=%s world_size=%s backend=%s pg_id=%s ranks=%s",
+            self.unique_name,
+            self.rank_in_group,
+            self.world_size,
+            backend,
+            process_group_id,
+            self.ranks,
+        )
+        if process_group_id not in seen_process_groups:
+            seen_process_groups.add(process_group_id)
+            torch.distributed.destroy_process_group(cpu_group)
+        self.cpu_group = None
+        self._snapshot_cpu_group_prepared = True
+        logger.info(
+            "Gloo checkpoint prepare: destroyed CPU communicator "
+            "group=%s rank=%s world_size=%s pg_id=%s",
+            self.unique_name,
+            self.rank_in_group,
+            self.world_size,
+            process_group_id,
+        )
+
+    def snapshot_checkpoint_restore_cpu_group(self) -> None:
+        if not self._snapshot_cpu_group_prepared:
+            return
+        if self.cpu_group is not None:
+            logger.warning(
+                "Gloo checkpoint restore: CPU communicator already present "
+                "group=%s rank=%s world_size=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+            )
+            self._snapshot_cpu_group_prepared = False
+            self._snapshot_mq_broadcaster_prepared = False
+            return
+
+        self_cpu_group = None
+        for ranks in self._group_ranks:
+            with suppress_stdout():
+                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            if self.rank in ranks:
+                self_cpu_group = cpu_group
+
+        if self_cpu_group is None:
+            raise RuntimeError(
+                f"Failed to recreate Gloo CPU group for {self.unique_name}"
+            )
+
+        self.cpu_group = self_cpu_group
+        if self.device_communicator is not None:
+            self.device_communicator.cpu_group = self_cpu_group
+            pynccl_comm = getattr(self.device_communicator, "pynccl_comm", None)
+            if (
+                pynccl_comm is not None
+                and not isinstance(
+                    getattr(pynccl_comm, "group", None), StatelessProcessGroup
+                )
+            ):
+                pynccl_comm.group = self_cpu_group
+
+        if (
+            self._snapshot_mq_broadcaster_prepared
+            and self._use_message_queue_broadcaster
+            and self.world_size > 1
+        ):
+            from vllm.distributed.device_communicators.shm_broadcast import (
+                MessageQueue,
+            )
+            from vllm.utils.network_utils import get_current_ip
+
+            connect_ip = get_current_ip()
+
+            logger.info(
+                "MessageQueue checkpoint restore: recreating CPU broadcaster "
+                "group=%s rank=%s world_size=%s connect_ip=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                connect_ip,
+            )
+            self.mq_broadcaster = MessageQueue.create_from_process_group(
+                self_cpu_group, 1 << 22, 6, connect_ip=connect_ip
+            )
+            logger.info(
+                "MessageQueue checkpoint restore: recreated CPU broadcaster "
+                "group=%s rank=%s world_size=%s remote_addr=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                getattr(self.mq_broadcaster, "remote_subscribe_addr", None),
+            )
+
+        self._snapshot_mq_broadcaster_prepared = False
+        self._snapshot_cpu_group_prepared = False
+        logger.info(
+            "Gloo checkpoint restore: recreated CPU communicator "
+            "group=%s rank=%s world_size=%s backend=gloo pg_id=%s ranks=%s",
+            self.unique_name,
+            self.rank_in_group,
+            self.world_size,
+            id(self_cpu_group),
+            self.ranks,
+        )
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
         if self.device_communicator is not None:
@@ -1907,6 +2080,103 @@ def destroy_distributed_environment():
     _NODE_COUNT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def checkpoint_prepare_device_communicators():
+    for group_ref in list(_groups.values()):
+        group = group_ref()
+        if group is None or group.device_communicator is None:
+            continue
+        prepare = getattr(group.device_communicator, "snapshot_checkpoint_prepare", None)
+        if prepare is not None:
+            prepare()
+
+
+def checkpoint_prepare_cpu_groups():
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    seen_process_groups: set[int] = set()
+    for group_ref in list(_groups.values()):
+        group = group_ref()
+        if group is None:
+            continue
+        group.snapshot_checkpoint_prepare_cpu_group(seen_process_groups)
+
+
+def checkpoint_run_torch_device_group_collectives(phase: str):
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    seen_process_groups: set[int] = set()
+    for group_ref in list(_groups.values()):
+        group = group_ref()
+        if group is None or group.world_size <= 1:
+            continue
+        device_group = getattr(group, "device_group", None)
+        if device_group is None:
+            continue
+        process_group_id = id(device_group)
+        if process_group_id in seen_process_groups:
+            continue
+        seen_process_groups.add(process_group_id)
+
+        backend = str(torch.distributed.get_backend(device_group)).lower()
+        if "nccl" not in backend:
+            continue
+
+        with torch.cuda.device(group.device):
+            local = torch.tensor(
+                [group.rank_in_group], device=group.device, dtype=torch.int32
+            )
+            gathered = torch.empty(
+                group.world_size, device=group.device, dtype=torch.int32
+            )
+            torch.distributed.all_gather_into_tensor(
+                gathered, local, group=device_group
+            )
+            torch.cuda.synchronize(group.device)
+            expected = torch.arange(
+                group.world_size, device=group.device, dtype=torch.int32
+            )
+            if not torch.equal(gathered, expected):
+                raise RuntimeError(
+                    "c10d NCCL checkpoint "
+                    f"{phase}: collective validation failed for "
+                    f"group={group.unique_name} rank={group.rank_in_group} "
+                    f"world_size={group.world_size} gathered={gathered.tolist()}"
+                )
+        logger.info(
+            "c10d NCCL checkpoint %s: shim replay collective "
+            "group=%s rank=%s world_size=%s device=%s backend=%s",
+            phase,
+            group.unique_name,
+            group.rank_in_group,
+            group.world_size,
+            group.device,
+            backend,
+        )
+
+
+def checkpoint_restore_device_communicators():
+    for group_ref in list(_groups.values()):
+        group = group_ref()
+        if group is None or group.device_communicator is None:
+            continue
+        restore = getattr(group.device_communicator, "snapshot_checkpoint_restore", None)
+        if restore is not None:
+            restore()
+
+
+def checkpoint_restore_cpu_groups():
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    for group_ref in list(_groups.values()):
+        group = group_ref()
+        if group is None:
+            continue
+        group.snapshot_checkpoint_restore_cpu_group()
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):

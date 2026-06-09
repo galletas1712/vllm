@@ -3,6 +3,7 @@
 """A GPU worker class."""
 
 import gc
+import hashlib
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -35,6 +36,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     get_pp_group,
     get_tp_group,
+    get_world_group,
 )
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 from vllm.logger import init_logger
@@ -156,6 +158,7 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._snapshot_model_weight_layout_digest: tuple[str, int, int] | None = None
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -197,6 +200,171 @@ class Worker(WorkerBase):
 
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
+
+    def _compute_snapshot_model_weight_layout_digest(
+        self, phase: str
+    ) -> tuple[str, int, int] | None:
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            logger.warning(
+                "Snapshot checkpoint model weight layout digest skipped: "
+                "model_runner is unavailable phase=%s rank=%s",
+                phase,
+                self.rank,
+            )
+            return None
+
+        get_model = getattr(model_runner, "get_model", None)
+        model = (
+            get_model() if callable(get_model) else getattr(model_runner, "model", None)
+        )
+        if not isinstance(model, nn.Module):
+            logger.warning(
+                "Snapshot checkpoint model weight layout digest skipped: "
+                "model is unavailable phase=%s rank=%s model=%s",
+                phase,
+                self.rank,
+                type(model).__name__ if model is not None else None,
+            )
+            return None
+
+        digest = hashlib.sha256()
+        tensor_count = 0
+        metadata_bytes = 0
+        max_tensors = 32
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if not isinstance(param, torch.Tensor) or param.numel() == 0:
+                    continue
+
+                detached = param.detach()
+                fields = (
+                    name,
+                    str(tuple(detached.shape)),
+                    str(tuple(detached.stride())),
+                    str(detached.storage_offset()),
+                    str(detached.dtype),
+                    str(detached.device),
+                    str(detached.data_ptr()),
+                )
+                encoded = "\0".join(fields).encode("utf-8", "surrogatepass")
+                digest.update(encoded)
+                tensor_count += 1
+                metadata_bytes += len(encoded)
+                if tensor_count >= max_tensors:
+                    break
+
+        if tensor_count == 0:
+            logger.warning(
+                "Snapshot checkpoint model weight layout digest skipped: "
+                "no parameters found phase=%s rank=%s",
+                phase,
+                self.rank,
+            )
+            return None
+
+        result = (digest.hexdigest(), tensor_count, metadata_bytes)
+        logger.info(
+            "Snapshot checkpoint model weight layout digest phase=%s rank=%s "
+            "local_rank=%s digest=%s tensors=%s metadata_bytes=%s model=%s",
+            phase,
+            self.rank,
+            self.local_rank,
+            result[0],
+            tensor_count,
+            metadata_bytes,
+            type(model).__name__,
+        )
+        return result
+
+    def snapshot_checkpoint_prepare(self) -> None:
+        if not torch.cuda.is_available():
+            return
+
+        torch.cuda.synchronize()
+        self._snapshot_model_weight_layout_digest = (
+            self._compute_snapshot_model_weight_layout_digest("prepare")
+        )
+
+        from torch.multiprocessing import reductions as mp_reductions
+        from vllm.distributed import (
+            checkpoint_prepare_cpu_groups,
+            checkpoint_prepare_device_communicators,
+            checkpoint_run_torch_device_group_collectives,
+        )
+
+        checkpoint_prepare_device_communicators()
+        checkpoint_run_torch_device_group_collectives("prepare")
+        torch.cuda.synchronize()
+        # Drop PyTorch-owned CUDA IPC refs after communicator quiesce.
+        gc.collect()
+        mp_reductions.shared_cache.free_dead_references()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            from torch.distributed import distributed_c10d
+
+            if not hasattr(distributed_c10d, "_checkpoint_prepare_process_groups"):
+                raise RuntimeError(
+                    "PyTorch does not expose c10d checkpoint prepare hooks"
+                )
+            distributed_c10d._checkpoint_prepare_process_groups()
+
+        torch.cuda.synchronize()
+
+        from nccl_checkpoint import NCCLCheckpointLibrary
+
+        NCCLCheckpointLibrary().checkpoint_prepare()
+        torch.cuda.synchronize()
+        checkpoint_prepare_cpu_groups()
+        torch.cuda.synchronize()
+        gc.collect()
+        mp_reductions.shared_cache.free_dead_references()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def snapshot_checkpoint_restore(self) -> None:
+        if not torch.cuda.is_available():
+            return
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            from torch.distributed import distributed_c10d
+
+            if not hasattr(distributed_c10d, "_checkpoint_restore_process_groups"):
+                raise RuntimeError(
+                    "PyTorch does not expose c10d checkpoint restore hooks"
+                )
+            distributed_c10d._checkpoint_restore_process_groups()
+
+        from vllm.distributed import checkpoint_restore_cpu_groups
+
+        checkpoint_restore_cpu_groups()
+
+        from nccl_checkpoint import NCCLCheckpointLibrary
+
+        NCCLCheckpointLibrary().checkpoint_restore(group=get_world_group().cpu_group)
+        from vllm.distributed import (
+            checkpoint_restore_device_communicators,
+            checkpoint_run_torch_device_group_collectives,
+        )
+
+        checkpoint_restore_device_communicators()
+        checkpoint_run_torch_device_group_collectives("restore")
+
+        torch.cuda.synchronize()
+        restore_digest = self._compute_snapshot_model_weight_layout_digest("restore")
+        if (
+            self._snapshot_model_weight_layout_digest is not None
+            and restore_digest != self._snapshot_model_weight_layout_digest
+        ):
+            raise RuntimeError(
+                "Snapshot checkpoint model weight layout digest changed across restore: "
+                f"before={self._snapshot_model_weight_layout_digest} "
+                f"after={restore_digest} rank={self.rank}"
+            )
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_sleep_mode:
