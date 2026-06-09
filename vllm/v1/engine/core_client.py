@@ -162,6 +162,12 @@ class EngineCoreClient(ABC):
     def wake_up(self, tags: list[str] | None = None) -> None:
         raise NotImplementedError
 
+    def snapshot_checkpoint_prepare(self, control_dir: str) -> None:
+        raise NotImplementedError
+
+    def snapshot_checkpoint_restore(self) -> None:
+        raise NotImplementedError
+
     def is_sleeping(self) -> bool:
         raise NotImplementedError
 
@@ -237,6 +243,12 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
+        raise NotImplementedError
+
+    async def snapshot_checkpoint_prepare_async(self, control_dir: str) -> None:
+        raise NotImplementedError
+
+    async def snapshot_checkpoint_restore_async(self) -> None:
         raise NotImplementedError
 
     async def is_sleeping_async(self) -> bool:
@@ -328,6 +340,12 @@ class InprocClient(EngineCoreClient):
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.engine_core.wake_up(tags)
+
+    def snapshot_checkpoint_prepare(self, control_dir: str) -> None:
+        self.engine_core.snapshot_checkpoint_prepare(control_dir)
+
+    def snapshot_checkpoint_restore(self) -> None:
+        self.engine_core.snapshot_checkpoint_restore()
 
     def is_sleeping(self) -> bool:
         return self.engine_core.is_sleeping()
@@ -911,6 +929,12 @@ class SyncMPClient(MPClient):
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.call_utility("wake_up", tags)
 
+    def snapshot_checkpoint_prepare(self, control_dir: str) -> None:
+        self.call_utility("snapshot_checkpoint_prepare", control_dir)
+
+    def snapshot_checkpoint_restore(self) -> None:
+        self.call_utility("snapshot_checkpoint_restore")
+
     def is_sleeping(self) -> bool:
         return self.call_utility("is_sleeping")
 
@@ -1146,6 +1170,12 @@ class AsyncMPClient(MPClient):
 
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
         await self.call_utility_async("wake_up", tags)
+
+    async def snapshot_checkpoint_prepare_async(self, control_dir: str) -> None:
+        await self.call_utility_async("snapshot_checkpoint_prepare", control_dir)
+
+    async def snapshot_checkpoint_restore_async(self) -> None:
+        await self.call_utility_async("snapshot_checkpoint_restore")
 
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")

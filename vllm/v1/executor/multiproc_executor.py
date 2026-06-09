@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import multiprocessing
 import os
 import pickle
 import queue
 import signal
+import tempfile
 import threading
 import time
 import traceback
@@ -46,7 +48,10 @@ from vllm.platforms import current_platform
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.utils import numa_utils
 from vllm.utils.network_utils import (
+    assert_no_tcp_socket_fds_for_checkpoint,
+    close_tcp_socket_fds_for_current_process,
     get_distributed_init_method,
+    get_current_ip,
     get_ip,
     get_loopback_ip,
     get_open_port,
@@ -65,6 +70,52 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOu
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+SNAPSHOT_COMPLETE_FILE = "snapshot-complete"
+RESTORE_COMPLETE_FILE = "restore-complete"
+READY_FOR_CHECKPOINT_FILE = "ready-for-checkpoint"
+READY_FOR_CHECKPOINT_RANK_PREFIX = "ready-for-checkpoint-rank"
+SNAPSHOT_RPC_HANDLE_FILE = "vllm-rpc-handle.pkl"
+SNAPSHOT_WORKER_HANDLES_PREFIX = "vllm-worker-handles-rank"
+
+
+def _snapshot_path(control_dir: str, name: str) -> str:
+    return os.path.join(control_dir, name)
+
+
+def _write_pickle_atomic(path: str, value: Any) -> None:
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+
+
+def _write_text_atomic(path: str, value: str) -> None:
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(value)
+    os.replace(tmp_path, path)
+
+
+def _read_pickle_when_ready(path: str) -> Any:
+    while True:
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except FileNotFoundError:
+            time.sleep(0.1)
+
+
+def _wait_for_snapshot_sentinel(control_dir: str) -> str:
+    snapshot_path = _snapshot_path(control_dir, SNAPSHOT_COMPLETE_FILE)
+    restore_path = _snapshot_path(control_dir, RESTORE_COMPLETE_FILE)
+    while True:
+        if os.path.exists(snapshot_path):
+            return "checkpoint"
+        if os.path.exists(restore_path):
+            return "restore"
+        time.sleep(0.1)
+
 
 
 class FutureWrapper(Future):
@@ -124,19 +175,32 @@ class MultiprocExecutor(Executor):
 
         set_multiprocessing_worker_envs()
 
-        # use the loopback address get_loopback_ip() for communication.
-        distributed_init_method = get_distributed_init_method(
-            get_loopback_ip(), get_open_port()
-        )
+        self._distributed_init_dir: tempfile.TemporaryDirectory | None = None
+        if self.parallel_config.nnodes_within_dp == 1:
+            self._distributed_init_dir = tempfile.TemporaryDirectory(
+                prefix="vllm-dist-init-"
+            )
+            distributed_init_method = (
+                f"file://{self._distributed_init_dir.name}/torch_pg_store"
+            )
+        else:
+            distributed_init_method = get_distributed_init_method(
+                get_ip(), get_open_port()
+            )
         self.rpc_broadcast_mq: MessageQueue | None = None
         scheduler_output_handle: Handle | None = None
+        self.scheduler_output_handle: Handle | None = None
+        self._snapshot_control_dir: str | None = None
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
         if self.parallel_config.node_rank_within_dp == 0:
             # For leader node within each dp rank,
             # each dp will have its own leader multiproc executor.
             max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
-            mq_connect_ip = get_ip()
+            if self.parallel_config.nnodes_within_dp == 1:
+                mq_connect_ip = get_loopback_ip()
+            else:
+                mq_connect_ip = get_ip()
             logger.info(
                 "DP group leader: node_rank=%d, node_rank_within_dp=%d, "
                 "master_addr=%s, mq_connect_ip=%s (local), "
@@ -155,6 +219,7 @@ class MultiprocExecutor(Executor):
                 connect_ip=mq_connect_ip,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
+            self.scheduler_output_handle = scheduler_output_handle
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
@@ -403,6 +468,153 @@ class MultiprocExecutor(Executor):
 
         return future if non_block else future.result()
 
+    def snapshot_checkpoint_prepare(self, control_dir: str) -> None:
+        if self.rpc_broadcast_mq is None:
+            return
+
+        self._snapshot_control_dir = control_dir
+        prepare_id = f"{os.getpid()}-{time.time_ns()}"
+        logger.info(
+            "RPC MessageQueue checkpoint prepare: closing leader queues "
+            "control_dir=%s node_rank=%s world_size=%s local_world_size=%s",
+            control_dir,
+            self.parallel_config.node_rank_within_dp,
+            self.world_size,
+            self.local_world_size,
+        )
+        for name in os.listdir(control_dir):
+            if (
+                name == READY_FOR_CHECKPOINT_FILE
+                or name == SNAPSHOT_RPC_HANDLE_FILE
+                or name.startswith(READY_FOR_CHECKPOINT_RANK_PREFIX)
+                or name.startswith(SNAPSHOT_WORKER_HANDLES_PREFIX)
+            ):
+                with suppress(FileNotFoundError):
+                    os.unlink(_snapshot_path(control_dir, name))
+
+        self.collective_rpc(
+            "snapshot_checkpoint_wait",
+            kwargs={"control_dir": control_dir, "prepare_id": prepare_id},
+        )
+        logger.info(
+            "RPC MessageQueue checkpoint prepare: worker acknowledgements "
+            "received control_dir=%s prepare_id=%s",
+            control_dir,
+            prepare_id,
+        )
+        self.rpc_broadcast_mq.close()
+        self.rpc_broadcast_mq = None
+        for mq in self.response_mqs:
+            mq.close()
+        self.response_mqs = []
+        assert_no_tcp_socket_fds_for_checkpoint("multiproc-executor")
+        logger.info(
+            "RPC MessageQueue checkpoint prepare: leader queues closed "
+            "control_dir=%s prepare_id=%s",
+            control_dir,
+            prepare_id,
+        )
+        global_start_rank = (
+            self.local_world_size * self.parallel_config.node_rank_within_dp
+        )
+        local_rank_ready_paths = [
+            _snapshot_path(
+                control_dir,
+                f"{READY_FOR_CHECKPOINT_RANK_PREFIX}"
+                f"{global_start_rank + local_rank}-{prepare_id}",
+            )
+            for local_rank in range(self.local_world_size)
+        ]
+        while not all(os.path.exists(path) for path in local_rank_ready_paths):
+            time.sleep(0.1)
+
+    def snapshot_checkpoint_restore(self) -> None:
+        control_dir = self._snapshot_control_dir
+        if control_dir is None:
+            return
+        if self.parallel_config.node_rank_within_dp != 0:
+            return
+
+        max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
+        mq_connect_ip = (
+            get_loopback_ip()
+            if self.parallel_config.nnodes_within_dp == 1
+            else get_current_ip()
+        )
+        logger.info(
+            "RPC MessageQueue checkpoint restore: recreating leader queues "
+            "control_dir=%s node_rank=%s world_size=%s local_world_size=%s "
+            "connect_ip=%s",
+            control_dir,
+            self.parallel_config.node_rank_within_dp,
+            self.world_size,
+            self.local_world_size,
+            mq_connect_ip,
+        )
+        self.rpc_broadcast_mq = MessageQueue(
+            self.world_size,
+            self.local_world_size,
+            max_chunk_bytes=max_chunk_bytes,
+            connect_ip=mq_connect_ip,
+        )
+        self.scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
+        _write_pickle_atomic(
+            _snapshot_path(control_dir, SNAPSHOT_RPC_HANDLE_FILE),
+            self.scheduler_output_handle,
+        )
+        logger.info(
+            "RPC MessageQueue checkpoint restore: leader scheduler handle "
+            "published control_dir=%s",
+            control_dir,
+        )
+
+        worker_payloads = []
+        global_start_rank = (
+            self.local_world_size * self.parallel_config.node_rank_within_dp
+        )
+        for local_rank in range(self.local_world_size):
+            rank = global_start_rank + local_rank
+            worker_payloads.append(
+                _read_pickle_when_ready(
+                    _snapshot_path(
+                        control_dir,
+                        f"{SNAPSHOT_WORKER_HANDLES_PREFIX}{rank}.pkl",
+                    )
+                )
+            )
+
+        self.response_mqs = []
+        for local_rank, payload in enumerate(worker_payloads):
+            response_handle = payload["handle"]
+            if len(response_handle.local_reader_ranks) > 0:
+                self.response_mqs.append(
+                    MessageQueue.create_from_handle(response_handle, 0)
+                )
+            else:
+                self.response_mqs.append(
+                    MessageQueue.create_from_handle(
+                        worker_payloads[0]["peer_response_handles"][local_rank],
+                        -1,
+                    )
+                )
+
+        if self.world_size > self.local_world_size:
+            peer_response_handles = worker_payloads[0]["peer_response_handles"]
+            for rank in range(self.local_world_size, self.world_size):
+                self.response_mqs.append(
+                    MessageQueue.create_from_handle(peer_response_handles[rank], -1)
+                )
+
+        self.rpc_broadcast_mq.wait_until_ready()
+        for response_mq in self.response_mqs:
+            response_mq.wait_until_ready()
+        logger.info(
+            "RPC MessageQueue checkpoint restore: leader queues ready "
+            "control_dir=%s response_queues=%s",
+            control_dir,
+            len(self.response_mqs),
+        )
+
     @staticmethod
     def _ensure_worker_termination(worker_procs: list[BaseProcess]):
         """Ensure that all worker processes are terminated. Assumes workers have
@@ -485,6 +697,9 @@ class MultiprocExecutor(Executor):
             for mq in response_mqs:
                 mq.shutdown()
             self.response_mqs = []
+        if distributed_init_dir := getattr(self, "_distributed_init_dir", None):
+            distributed_init_dir.cleanup()
+            self._distributed_init_dir = None
 
         logger.debug_once("[shutdown] Executor: complete")
 
@@ -559,7 +774,10 @@ class WorkerProc:
     worker_response_mq: MessageQueue | None
 
     def _init_message_queues(
-        self, input_shm_handle: Handle, vllm_config: VllmConfig
+        self,
+        input_shm_handle: Handle | None,
+        vllm_config: VllmConfig,
+        refresh_connect_ip: bool = False,
     ) -> None:
         if vllm_config.parallel_config.nnodes_within_dp == 1:
             # Initialize MessageQueue for receiving SchedulerOutput
@@ -571,6 +789,7 @@ class WorkerProc:
             self.worker_response_mq = MessageQueue(1, 1)
             self.peer_response_handles = []
         else:
+            connect_ip = get_current_ip() if refresh_connect_ip else None
             # Initialize remote MessageQueue for receiving SchedulerOutput across nodes
             self.rpc_broadcast_mq = get_inner_dp_world_group().create_mq_broadcaster(
                 external_writer_handle=input_shm_handle,
@@ -580,13 +799,15 @@ class WorkerProc:
                 # non blocking. The handshake will be triggered when
                 # worker.rpc_broadcast_mq.wait_until_ready() is called
                 blocking=False,
+                connect_ip=connect_ip,
             )
             # Initializes remote message queue for sending the model output to the
             # driver worker, exposing peer_response_handles for driver worker
             # that include handles for all ranks
             self.worker_response_mq, self.peer_response_handles = (
                 get_inner_dp_world_group().create_single_reader_mq_broadcasters(
-                    reader_rank_in_group=0
+                    reader_rank_in_group=0,
+                    connect_ip=connect_ip,
                 )
             )
 
@@ -602,6 +823,9 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        self.local_rank = local_rank
+        self.vllm_config = vllm_config
+        self.input_shm_handle = input_shm_handle
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -778,27 +1002,169 @@ class WorkerProc:
         destroy_model_parallel()
         destroy_distributed_environment()
 
+    def _shutdown_current_queues(self) -> None:
+        if self.rpc_broadcast_mq is not None:
+            self.rpc_broadcast_mq.shutdown()
+        if self.worker_response_mq is not None:
+            self.worker_response_mq.shutdown()
+
+    def _cleanup_cuda_ipc_after_checkpoint_queue_close(self) -> None:
+        if not torch.cuda.is_available():
+            return
+
+        from torch.multiprocessing import reductions as mp_reductions
+
+        logger.info("Running post-checkpoint MessageQueue CUDA IPC cleanup")
+        torch.cuda.synchronize()
+        gc.collect()
+        mp_reductions.shared_cache.free_dead_references()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def snapshot_checkpoint_wait(
+        self, control_dir: str, prepare_id: str, output_rank: int | None
+    ):
+        if self.local_rank == 0:
+            for name in (
+                READY_FOR_CHECKPOINT_FILE,
+                SNAPSHOT_COMPLETE_FILE,
+                RESTORE_COMPLETE_FILE,
+            ):
+                with suppress(FileNotFoundError):
+                    os.unlink(_snapshot_path(control_dir, name))
+
+        self.worker.snapshot_checkpoint_prepare()
+        logger.info(
+            "RPC MessageQueue checkpoint prepare: worker closing queues "
+            "rank=%s local_rank=%s control_dir=%s",
+            self.rank,
+            self.local_rank,
+            control_dir,
+        )
+        if self.rpc_broadcast_mq is not None:
+            self.rpc_broadcast_mq.close()
+            self.rpc_broadcast_mq = None
+        self._cleanup_cuda_ipc_after_checkpoint_queue_close()
+
+        if output_rank is None or self.rank == output_rank:
+            # The checkpoint path closes worker_response_mq immediately below.
+            # Bypass async scheduling so the leader observes this response
+            # before the queue is torn down.
+            self.enqueue_output(True)
+
+        if self.worker_response_mq is not None:
+            self.worker_response_mq.close(linger=0)
+            self.worker_response_mq = None
+        self._cleanup_cuda_ipc_after_checkpoint_queue_close()
+        assert_no_tcp_socket_fds_for_checkpoint(f"worker-proc-rank-{self.rank}")
+        logger.info(
+            "RPC MessageQueue checkpoint prepare: worker queues closed "
+            "rank=%s local_rank=%s control_dir=%s",
+            self.rank,
+            self.local_rank,
+            control_dir,
+        )
+
+        rank_ready_name = (
+            f"{READY_FOR_CHECKPOINT_RANK_PREFIX}{self.rank}-{prepare_id}"
+        )
+        _write_text_atomic(_snapshot_path(control_dir, rank_ready_name), "ready\n")
+        if self.local_rank == 0:
+            global_start_rank = self.rank
+            local_world_size = self.vllm_config.parallel_config.local_world_size
+            local_rank_ready_paths = [
+                _snapshot_path(
+                    control_dir,
+                    f"{READY_FOR_CHECKPOINT_RANK_PREFIX}"
+                    f"{global_start_rank + local_rank}-{prepare_id}",
+                )
+                for local_rank in range(local_world_size)
+            ]
+            while not all(os.path.exists(path) for path in local_rank_ready_paths):
+                time.sleep(0.1)
+
+        if (
+            self.local_rank == 0
+            and self.vllm_config.parallel_config.node_rank_within_dp != 0
+        ):
+            _write_text_atomic(
+                _snapshot_path(control_dir, READY_FOR_CHECKPOINT_FILE), "ready\n"
+            )
+
+        event = _wait_for_snapshot_sentinel(control_dir)
+        with suppress(FileNotFoundError):
+            os.unlink(_snapshot_path(control_dir, rank_ready_name))
+        if self.local_rank == 0:
+            with suppress(FileNotFoundError):
+                os.unlink(_snapshot_path(control_dir, READY_FOR_CHECKPOINT_FILE))
+        if event != "restore":
+            raise SystemExit(0)
+
+        self.worker.snapshot_checkpoint_restore()
+        logger.info(
+            "RPC MessageQueue checkpoint restore: worker recreating queues "
+            "rank=%s local_rank=%s control_dir=%s",
+            self.rank,
+            self.local_rank,
+            control_dir,
+        )
+        input_shm_handle = None
+        if self.vllm_config.parallel_config.node_rank_within_dp == 0:
+            input_shm_handle = _read_pickle_when_ready(
+                _snapshot_path(control_dir, SNAPSHOT_RPC_HANDLE_FILE)
+            )
+        self._init_message_queues(
+            input_shm_handle, self.vllm_config, refresh_connect_ip=True
+        )
+        _write_pickle_atomic(
+            _snapshot_path(
+                control_dir,
+                f"{SNAPSHOT_WORKER_HANDLES_PREFIX}{self.rank}.pkl",
+            ),
+            {
+                "handle": self.worker_response_mq.export_handle()
+                if self.worker_response_mq is not None
+                else None,
+                "peer_response_handles": self.peer_response_handles,
+            },
+        )
+        if self.rpc_broadcast_mq is not None:
+            self.rpc_broadcast_mq.wait_until_ready()
+        if self.worker_response_mq is not None:
+            self.worker_response_mq.wait_until_ready()
+        logger.info(
+            "RPC MessageQueue checkpoint restore: worker queues ready "
+            "rank=%s local_rank=%s has_rpc_queue=%s has_response_queue=%s",
+            self.rank,
+            self.local_rank,
+            self.rpc_broadcast_mq is not None,
+            self.worker_response_mq is not None,
+        )
+
     def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
         if death_pipe is None:
             return
 
-        def death_pipe_monitor(queues_to_shutdown: list[MessageQueue]):
+        worker_ref = weakref.ref(self)
+
+        def death_pipe_monitor():
             try:
                 # This will block until parent process exits (pipe closes)
                 death_pipe.recv()
             except EOFError:
                 logger.info_once("Parent process exited, terminating worker queues")
                 shutdown_requested.set()
-                for mq in queues_to_shutdown:
-                    if mq is not None:
-                        mq.shutdown()
+                worker = worker_ref()
+                if worker is not None:
+                    worker._shutdown_current_queues()
             except Exception as e:
                 logger.warning("Death monitoring error: %s", e)
 
-        # Pass queue references directly to avoid gc issues if passing self
+        # Queue objects are recreated after CRIU restore, so resolve them when
+        # the death pipe fires instead of capturing stale queue instances.
         Thread(
             target=death_pipe_monitor,
-            args=([self.rpc_broadcast_mq, self.worker_response_mq],),
             daemon=True,
             name="DeathPipeMonitor",
         ).start()
@@ -842,6 +1208,7 @@ class WorkerProc:
                 os.close(fd)
             except Exception as e:
                 logger.warning("Error closing inherited connection: %s: %s", type(e), e)
+        close_tcp_socket_fds_for_current_process("worker-proc-start")
 
         try:
             # Initialize tracer
@@ -973,6 +1340,9 @@ class WorkerProc:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True
             )
+            if method == "snapshot_checkpoint_wait":
+                self.snapshot_checkpoint_wait(*args, output_rank=output_rank, **kwargs)
+                continue
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)

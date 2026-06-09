@@ -51,7 +51,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
+            use_torch_symm_mem = (
+                _ENABLE_CUSTOM_ALL_REDUCE and envs.VLLM_ALLREDUCE_USE_SYMM_MEM
+            )
             use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
 
         self.use_custom_allreduce = use_custom_allreduce
@@ -410,18 +412,43 @@ class CudaCommunicator(DeviceCommunicatorBase):
         else:
             raise ValueError("No PyNCCL communicator found")
 
+    def _snapshot_checkpoint_prepare_comms(self):
+        if self.pynccl_comm is None:
+            logger.warning(
+                "CudaCommunicator checkpoint prepare: no replayable comms "
+                "rank=%s world_size=%s device=%s",
+                self.rank_in_group,
+                self.world_size,
+                self.device,
+            )
+        else:
+            self.pynccl_comm.snapshot_checkpoint_prepare()
+
     def destroy(self):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.fi_ar_comm is not None:
             self.fi_ar_comm.destroy()
             self.fi_ar_comm = None
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]
+
+    def snapshot_checkpoint_prepare(self):
+        self._snapshot_checkpoint_prepare_comms()
+
+    def snapshot_checkpoint_restore(self):
+        if self.pynccl_comm is None:
+            logger.warning(
+                "CudaCommunicator checkpoint restore: no replayable comms "
+                "rank=%s world_size=%s device=%s",
+                self.rank_in_group,
+                self.world_size,
+                self.device,
+            )
+            return
+        self.pynccl_comm.snapshot_checkpoint_restore()
 
     def all_gatherv(
         self,

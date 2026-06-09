@@ -5,11 +5,13 @@ import ipaddress
 import os
 import socket
 import sys
+import time
 import warnings
 from collections.abc import (
     Iterator,
     Sequence,
 )
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -24,27 +26,142 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class TcpSocketFd:
+    fd: int
+    inode: str
+    state: str
+    local: str
+    remote: str
+
+
+_TCP_STATE_NAMES = {
+    "01": "TCP_ESTABLISHED",
+    "02": "TCP_SYN_SENT",
+    "03": "TCP_SYN_RECV",
+    "04": "TCP_FIN_WAIT1",
+    "05": "TCP_FIN_WAIT2",
+    "06": "TCP_TIME_WAIT",
+    "07": "TCP_CLOSE",
+    "08": "TCP_CLOSE_WAIT",
+    "09": "TCP_LAST_ACK",
+    "0A": "TCP_LISTEN",
+    "0B": "TCP_CLOSING",
+    "0C": "TCP_NEW_SYN_RECV",
+}
+
+
+def _format_tcp_endpoint(value: str) -> str:
+    addr, port = value.split(":")
+    if len(addr) == 8:
+        ip = socket.inet_ntop(socket.AF_INET, bytes.fromhex(addr)[::-1])
+    elif len(addr) == 32:
+        ip = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(addr))
+    else:
+        ip = addr
+    return f"{ip}:{int(port, 16)}"
+
+
+def collect_tcp_socket_fds_for_current_process() -> list[TcpSocketFd]:
+    fd_by_inode: dict[str, list[int]] = {}
+    for fd_name in os.listdir("/proc/self/fd"):
+        try:
+            fd = int(fd_name)
+            target = os.readlink(os.path.join("/proc/self/fd", fd_name))
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        if target.startswith("socket:[") and target.endswith("]"):
+            inode = target.removeprefix("socket:[").removesuffix("]")
+            fd_by_inode.setdefault(inode, []).append(fd)
+
+    sockets: list[TcpSocketFd] = []
+    for proc_tcp_path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(proc_tcp_path, encoding="ascii") as proc_tcp:
+                lines = proc_tcp.readlines()
+        except OSError:
+            continue
+        for line in lines[1:]:
+            fields = line.split()
+            if len(fields) < 10:
+                continue
+            inode = fields[9]
+            for fd in fd_by_inode.get(inode, ()):
+                sockets.append(
+                    TcpSocketFd(
+                        fd=fd,
+                        inode=inode,
+                        state=_TCP_STATE_NAMES.get(fields[3], fields[3]),
+                        local=_format_tcp_endpoint(fields[1]),
+                        remote=_format_tcp_endpoint(fields[2]),
+                    )
+                )
+    return sockets
+
+
+def format_tcp_socket_fds(sockets: Sequence[TcpSocketFd]) -> str:
+    return ", ".join(
+        f"fd={sock.fd} inode={sock.inode} state={sock.state} "
+        f"{sock.local}->{sock.remote}"
+        for sock in sockets
+    )
+
+
+def assert_no_tcp_socket_fds_for_checkpoint(
+    owner: str, timeout_s: float = 15.0
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    logged = False
+    while True:
+        sockets = collect_tcp_socket_fds_for_current_process()
+        if not sockets:
+            logger.info("No TCP socket fds remain before checkpoint owner=%s", owner)
+            return
+
+        if not logged:
+            logger.warning(
+                "Waiting for TCP socket fds to close before checkpoint "
+                "owner=%s sockets=%s",
+                owner,
+                format_tcp_socket_fds(sockets),
+            )
+            logged = True
+
+        if time.monotonic() >= deadline:
+            remaining = collect_tcp_socket_fds_for_current_process()
+            if remaining:
+                raise RuntimeError(
+                    "TCP socket fds remain before checkpoint "
+                    f"owner={owner} sockets={format_tcp_socket_fds(remaining)}"
+                )
+            logger.info("No TCP socket fds remain before checkpoint owner=%s", owner)
+            return
+
+        time.sleep(0.1)
+
+
+def close_tcp_socket_fds_for_current_process(owner: str) -> None:
+    sockets = collect_tcp_socket_fds_for_current_process()
+    if not sockets:
+        return
+    logger.info(
+        "Closing inherited TCP socket fds owner=%s sockets=%s",
+        owner,
+        format_tcp_socket_fds(sockets),
+    )
+    for sock in sockets:
+        with contextlib.suppress(OSError):
+            os.close(sock.fd)
+
+
 def close_sockets(sockets: Sequence[zmq.Socket | zmq.asyncio.Socket]):
     for sock in sockets:
         if sock is not None:
             sock.close(linger=0)
 
 
-def get_ip() -> str:
-    host_ip = envs.VLLM_HOST_IP
-    if "HOST_IP" in os.environ and "VLLM_HOST_IP" not in os.environ:
-        logger.warning(
-            "The environment variable HOST_IP is deprecated and ignored, as"
-            " it is often used by Docker and other software to"
-            " interact with the container's network stack. Please "
-            "use VLLM_HOST_IP instead to set the IP address for vLLM processes"
-            " to communicate with each other."
-        )
-    if host_ip:
-        return host_ip
-
-    # IP is not set, try to get it from the network interface
-
+def get_current_ip() -> str:
+    """Return the IP selected by the current network namespace."""
     # try ipv4
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -70,6 +187,22 @@ def get_ip() -> str:
         stacklevel=2,
     )
     return "0.0.0.0"
+
+
+def get_ip() -> str:
+    host_ip = envs.VLLM_HOST_IP
+    if "HOST_IP" in os.environ and "VLLM_HOST_IP" not in os.environ:
+        logger.warning(
+            "The environment variable HOST_IP is deprecated and ignored, as"
+            " it is often used by Docker and other software to"
+            " interact with the container's network stack. Please "
+            "use VLLM_HOST_IP instead to set the IP address for vLLM processes"
+            " to communicate with each other."
+        )
+    if host_ip:
+        return host_ip
+
+    return get_current_ip()
 
 
 def test_loopback_bind(address: str, family: int) -> bool:

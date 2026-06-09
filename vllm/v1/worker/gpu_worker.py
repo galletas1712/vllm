@@ -42,6 +42,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     get_pp_group,
     get_tp_group,
+    get_world_group,
 )
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
@@ -198,6 +199,82 @@ class Worker(WorkerBase):
 
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
+
+    def snapshot_checkpoint_prepare(self) -> None:
+        if not torch.cuda.is_available():
+            return
+
+        torch.cuda.synchronize()
+
+        from torch.multiprocessing import reductions as mp_reductions
+        from vllm.distributed import (
+            checkpoint_prepare_cpu_groups,
+            checkpoint_prepare_device_communicators,
+            checkpoint_run_torch_device_group_collectives,
+        )
+
+        checkpoint_prepare_device_communicators()
+        checkpoint_run_torch_device_group_collectives("prepare")
+        torch.cuda.synchronize()
+        # Drop PyTorch-owned CUDA IPC refs after communicator quiesce.
+        gc.collect()
+        mp_reductions.shared_cache.free_dead_references()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            from torch.distributed import distributed_c10d
+
+            if not hasattr(distributed_c10d, "_checkpoint_prepare_process_groups"):
+                raise RuntimeError(
+                    "PyTorch does not expose c10d checkpoint prepare hooks"
+                )
+            distributed_c10d._checkpoint_prepare_process_groups()
+
+        torch.cuda.synchronize()
+
+        from nccl_checkpoint import NCCLCheckpointLibrary
+
+        NCCLCheckpointLibrary().checkpoint_prepare()
+        torch.cuda.synchronize()
+        checkpoint_prepare_cpu_groups()
+        torch.cuda.synchronize()
+        gc.collect()
+        mp_reductions.shared_cache.free_dead_references()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def snapshot_checkpoint_restore(self) -> None:
+        if not torch.cuda.is_available():
+            return
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            from torch.distributed import distributed_c10d
+
+            if not hasattr(distributed_c10d, "_checkpoint_restore_process_groups"):
+                raise RuntimeError(
+                    "PyTorch does not expose c10d checkpoint restore hooks"
+                )
+            distributed_c10d._checkpoint_restore_process_groups()
+
+        from vllm.distributed import checkpoint_restore_cpu_groups
+
+        checkpoint_restore_cpu_groups()
+
+        from nccl_checkpoint import NCCLCheckpointLibrary
+
+        NCCLCheckpointLibrary().checkpoint_restore(group=get_world_group().cpu_group)
+        from vllm.distributed import (
+            checkpoint_restore_device_communicators,
+            checkpoint_run_torch_device_group_collectives,
+        )
+
+        checkpoint_restore_device_communicators()
+        checkpoint_run_torch_device_group_collectives("restore")
+
+        torch.cuda.synchronize()
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if (

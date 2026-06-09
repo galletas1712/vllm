@@ -942,6 +942,12 @@ class AsyncLLM(EngineClient):
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(0, 0)
 
+    async def snapshot_checkpoint_prepare(self, control_dir: str) -> None:
+        await self.engine_core.snapshot_checkpoint_prepare_async(control_dir)
+
+    async def snapshot_checkpoint_restore(self) -> None:
+        await self.engine_core.snapshot_checkpoint_restore_async()
+
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
 

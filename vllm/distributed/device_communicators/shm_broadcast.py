@@ -5,7 +5,7 @@ import pickle
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from pickle import PickleBuffer
@@ -179,6 +179,15 @@ class SpinCondition:
         if self.is_reader:
             logger.debug("Canceling waiting reads on SHM Buffer")
             self.write_cancel_socket.send(b"\x00")
+
+    def close(self, linger: int = 0):
+        for socket in (
+            self.local_notify_socket,
+            self.read_cancel_socket,
+            self.write_cancel_socket,
+        ):
+            if socket is not None:
+                socket.close(linger=linger)
 
     def wait(self, timeout_ms: int | None = None) -> None:
         """Wait for data on the shared memory buffer.
@@ -383,6 +392,7 @@ class MessageQueue:
         self.n_remote_reader = n_remote_reader
         self.shutting_down = False
         context = Context()
+        self.context = context
 
         if n_local_reader > 0:
             # for local readers, we will:
@@ -442,6 +452,7 @@ class MessageQueue:
         self.local_reader_rank = -1
         # rank does not matter for remote readers
         self._is_remote_reader = False
+        self.remote_subscribe_addr = remote_subscribe_addr
 
         self.handle = Handle(
             local_reader_ranks=local_reader_ranks,
@@ -464,6 +475,7 @@ class MessageQueue:
         self._is_writer = False
 
         context = Context()
+        self.context = context
 
         if rank in handle.local_reader_ranks:
             assert handle.buffer_handle is not None
@@ -484,6 +496,7 @@ class MessageQueue:
             self._spin_condition = SpinCondition(
                 is_reader=True, context=context, notify_address=handle.local_notify_addr
             )
+            self.remote_subscribe_addr = None
         else:
             self.buffer = None  # type: ignore
             self.current_idx = -1
@@ -501,6 +514,7 @@ class MessageQueue:
             logger.debug("Connecting to %s", socket_addr)
             self.remote_socket.connect(socket_addr)
             self._spin_condition = None  # type: ignore
+            self.remote_subscribe_addr = handle.remote_subscribe_addr
 
         self.shutting_down = False
         return self
@@ -544,6 +558,60 @@ class MessageQueue:
         self.shutting_down = True
         if self._spin_condition is not None:
             self._spin_condition.cancel()
+
+    def close(self, linger: int = 0):
+        effective_linger = 0
+        self.shutting_down = True
+        logger.info(
+            "Closing vLLM MessageQueue writer=%s local_reader=%s remote_reader=%s "
+            "remote_addr=%s requested_linger=%s effective_linger=%s",
+            self._is_writer,
+            self._is_local_reader,
+            self._is_remote_reader,
+            self.remote_subscribe_addr,
+            linger,
+            effective_linger,
+        )
+        try:
+            if self._spin_condition is not None:
+                self._spin_condition.close(linger=effective_linger)
+                self._spin_condition = None  # type: ignore
+            for socket_name in ("local_socket", "remote_socket"):
+                socket = getattr(self, socket_name, None)
+                if socket is not None:
+                    with suppress(zmq.ZMQError):
+                        socket.setsockopt(zmq.LINGER, effective_linger)
+                    if (
+                        socket_name == "remote_socket"
+                        and self.remote_subscribe_addr is not None
+                    ):
+                        if self._is_remote_reader:
+                            with suppress(zmq.ZMQError):
+                                socket.disconnect(self.remote_subscribe_addr)
+                        elif self._is_writer:
+                            with suppress(zmq.ZMQError):
+                                socket.unbind(self.remote_subscribe_addr)
+                    socket.close(linger=effective_linger)
+                    setattr(self, socket_name, None)
+            if self.buffer is not None and hasattr(self.buffer, "shared_memory"):
+                self.buffer.shared_memory.close()
+                self.buffer = None  # type: ignore
+        finally:
+            context = getattr(self, "context", None)
+            if context is not None:
+                context.destroy(linger=effective_linger)
+                self.context = None
+        if self.remote_subscribe_addr is not None:
+            time.sleep(0.1)
+        logger.info(
+            "Closed vLLM MessageQueue writer=%s local_reader=%s remote_reader=%s "
+            "remote_addr=%s effective_linger=%s",
+            self._is_writer,
+            self._is_local_reader,
+            self._is_remote_reader,
+            self.remote_subscribe_addr,
+            effective_linger,
+        )
 
     @contextmanager
     def acquire_write(self, timeout: float | None = None):
@@ -817,6 +885,7 @@ class MessageQueue:
         max_chunks,
         reader_rank: int = 0,
         blocking: bool = False,
+        connect_ip: str | None = None,
     ) -> tuple["MessageQueue", list[Handle]]:
         """
         Creates a MessageQueue for a process group with a single reader.
@@ -848,6 +917,7 @@ class MessageQueue:
             n_local_reader=1 if same_node else 0,
             max_chunk_bytes=max_chunk_bytes,
             max_chunks=max_chunks,
+            connect_ip=connect_ip,
         )
         handle = buffer_io.export_handle()
         handles = [None] * dist.get_world_size(pg) if rank == reader_rank else None
@@ -864,6 +934,7 @@ class MessageQueue:
         writer_rank: int = 0,
         external_writer_handle=None,
         blocking: bool = True,
+        connect_ip: str | None = None,
     ) -> "MessageQueue":
         """
         Creates a MessageQueue for a distributed process group with one writer and
@@ -918,6 +989,7 @@ class MessageQueue:
                     local_reader_ranks=local_reader_ranks,
                     max_chunk_bytes=max_chunk_bytes,
                     max_chunks=max_chunks,
+                    connect_ip=connect_ip,
                 )
             handle = buffer_io.export_handle()
             if isinstance(pg, ProcessGroup):

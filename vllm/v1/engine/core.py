@@ -625,6 +625,16 @@ class EngineCore:
         cleanup_dist_env_and_memory()
         logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
 
+    def _snapshot_checkpoint_prepare_scheduler(self) -> None:
+        prepare = getattr(self.scheduler, "snapshot_checkpoint_prepare", None)
+        if prepare is not None:
+            prepare()
+
+    def _snapshot_checkpoint_restore_scheduler(self) -> None:
+        restore = getattr(self.scheduler, "snapshot_checkpoint_restore", None)
+        if restore is not None:
+            restore()
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
 
@@ -713,11 +723,13 @@ class EngineCore:
         self.scheduler.set_pause_state(pause_state)
         if clear_cache:
             self._reset_caches()
+        self._snapshot_checkpoint_prepare_scheduler()
 
         return None
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
+        self._snapshot_checkpoint_restore_scheduler()
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
 
     def is_scheduler_paused(self) -> bool:
@@ -777,6 +789,16 @@ class EngineCore:
 
         # Resume scheduling (applies to all levels)
         self.resume_scheduler()
+
+    def snapshot_checkpoint_prepare(self, control_dir: str) -> None:
+        prepare = getattr(self.model_executor, "snapshot_checkpoint_prepare", None)
+        if prepare is not None:
+            prepare(control_dir)
+
+    def snapshot_checkpoint_restore(self) -> None:
+        restore = getattr(self.model_executor, "snapshot_checkpoint_restore", None)
+        if restore is not None:
+            restore()
 
     def is_sleeping(self) -> bool:
         """Check if engine is sleeping at any level."""
@@ -1640,6 +1662,7 @@ class EngineCoreProc(EngineCore):
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
             if clear_cache:
                 engine._reset_caches()
+            engine._snapshot_checkpoint_prepare_scheduler()
             future.set_result(None)
 
         if mode == "abort":
@@ -1654,6 +1677,7 @@ class EngineCoreProc(EngineCore):
         if self._pause_complete():
             if clear_cache:
                 self._reset_caches()
+            self._snapshot_checkpoint_prepare_scheduler()
             return None
 
         future = Future[Any]()
