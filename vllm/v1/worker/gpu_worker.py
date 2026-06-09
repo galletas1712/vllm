@@ -42,7 +42,6 @@ from vllm.distributed.parallel_state import (
     Handle,
     get_pp_group,
     get_tp_group,
-    get_world_group,
 )
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
@@ -265,7 +264,7 @@ class Worker(WorkerBase):
 
         from nccl_checkpoint import NCCLCheckpointLibrary
 
-        NCCLCheckpointLibrary().checkpoint_restore(group=get_world_group().cpu_group)
+        NCCLCheckpointLibrary().checkpoint_restore()
         from vllm.distributed import (
             checkpoint_restore_device_communicators,
             checkpoint_run_torch_device_group_collectives,
