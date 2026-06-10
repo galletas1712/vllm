@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -402,6 +403,7 @@ class GroupCoordinator:
 
         # VLLM_DISTRIBUTED_USE_SPLIT_GROUP gates the new ``split_group``
         # codepath. Default (False) preserves the legacy ``new_group`` path.
+        _validate_checkpoint_restore_config()
         if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
             self_device_group, self_cpu_group = _create_subgroups_split_group(
                 group_ranks, group_name, torch_distributed_backend
@@ -1233,16 +1235,20 @@ class GroupCoordinator:
             return
 
         backend = str(torch.distributed.get_backend(cpu_group)).lower()
-        if "gloo" not in backend:
-            logger.warning(
-                "Gloo checkpoint prepare: refusing to destroy non-Gloo CPU "
-                "communicator group=%s rank=%s world_size=%s backend=%s",
-                self.unique_name,
-                self.rank_in_group,
-                self.world_size,
-                backend,
+        if "nccl" in backend or "cuda" in backend:
+            raise RuntimeError(
+                "vLLM checkpoint-restore requires pure Gloo CPU groups. "
+                f"Refusing to destroy mixed CPU communicator "
+                f"group={self.unique_name} rank={self.rank_in_group} "
+                f"world_size={self.world_size} backend={backend}."
             )
-            return
+        if "gloo" not in backend:
+            raise RuntimeError(
+                "vLLM checkpoint-restore can only tear down Gloo CPU groups. "
+                f"Refusing to destroy CPU communicator group={self.unique_name} "
+                f"rank={self.rank_in_group} world_size={self.world_size} "
+                f"backend={backend}."
+            )
 
         process_group_id = id(cpu_group)
         logger.info(
@@ -1269,7 +1275,9 @@ class GroupCoordinator:
             process_group_id,
         )
 
-    def snapshot_checkpoint_restore_cpu_group(self) -> None:
+    def snapshot_checkpoint_restore_cpu_group(
+        self, restored_process_groups: dict[tuple[int, ...], ProcessGroup]
+    ) -> None:
         if not self._snapshot_cpu_group_prepared:
             return
         if self.cpu_group is not None:
@@ -1286,8 +1294,12 @@ class GroupCoordinator:
 
         self_cpu_group = None
         for ranks in self._group_ranks:
-            with suppress_stdout():
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            key = tuple(ranks)
+            cpu_group = restored_process_groups.get(key)
+            if cpu_group is None:
+                with suppress_stdout():
+                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                restored_process_groups[key] = cpu_group
             if self.rank in ranks:
                 self_cpu_group = cpu_group
 
@@ -1595,6 +1607,84 @@ def set_custom_all_reduce(enable: bool):
     _ENABLE_CUSTOM_ALL_REDUCE = enable
 
 
+def is_checkpoint_restore_enabled() -> bool:
+    return envs.VLLM_ENABLE_CHECKPOINT_RESTORE
+
+
+def _checkpoint_restore_filestore_path() -> str:
+    path = envs.VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH
+    if not path:
+        raise RuntimeError(
+            "vLLM checkpoint-restore requires "
+            "VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH to point at a shared "
+            "FileStore rendezvous file."
+        )
+    return path
+
+
+def _validate_checkpoint_restore_config() -> None:
+    if not is_checkpoint_restore_enabled():
+        return
+    if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+        raise RuntimeError(
+            "vLLM checkpoint-restore requires pure Gloo CPU groups. "
+            "Set VLLM_DISTRIBUTED_USE_SPLIT_GROUP=0."
+        )
+    _checkpoint_restore_filestore_path()
+
+
+def _checkpoint_restore_init_method(distributed_init_method: str) -> str:
+    if not is_checkpoint_restore_enabled():
+        return distributed_init_method
+
+    path = _checkpoint_restore_filestore_path()
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    init_method = f"file://{path}"
+    if distributed_init_method != init_method:
+        logger.info(
+            "vLLM checkpoint-restore: using FileStore rendezvous %s "
+            "instead of %s",
+            init_method,
+            distributed_init_method,
+        )
+    return init_method
+
+
+def checkpoint_reset_filestore() -> None:
+    if not is_checkpoint_restore_enabled():
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    from torch.distributed import distributed_c10d
+
+    if not hasattr(distributed_c10d, "_get_default_store"):
+        raise RuntimeError(
+            "PyTorch does not expose the default c10d store needed for "
+            "checkpoint-restore FileStore reset"
+        )
+
+    store = distributed_c10d._get_default_store()
+    underlying_store = getattr(store, "_underlying_non_prefix_store", None)
+    if underlying_store is not None:
+        store = underlying_store() if callable(underlying_store) else underlying_store
+    checkpoint_reset = getattr(store, "checkpoint_reset", None)
+    if checkpoint_reset is None:
+        raise RuntimeError(
+            "vLLM checkpoint-restore requires the default c10d store to be "
+            "a FileStore with checkpoint_reset(); got "
+            f"{type(store).__name__}. Ensure torch.distributed was initialized "
+            "from VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH."
+        )
+    checkpoint_reset()
+    logger.info(
+        "vLLM checkpoint-restore: reset FileStore rendezvous path=%s",
+        _checkpoint_restore_filestore_path(),
+    )
+
+
 def _init_process_group_for_split_group(
     *,
     backend: str,
@@ -1706,6 +1796,12 @@ def init_distributed_environment(
 
     config = get_current_vllm_config_or_none()
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
+    _validate_checkpoint_restore_config()
+    if is_checkpoint_restore_enabled() and enable_elastic_ep:
+        raise RuntimeError(
+            "vLLM checkpoint-restore does not yet support elastic expert "
+            "parallelism."
+        )
     if (
         config is not None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
@@ -1737,6 +1833,7 @@ def init_distributed_environment(
                 rank,
                 distributed_init_method,
             )
+    distributed_init_method = _checkpoint_restore_init_method(distributed_init_method)
     if not torch.distributed.is_initialized():
         logger.info(
             "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
@@ -2317,11 +2414,13 @@ def checkpoint_restore_cpu_groups():
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return
 
+    checkpoint_reset_filestore()
+    restored_process_groups: dict[tuple[int, ...], ProcessGroup] = {}
     for group_ref in list(_groups.values()):
         group = group_ref()
         if group is None:
             continue
-        group.snapshot_checkpoint_restore_cpu_group()
+        group.snapshot_checkpoint_restore_cpu_group(restored_process_groups)
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):

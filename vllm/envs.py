@@ -64,6 +64,8 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
+    VLLM_ENABLE_CHECKPOINT_RESTORE: bool = False
+    VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH: str | None = None
     VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
@@ -890,6 +892,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mixed ``cpu:gloo,cuda:nccl`` backend + eager ``device_id`` binding.
     "VLLM_DISTRIBUTED_USE_SPLIT_GROUP": lambda: bool(
         int(os.getenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", "0"))
+    ),
+    # Enable Dynamo/CRIU checkpoint-restore integration. This mode keeps NCCL
+    # communicators alive and tears down/recreates pure-Gloo CPU groups.
+    "VLLM_ENABLE_CHECKPOINT_RESTORE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_CHECKPOINT_RESTORE", "0"))
+    ),
+    # Shared FileStore path used for torch.distributed rendezvous in
+    # checkpoint-restore mode.
+    "VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH": lambda: os.getenv(
+        "VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH"
     ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
