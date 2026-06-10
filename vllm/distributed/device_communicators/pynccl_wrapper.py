@@ -350,9 +350,26 @@ class NCCLLibrary:
                 return entry
         return None
 
+    @staticmethod
+    def find_preloaded_nccl_library() -> str | None:
+        for entry in os.environ.get("LD_PRELOAD", "").replace(":", " ").split():
+            filename = os.path.basename(entry)
+            if filename == "libnccl.so" or filename.startswith("libnccl.so."):
+                return entry
+        return None
+
     def __init__(self, so_file: str | None = None):
-        so_file = so_file or find_nccl_library()
         shim_file = self.find_preloaded_checkpoint_shim()
+        if so_file is None and shim_file is not None:
+            preloaded_nccl = self.find_preloaded_nccl_library()
+            if preloaded_nccl is not None and envs.VLLM_NCCL_SO_PATH is None:
+                so_file = preloaded_nccl
+                logger.info_once(
+                    "PyNCCL checkpoint shim mode: using preloaded NCCL "
+                    "library %s",
+                    so_file,
+                )
+        so_file = so_file or find_nccl_library()
         funcs_key = (
             so_file
             if shim_file is None
@@ -361,7 +378,12 @@ class NCCLLibrary:
 
         try:
             if so_file not in NCCLLibrary.path_to_library_cache:
-                lib = ctypes.CDLL(so_file)
+                load_mode = (
+                    ctypes.DEFAULT_MODE
+                    if shim_file is None
+                    else ctypes.RTLD_GLOBAL
+                )
+                lib = ctypes.CDLL(so_file, mode=load_mode)
                 NCCLLibrary.path_to_library_cache[so_file] = lib
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
             self.shim_lib = None

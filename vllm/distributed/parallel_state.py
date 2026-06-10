@@ -1265,6 +1265,20 @@ class GroupCoordinator:
             seen_process_groups.add(process_group_id)
             torch.distributed.destroy_process_group(cpu_group)
         self.cpu_group = None
+        if self.device_communicator is not None:
+            if getattr(self.device_communicator, "cpu_group", None) is cpu_group:
+                self.device_communicator.cpu_group = None
+            pynccl_comm = getattr(self.device_communicator, "pynccl_comm", None)
+            if (
+                pynccl_comm is not None
+                and getattr(pynccl_comm, "group", None) is cpu_group
+                and not isinstance(
+                    getattr(pynccl_comm, "group", None), StatelessProcessGroup
+                )
+            ):
+                pynccl_comm.group = None
+        cpu_group = None
+        gc.collect()
         self._snapshot_cpu_group_prepared = True
         logger.info(
             "Gloo checkpoint prepare: destroyed CPU communicator "
@@ -1611,13 +1625,13 @@ def is_checkpoint_restore_enabled() -> bool:
     return envs.VLLM_ENABLE_CHECKPOINT_RESTORE
 
 
-def _checkpoint_restore_filestore_path() -> str:
-    path = envs.VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH
+def _checkpoint_restore_rendezvous_file() -> str:
+    path = os.environ.get("TORCH_C10D_RENDEZVOUS_FILE")
     if not path:
         raise RuntimeError(
             "vLLM checkpoint-restore requires "
-            "VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH to point at a shared "
-            "FileStore rendezvous file."
+            "TORCH_C10D_RENDEZVOUS_FILE to point at the snapshot-control "
+            "rendezvous file."
         )
     return path
 
@@ -1630,59 +1644,116 @@ def _validate_checkpoint_restore_config() -> None:
             "vLLM checkpoint-restore requires pure Gloo CPU groups. "
             "Set VLLM_DISTRIBUTED_USE_SPLIT_GROUP=0."
         )
-    _checkpoint_restore_filestore_path()
+    _checkpoint_restore_rendezvous_file()
 
 
 def _checkpoint_restore_init_method(distributed_init_method: str) -> str:
-    if not is_checkpoint_restore_enabled():
-        return distributed_init_method
-
-    path = _checkpoint_restore_filestore_path()
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    init_method = f"file://{path}"
-    if distributed_init_method != init_method:
+    if is_checkpoint_restore_enabled():
         logger.info(
-            "vLLM checkpoint-restore: using FileStore rendezvous %s "
-            "instead of %s",
-            init_method,
+            "vLLM checkpoint-restore: using checkpoint-aware TCPStore "
+            "rendezvous file %s with init method %s",
+            _checkpoint_restore_rendezvous_file(),
             distributed_init_method,
         )
-    return init_method
+    return distributed_init_method
 
 
-def checkpoint_reset_filestore() -> None:
-    if not is_checkpoint_restore_enabled():
-        return
+def _default_c10d_store():
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return
+        return None
 
     from torch.distributed import distributed_c10d
 
     if not hasattr(distributed_c10d, "_get_default_store"):
         raise RuntimeError(
             "PyTorch does not expose the default c10d store needed for "
-            "checkpoint-restore FileStore reset"
+            "checkpoint-restore"
         )
 
-    store = distributed_c10d._get_default_store()
+    return distributed_c10d._get_default_store()
+
+
+def checkpoint_prepare_default_store() -> None:
+    if not is_checkpoint_restore_enabled():
+        return
+
+    store = _default_c10d_store()
+    if store is None:
+        return
+
+    checkpoint_prepare = getattr(store, "checkpoint_prepare", None)
+    if checkpoint_prepare is None:
+        raise RuntimeError(
+            "vLLM checkpoint-restore requires the default c10d store to expose "
+            "checkpoint_prepare(). Ensure PyTorch wraps it with "
+            "CheckpointRendezvousStore via TORCH_C10D_RENDEZVOUS_FILE."
+        )
+    checkpoint_prepare()
+    logger.info(
+        "vLLM checkpoint-restore: prepared default c10d store from %s",
+        _checkpoint_restore_rendezvous_file(),
+    )
+
+
+def checkpoint_restore_default_store() -> None:
+    if not is_checkpoint_restore_enabled():
+        return
+
+    store = _default_c10d_store()
+    if store is None:
+        return
+
+    checkpoint_restore = getattr(store, "checkpoint_restore", None)
+    if checkpoint_restore is None:
+        raise RuntimeError(
+            "vLLM checkpoint-restore requires the default c10d store to expose "
+            "checkpoint_restore(). Ensure PyTorch wraps it with "
+            "CheckpointRendezvousStore via TORCH_C10D_RENDEZVOUS_FILE."
+        )
+    checkpoint_restore()
+    logger.info(
+        "vLLM checkpoint-restore: restored default c10d store from %s",
+        _checkpoint_restore_rendezvous_file(),
+    )
+
+
+def checkpoint_reset_filestore() -> None:
+    if not is_checkpoint_restore_enabled():
+        return
+
+    path = envs.VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH
+    if not path:
+        return
+
+    store = _default_c10d_store()
+    if store is None:
+        return
+
     underlying_store = getattr(store, "_underlying_non_prefix_store", None)
     if underlying_store is not None:
         store = underlying_store() if callable(underlying_store) else underlying_store
     checkpoint_reset = getattr(store, "checkpoint_reset", None)
     if checkpoint_reset is None:
-        raise RuntimeError(
-            "vLLM checkpoint-restore requires the default c10d store to be "
-            "a FileStore with checkpoint_reset(); got "
-            f"{type(store).__name__}. Ensure torch.distributed was initialized "
-            "from VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH."
+        logger.info(
+            "vLLM checkpoint-restore: default c10d store is %s, skipping "
+            "optional FileStore reset",
+            type(store).__name__,
         )
+        return
     checkpoint_reset()
     logger.info(
         "vLLM checkpoint-restore: reset FileStore rendezvous path=%s",
-        _checkpoint_restore_filestore_path(),
+        path,
     )
+
+
+def checkpoint_restore_rendezvous() -> None:
+    checkpoint_restore_default_store()
+    checkpoint_reset_filestore()
+
+
+def checkpoint_prepare_rendezvous() -> None:
+    checkpoint_prepare_default_store()
 
 
 def _init_process_group_for_split_group(
@@ -2414,7 +2485,6 @@ def checkpoint_restore_cpu_groups():
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return
 
-    checkpoint_reset_filestore()
     restored_process_groups: dict[tuple[int, ...], ProcessGroup] = {}
     for group_ref in list(_groups.values()):
         group = group_ref()

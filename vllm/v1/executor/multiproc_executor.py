@@ -77,6 +77,8 @@ READY_FOR_CHECKPOINT_FILE = "ready-for-checkpoint"
 READY_FOR_CHECKPOINT_RANK_PREFIX = "ready-for-checkpoint-rank"
 SNAPSHOT_RPC_HANDLE_FILE = "vllm-rpc-handle.pkl"
 SNAPSHOT_WORKER_HANDLES_PREFIX = "vllm-worker-handles-rank"
+SNAPSHOT_RESTORE_RANK_BARRIER_DIR = "vllm-restore-rank-barrier"
+SNAPSHOT_RESTORE_BARRIER_TIMEOUT_SEC = 600.0
 
 
 def _snapshot_path(control_dir: str, name: str) -> str:
@@ -114,6 +116,60 @@ def _wait_for_snapshot_sentinel(control_dir: str) -> str:
             return "checkpoint"
         if os.path.exists(restore_path):
             return "restore"
+        time.sleep(0.1)
+
+
+def _wait_for_snapshot_restore_rank_barrier(
+    control_dir: str,
+    rank: int,
+    world_size: int,
+) -> None:
+    if world_size <= 1:
+        return
+
+    filestore_path = envs.VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH
+    if filestore_path:
+        barrier_root = os.path.join(
+            os.path.dirname(filestore_path),
+            SNAPSHOT_RESTORE_RANK_BARRIER_DIR,
+        )
+    else:
+        barrier_root = os.path.join(control_dir, SNAPSHOT_RESTORE_RANK_BARRIER_DIR)
+
+    os.makedirs(barrier_root, exist_ok=True)
+    rank_path = os.path.join(barrier_root, f"rank-{rank}.ready")
+    _write_text_atomic(rank_path, f"{os.getpid()}\n")
+
+    logger.info(
+        "RPC MessageQueue checkpoint restore: waiting at rank barrier "
+        "rank=%s world_size=%s barrier_dir=%s",
+        rank,
+        world_size,
+        barrier_root,
+    )
+    expected_paths = [
+        os.path.join(barrier_root, f"rank-{barrier_rank}.ready")
+        for barrier_rank in range(world_size)
+    ]
+    deadline = time.monotonic() + SNAPSHOT_RESTORE_BARRIER_TIMEOUT_SEC
+    while True:
+        missing = [path for path in expected_paths if not os.path.exists(path)]
+        if not missing:
+            logger.info(
+                "RPC MessageQueue checkpoint restore: rank barrier complete "
+                "rank=%s world_size=%s barrier_dir=%s",
+                rank,
+                world_size,
+                barrier_root,
+            )
+            return
+        if time.monotonic() >= deadline:
+            missing_names = [os.path.basename(path) for path in missing]
+            raise TimeoutError(
+                "Timed out waiting for checkpoint restore rank barrier "
+                f"rank={rank} world_size={world_size} "
+                f"missing={missing_names} barrier_dir={barrier_root}"
+            )
         time.sleep(0.1)
 
 
@@ -507,6 +563,7 @@ class MultiprocExecutor(Executor):
         for mq in self.response_mqs:
             mq.close()
         self.response_mqs = []
+        close_tcp_socket_fds_for_current_process("multiproc-executor")
         assert_no_tcp_socket_fds_for_checkpoint("multiproc-executor")
         logger.info(
             "RPC MessageQueue checkpoint prepare: leader queues closed "
@@ -825,6 +882,7 @@ class WorkerProc:
         self.rank = rank
         self.local_rank = local_rank
         self.vllm_config = vllm_config
+        self.world_size = vllm_config.parallel_config.world_size
         self.input_shm_handle = input_shm_handle
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
@@ -1057,7 +1115,9 @@ class WorkerProc:
             self.worker_response_mq.close(linger=0)
             self.worker_response_mq = None
         self._cleanup_cuda_ipc_after_checkpoint_queue_close()
-        assert_no_tcp_socket_fds_for_checkpoint(f"worker-proc-rank-{self.rank}")
+        owner = f"worker-proc-rank-{self.rank}"
+        close_tcp_socket_fds_for_current_process(owner)
+        assert_no_tcp_socket_fds_for_checkpoint(owner)
         logger.info(
             "RPC MessageQueue checkpoint prepare: worker queues closed "
             "rank=%s local_rank=%s control_dir=%s",
@@ -1101,6 +1161,11 @@ class WorkerProc:
         if event != "restore":
             raise SystemExit(0)
 
+        _wait_for_snapshot_restore_rank_barrier(
+            control_dir,
+            self.rank,
+            self.vllm_config.parallel_config.world_size,
+        )
         self.worker.snapshot_checkpoint_restore()
         logger.info(
             "RPC MessageQueue checkpoint restore: worker recreating queues "

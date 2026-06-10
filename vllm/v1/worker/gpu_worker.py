@@ -209,6 +209,7 @@ class Worker(WorkerBase):
         from vllm.distributed import (
             checkpoint_prepare_cpu_groups,
             checkpoint_prepare_device_communicators,
+            checkpoint_prepare_rendezvous,
             checkpoint_run_torch_device_group_collectives,
         )
 
@@ -216,6 +217,7 @@ class Worker(WorkerBase):
         checkpoint_run_torch_device_group_collectives("prepare")
         torch.cuda.synchronize()
         checkpoint_prepare_cpu_groups()
+        checkpoint_prepare_rendezvous()
         torch.cuda.synchronize()
         # Drop PyTorch-owned CUDA IPC refs after communicator quiesce.
         gc.collect()
@@ -235,10 +237,6 @@ class Worker(WorkerBase):
 
         torch.cuda.synchronize()
 
-        from nccl_checkpoint import NCCLCheckpointLibrary
-
-        NCCLCheckpointLibrary().checkpoint_prepare()
-        torch.cuda.synchronize()
         gc.collect()
         mp_reductions.shared_cache.free_dead_references()
         torch.cuda.ipc_collect()
@@ -249,10 +247,6 @@ class Worker(WorkerBase):
         if not torch.cuda.is_available():
             return
 
-        from nccl_checkpoint import NCCLCheckpointLibrary
-
-        NCCLCheckpointLibrary().checkpoint_restore()
-
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             from torch.distributed import distributed_c10d
 
@@ -262,8 +256,12 @@ class Worker(WorkerBase):
                 )
             distributed_c10d._checkpoint_restore_process_groups()
 
-        from vllm.distributed import checkpoint_restore_cpu_groups
+        from vllm.distributed import (
+            checkpoint_restore_cpu_groups,
+            checkpoint_restore_rendezvous,
+        )
 
+        checkpoint_restore_rendezvous()
         checkpoint_restore_cpu_groups()
 
         from vllm.distributed import (
