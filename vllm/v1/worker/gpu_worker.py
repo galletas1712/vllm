@@ -4,6 +4,7 @@
 
 import gc
 import os
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
@@ -161,6 +162,7 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._checkpoint_wake_restore_done = False
 
     def sleep(self, level: int = 1) -> None:
         from vllm.distributed import is_checkpoint_restore_enabled
@@ -195,7 +197,7 @@ class Worker(WorkerBase):
         from vllm.distributed import is_checkpoint_restore_enabled
 
         if is_checkpoint_restore_enabled():
-            self._checkpoint_wake_restore()
+            self.checkpoint_restore_transport()
 
         allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
@@ -215,6 +217,7 @@ class Worker(WorkerBase):
         if not torch.cuda.is_available():
             return
 
+        self._checkpoint_wake_restore_done = False
         torch.cuda.synchronize()
 
         from torch.multiprocessing import reductions as mp_reductions
@@ -259,6 +262,7 @@ class Worker(WorkerBase):
         NCCLCheckpointLibrary().checkpoint_prepare()
         logger.info("Checkpoint sleep prepare: prepared NCCL shim")
         torch.cuda.synchronize()
+        time.sleep(1)
 
         logger.info("Checkpoint sleep prepare: final CUDA cleanup")
         gc.collect()
@@ -268,7 +272,10 @@ class Worker(WorkerBase):
         torch.cuda.synchronize()
         logger.info("Checkpoint sleep prepare: complete")
 
-    def _checkpoint_wake_restore(self) -> None:
+    def checkpoint_restore_transport(self) -> None:
+        if self._checkpoint_wake_restore_done:
+            logger.info("Checkpoint wake restore: already complete")
+            return
         if not torch.cuda.is_available():
             return
 
@@ -305,6 +312,7 @@ class Worker(WorkerBase):
         checkpoint_restore_device_communicators()
 
         torch.cuda.synchronize()
+        self._checkpoint_wake_restore_done = True
         logger.info("Checkpoint wake restore: complete")
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
