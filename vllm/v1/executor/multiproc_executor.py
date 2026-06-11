@@ -1172,6 +1172,20 @@ class WorkerProc:
             self.local_rank,
             control_dir,
         )
+        from vllm.distributed import (
+            checkpoint_restore_cpu_groups,
+            checkpoint_restore_rendezvous,
+        )
+
+        logger.info(
+            "RPC MessageQueue checkpoint restore: worker restoring CPU "
+            "rendezvous/groups rank=%s local_rank=%s control_dir=%s",
+            self.rank,
+            self.local_rank,
+            control_dir,
+        )
+        checkpoint_restore_rendezvous()
+        checkpoint_restore_cpu_groups()
         input_shm_handle = None
         if self.vllm_config.parallel_config.node_rank_within_dp == 0:
             input_shm_handle = _read_pickle_when_ready(

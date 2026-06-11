@@ -1614,6 +1614,7 @@ def graph_capture(device: torch.device):
 logger = init_logger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
+_CHECKPOINT_RENDEZVOUS_RESTORED = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1679,11 +1680,15 @@ def _default_c10d_store():
 
 
 def checkpoint_reset_filestore() -> None:
+    global _CHECKPOINT_RENDEZVOUS_RESTORED
+
     if not is_checkpoint_restore_enabled():
         return
 
     path = envs.VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH
     if not path:
+        return
+    if _CHECKPOINT_RENDEZVOUS_RESTORED:
         return
 
     store = _default_c10d_store()
@@ -1706,6 +1711,7 @@ def checkpoint_reset_filestore() -> None:
         "vLLM checkpoint-restore: reset FileStore rendezvous path=%s",
         path,
     )
+    _CHECKPOINT_RENDEZVOUS_RESTORED = True
 
 
 def checkpoint_restore_rendezvous() -> None:
@@ -1713,6 +1719,9 @@ def checkpoint_restore_rendezvous() -> None:
 
 
 def checkpoint_prepare_rendezvous() -> None:
+    global _CHECKPOINT_RENDEZVOUS_RESTORED
+
+    _CHECKPOINT_RENDEZVOUS_RESTORED = False
     return
 
 
