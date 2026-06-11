@@ -1092,7 +1092,6 @@ class WorkerProc:
                 with suppress(FileNotFoundError):
                     os.unlink(_snapshot_path(control_dir, name))
 
-        self.worker.snapshot_checkpoint_prepare()
         logger.info(
             "RPC MessageQueue checkpoint prepare: worker closing queues "
             "rank=%s local_rank=%s control_dir=%s",
@@ -1166,7 +1165,6 @@ class WorkerProc:
             self.rank,
             self.vllm_config.parallel_config.world_size,
         )
-        self.worker.snapshot_checkpoint_restore()
         logger.info(
             "RPC MessageQueue checkpoint restore: worker recreating queues "
             "rank=%s local_rank=%s control_dir=%s",

@@ -163,28 +163,40 @@ class Worker(WorkerBase):
         self._pp_send_work: list[Handle] = []
 
     def sleep(self, level: int = 1) -> None:
-        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+        from vllm.distributed import is_checkpoint_restore_enabled
 
-        # Save the buffers before level 2 sleep
-        if level == 2:
-            model = self.model_runner.model
-            self._sleep_saved_buffers = {
-                name: buffer.cpu().clone() for name, buffer in model.named_buffers()
-            }
+        if level >= 1:
+            free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
-        allocator = get_mem_allocator_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
-        free_bytes_after_sleep, total = torch.cuda.mem_get_info()
-        freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
-        used_bytes = total - free_bytes_after_sleep
-        assert freed_bytes >= 0, "Memory usage increased after sleeping."
-        logger.info(
-            "Sleep mode freed %s GiB memory, %s GiB memory is still in use.",
-            format_gib(freed_bytes),
-            format_gib(used_bytes),
-        )
+            # Save the buffers before level 2 sleep
+            if level == 2:
+                model = self.model_runner.model
+                self._sleep_saved_buffers = {
+                    name: buffer.cpu().clone()
+                    for name, buffer in model.named_buffers()
+                }
+
+            allocator = get_mem_allocator_instance()
+            allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+            free_bytes_after_sleep, total = torch.cuda.mem_get_info()
+            freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+            used_bytes = total - free_bytes_after_sleep
+            assert freed_bytes >= 0, "Memory usage increased after sleeping."
+            logger.info(
+                "Sleep mode freed %s GiB memory, %s GiB memory is still in use.",
+                format_gib(freed_bytes),
+                format_gib(used_bytes),
+            )
+
+        if is_checkpoint_restore_enabled():
+            self._checkpoint_sleep_prepare()
 
     def wake_up(self, tags: list[str] | None = None) -> None:
+        from vllm.distributed import is_checkpoint_restore_enabled
+
+        if is_checkpoint_restore_enabled():
+            self._checkpoint_wake_restore()
+
         allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
 
@@ -199,7 +211,7 @@ class Worker(WorkerBase):
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
 
-    def snapshot_checkpoint_prepare(self) -> None:
+    def _checkpoint_sleep_prepare(self) -> None:
         if not torch.cuda.is_available():
             return
 
@@ -248,7 +260,7 @@ class Worker(WorkerBase):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def snapshot_checkpoint_restore(self) -> None:
+    def _checkpoint_wake_restore(self) -> None:
         if not torch.cuda.is_available():
             return
 
