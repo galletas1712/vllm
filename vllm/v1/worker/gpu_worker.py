@@ -222,14 +222,16 @@ class Worker(WorkerBase):
             checkpoint_prepare_cpu_groups,
             checkpoint_prepare_device_communicators,
             checkpoint_prepare_rendezvous,
-            checkpoint_run_torch_device_group_collectives,
         )
 
+        logger.info("Checkpoint sleep prepare: marking device communicators")
         checkpoint_prepare_device_communicators()
-        checkpoint_run_torch_device_group_collectives("prepare")
         torch.cuda.synchronize()
+        logger.info("Checkpoint sleep prepare: destroying CPU groups")
         checkpoint_prepare_cpu_groups()
+        logger.info("Checkpoint sleep prepare: preparing rendezvous")
         checkpoint_prepare_rendezvous()
+        logger.info("Checkpoint sleep prepare: collecting CUDA IPC references")
         torch.cuda.synchronize()
         # Drop PyTorch-owned CUDA IPC refs after communicator quiesce.
         gc.collect()
@@ -245,20 +247,26 @@ class Worker(WorkerBase):
                 raise RuntimeError(
                     "PyTorch does not expose c10d checkpoint prepare hooks"
                 )
+            logger.info("Checkpoint sleep prepare: preparing c10d NCCL groups")
             distributed_c10d._checkpoint_prepare_process_groups()
+            logger.info("Checkpoint sleep prepare: prepared c10d NCCL groups")
 
         torch.cuda.synchronize()
 
         from nccl_checkpoint import NCCLCheckpointLibrary
 
+        logger.info("Checkpoint sleep prepare: preparing NCCL shim")
         NCCLCheckpointLibrary().checkpoint_prepare()
+        logger.info("Checkpoint sleep prepare: prepared NCCL shim")
         torch.cuda.synchronize()
 
+        logger.info("Checkpoint sleep prepare: final CUDA cleanup")
         gc.collect()
         mp_reductions.shared_cache.free_dead_references()
         torch.cuda.ipc_collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        logger.info("Checkpoint sleep prepare: complete")
 
     def _checkpoint_wake_restore(self) -> None:
         if not torch.cuda.is_available():
@@ -266,7 +274,9 @@ class Worker(WorkerBase):
 
         from nccl_checkpoint import NCCLCheckpointLibrary
 
+        logger.info("Checkpoint wake restore: restoring NCCL shim")
         NCCLCheckpointLibrary().checkpoint_restore()
+        logger.info("Checkpoint wake restore: restored NCCL shim")
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             from torch.distributed import distributed_c10d
@@ -275,25 +285,27 @@ class Worker(WorkerBase):
                 raise RuntimeError(
                     "PyTorch does not expose c10d checkpoint restore hooks"
                 )
+            logger.info("Checkpoint wake restore: restoring c10d NCCL groups")
             distributed_c10d._checkpoint_restore_process_groups()
+            logger.info("Checkpoint wake restore: restored c10d NCCL groups")
 
         from vllm.distributed import (
             checkpoint_restore_cpu_groups,
             checkpoint_restore_rendezvous,
         )
 
+        logger.info("Checkpoint wake restore: resetting rendezvous")
         checkpoint_restore_rendezvous()
+        logger.info("Checkpoint wake restore: restoring CPU groups")
         checkpoint_restore_cpu_groups()
 
-        from vllm.distributed import (
-            checkpoint_restore_device_communicators,
-            checkpoint_run_torch_device_group_collectives,
-        )
+        from vllm.distributed import checkpoint_restore_device_communicators
 
+        logger.info("Checkpoint wake restore: restoring device communicators")
         checkpoint_restore_device_communicators()
-        checkpoint_run_torch_device_group_collectives("restore")
 
         torch.cuda.synchronize()
+        logger.info("Checkpoint wake restore: complete")
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if (

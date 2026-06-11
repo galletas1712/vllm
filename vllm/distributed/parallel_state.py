@@ -2377,60 +2377,6 @@ def checkpoint_prepare_cpu_groups():
         group.snapshot_checkpoint_prepare_cpu_group(seen_process_groups)
 
 
-def checkpoint_run_torch_device_group_collectives(phase: str):
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return
-
-    seen_process_groups: set[int] = set()
-    for group_ref in list(_groups.values()):
-        group = group_ref()
-        if group is None or group.world_size <= 1:
-            continue
-        device_group = getattr(group, "device_group", None)
-        if device_group is None:
-            continue
-        process_group_id = id(device_group)
-        if process_group_id in seen_process_groups:
-            continue
-        seen_process_groups.add(process_group_id)
-
-        backend = str(torch.distributed.get_backend(device_group)).lower()
-        if "nccl" not in backend:
-            continue
-
-        with torch.cuda.device(group.device):
-            local = torch.tensor(
-                [group.rank_in_group], device=group.device, dtype=torch.int32
-            )
-            gathered = torch.empty(
-                group.world_size, device=group.device, dtype=torch.int32
-            )
-            torch.distributed.all_gather_into_tensor(
-                gathered, local, group=device_group
-            )
-            torch.cuda.synchronize(group.device)
-            expected = torch.arange(
-                group.world_size, device=group.device, dtype=torch.int32
-            )
-            if not torch.equal(gathered, expected):
-                raise RuntimeError(
-                    "c10d NCCL checkpoint "
-                    f"{phase}: collective validation failed for "
-                    f"group={group.unique_name} rank={group.rank_in_group} "
-                    f"world_size={group.world_size} gathered={gathered.tolist()}"
-                )
-        logger.info(
-            "c10d NCCL checkpoint %s: shim replay collective "
-            "group=%s rank=%s world_size=%s device=%s backend=%s",
-            phase,
-            group.unique_name,
-            group.rank_in_group,
-            group.world_size,
-            group.device,
-            backend,
-        )
-
-
 def checkpoint_restore_device_communicators():
     for group_ref in list(_groups.values()):
         group = group_ref()
