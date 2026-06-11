@@ -1648,14 +1648,26 @@ def _validate_checkpoint_restore_config() -> None:
 
 
 def _checkpoint_restore_init_method(distributed_init_method: str) -> str:
-    if is_checkpoint_restore_enabled():
-        logger.info(
-            "vLLM checkpoint-restore: using checkpoint-aware TCPStore "
-            "rendezvous file %s with init method %s",
-            _checkpoint_restore_rendezvous_file(),
-            distributed_init_method,
+    if not is_checkpoint_restore_enabled():
+        return distributed_init_method
+
+    filestore_path = envs.VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH
+    if not filestore_path:
+        raise RuntimeError(
+            "vLLM checkpoint-restore requires "
+            "VLLM_CHECKPOINT_RESTORE_FILESTORE_PATH to point at a shared "
+            "FileStore rendezvous file."
         )
-    return distributed_init_method
+    os.makedirs(os.path.dirname(filestore_path), exist_ok=True)
+    init_method = f"file://{filestore_path}"
+    logger.info(
+        "vLLM checkpoint-restore: using FileStore init method %s and "
+        "checkpoint-aware TCPStore rendezvous file %s instead of %s",
+        init_method,
+        _checkpoint_restore_rendezvous_file(),
+        distributed_init_method,
+    )
+    return init_method
 
 
 def _default_c10d_store():
