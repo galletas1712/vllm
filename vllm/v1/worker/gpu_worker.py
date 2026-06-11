@@ -237,6 +237,11 @@ class Worker(WorkerBase):
 
         torch.cuda.synchronize()
 
+        from nccl_checkpoint import NCCLCheckpointLibrary
+
+        NCCLCheckpointLibrary().checkpoint_prepare()
+        torch.cuda.synchronize()
+
         gc.collect()
         mp_reductions.shared_cache.free_dead_references()
         torch.cuda.ipc_collect()
@@ -246,6 +251,10 @@ class Worker(WorkerBase):
     def snapshot_checkpoint_restore(self) -> None:
         if not torch.cuda.is_available():
             return
+
+        from nccl_checkpoint import NCCLCheckpointLibrary
+
+        NCCLCheckpointLibrary().checkpoint_restore()
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             from torch.distributed import distributed_c10d
