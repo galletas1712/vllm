@@ -40,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import (
     Handle,
+    get_ep_group,
     get_pp_group,
     get_tp_group,
 )
@@ -161,6 +162,34 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._all2all_checkpoint_paused = False
+
+    def _run_all2all_checkpoint_hook(self, hook_name: str) -> bool:
+        try:
+            ep_group = get_ep_group()
+        except AssertionError:
+            return False
+
+        device_communicator = ep_group.device_communicator
+        if device_communicator is None:
+            return False
+
+        all2all_manager = device_communicator.all2all_manager
+        if all2all_manager is None:
+            return False
+
+        hook = getattr(all2all_manager, hook_name, None)
+        if hook is None:
+            return False
+
+        if hook():
+            logger.info(
+                "Ran %s on %s.",
+                hook_name,
+                all2all_manager.__class__.__name__,
+            )
+            return True
+        return False
 
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
@@ -183,10 +212,17 @@ class Worker(WorkerBase):
             format_gib(freed_bytes),
             format_gib(used_bytes),
         )
+        self._all2all_checkpoint_paused = self._run_all2all_checkpoint_hook(
+            "checkpoint_pause"
+        )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
+        if self._all2all_checkpoint_paused:
+            if not self._run_all2all_checkpoint_hook("checkpoint_resume"):
+                raise RuntimeError("Failed to resume all2all checkpoint state")
+            self._all2all_checkpoint_paused = False
 
         # Restore the buffers after level 2 sleep
         if len(self._sleep_saved_buffers):
