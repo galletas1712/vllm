@@ -724,6 +724,49 @@ class EngineCore:
         """Return whether the scheduler is in any pause state."""
         return self.scheduler.pause_state != PauseState.UNPAUSED
 
+    def _maybe_pause_mooncake_graph_stable(self) -> None:
+        if not envs.VLLM_MOONCAKE_GRAPH_STABLE_CHECKPOINT:
+            return
+        connector = self.scheduler.get_kv_connector()
+        if connector is None:
+            raise RuntimeError(
+                "VLLM_MOONCAKE_GRAPH_STABLE_CHECKPOINT is set but no KV "
+                "connector is configured for Mooncake checkpoint pause."
+            )
+        pause = getattr(connector, "checkpoint_pause_graph_stable", None)
+        if pause is None or not callable(pause):
+            raise RuntimeError(
+                "VLLM_MOONCAKE_GRAPH_STABLE_CHECKPOINT requires a Mooncake "
+                "KV connector exposing checkpoint_pause_graph_stable()."
+            )
+        pause()
+
+    def _maybe_resume_mooncake_graph_stable(self) -> None:
+        if not envs.VLLM_MOONCAKE_GRAPH_STABLE_CHECKPOINT:
+            return
+        connector = self.scheduler.get_kv_connector()
+        if connector is None:
+            raise RuntimeError(
+                "VLLM_MOONCAKE_GRAPH_STABLE_CHECKPOINT is set but no KV "
+                "connector is configured for Mooncake checkpoint resume."
+            )
+        resume = getattr(connector, "checkpoint_resume_graph_stable", None)
+        if resume is None or not callable(resume):
+            raise RuntimeError(
+                "VLLM_MOONCAKE_GRAPH_STABLE_CHECKPOINT requires a Mooncake "
+                "KV connector exposing checkpoint_resume_graph_stable()."
+            )
+        fresh_bootstrap = envs.VLLM_MOONCAKE_GRAPH_STABLE_FRESH_BOOTSTRAP
+        fresh_metadata = envs.VLLM_MOONCAKE_GRAPH_STABLE_FRESH_METADATA
+        if not fresh_bootstrap and not fresh_metadata:
+            raise RuntimeError(
+                "VLLM_MOONCAKE_GRAPH_STABLE_CHECKPOINT wake_up requires "
+                "VLLM_MOONCAKE_GRAPH_STABLE_FRESH_BOOTSTRAP or "
+                "VLLM_MOONCAKE_GRAPH_STABLE_FRESH_METADATA with restored "
+                "Mooncake bootstrap/remote metadata."
+            )
+        resume(fresh_bootstrap=fresh_bootstrap, fresh_metadata=fresh_metadata)
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
         """Put the engine to sleep at the specified level.
 
@@ -746,6 +789,7 @@ class EngineCore:
         # Level 1+: Delegate to executor for GPU memory management
         model_executor = self.model_executor
         if pause_future is None:
+            self._maybe_pause_mooncake_graph_stable()
             model_executor.sleep(level)
             return None
 
@@ -754,6 +798,7 @@ class EngineCore:
         def pause_complete(f: Future):
             try:
                 f.result()  # propagate any exception
+                self._maybe_pause_mooncake_graph_stable()
                 future.set_result(model_executor.sleep(level))
             except Exception as e:
                 future.set_exception(e)
@@ -773,6 +818,7 @@ class EngineCore:
             tags = [t for t in tags if t != "scheduling"]
 
         if tags is None or tags:
+            self._maybe_resume_mooncake_graph_stable()
             self.model_executor.wake_up(tags)
 
         # Resume scheduling (applies to all levels)
