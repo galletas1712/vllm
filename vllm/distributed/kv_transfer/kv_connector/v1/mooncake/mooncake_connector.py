@@ -59,14 +59,10 @@ from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
 
-_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED = (
-    "Mooncake KV graph-stable checkpoint pause/resume is not supported in "
-    "vLLM. Preserving CUDA virtual addresses is not sufficient: Mooncake "
-    "Transfer Engine transport state, remote sessions, memory registrations, "
-    "rkeys, IPC handles, and outstanding transfers must be quiesced and "
-    "refreshed in place before an existing CUDA graph can be replayed after "
-    "restore. Disable Mooncake KV for graph-stable checkpointing, or fully "
-    "tear down and reinitialize the connector and recapture CUDA graphs."
+_MOONCAKE_GRAPH_STABLE_CHECKPOINT_API_MISSING = (
+    "Installed Mooncake lacks graph-stable checkpoint APIs. Upgrade to a "
+    "Mooncake build that exposes checkpoint_pause_graph_stable() and "
+    "checkpoint_resume_graph_stable() for VMM/stable-address checkpointing."
 )
 
 try:
@@ -443,10 +439,19 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.register_kv_caches(kv_caches)
 
     def checkpoint_pause_graph_stable(self) -> None:
-        raise NotImplementedError(_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+        assert self.connector_worker is not None
+        self.connector_worker.checkpoint_pause_graph_stable()
 
-    def checkpoint_resume_graph_stable(self) -> None:
-        raise NotImplementedError(_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+    def checkpoint_resume_graph_stable(
+        self,
+        fresh_bootstrap: str = "",
+        fresh_metadata: str = "",
+    ) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.checkpoint_resume_graph_stable(
+            fresh_bootstrap=fresh_bootstrap,
+            fresh_metadata=fresh_metadata,
+        )
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -782,6 +787,7 @@ class MooncakeConnectorWorker:
         if ret_value != 0:
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
 
+        self._checkpoint_graph_stable_paused = False
         self.rpc_port = self.engine.get_rpc_port()
 
         logger.debug(
@@ -1377,6 +1383,8 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError("Mooncake transfer attempted while checkpoint paused")
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
@@ -1473,11 +1481,62 @@ class MooncakeConnectorWorker:
         )
         ready_event.wait()  # Wait for listener ZMQ socket to be ready.
 
-    def checkpoint_pause_graph_stable(self) -> None:
-        raise NotImplementedError(_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+    def _require_checkpoint_api(self, method_name: str) -> Any:
+        method = getattr(self.engine, method_name, None)
+        if method is None or not callable(method):
+            raise RuntimeError(_MOONCAKE_GRAPH_STABLE_CHECKPOINT_API_MISSING)
+        return method
 
-    def checkpoint_resume_graph_stable(self) -> None:
-        raise NotImplementedError(_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+    def checkpoint_pause_graph_stable(self) -> None:
+        if self._checkpoint_graph_stable_paused:
+            return
+        pause = self._require_checkpoint_api("checkpoint_pause_graph_stable")
+        ret = pause()
+        if ret != 0:
+            raise RuntimeError(
+                "Mooncake graph-stable checkpoint pause failed with "
+                f"return code {ret}. Ensure transfers are quiesced and "
+                "graph-visible buffers use CUDA VMM stable addresses."
+            )
+        self._remote_agents.clear()
+        self._pending_bootstrap_queries.clear()
+        self._checkpoint_graph_stable_paused = True
+
+    def checkpoint_resume_graph_stable(
+        self,
+        fresh_bootstrap: str = "",
+        fresh_metadata: str = "",
+    ) -> None:
+        if not self._checkpoint_graph_stable_paused:
+            raise RuntimeError(
+                "Mooncake graph-stable checkpoint resume called before pause"
+            )
+        if not fresh_bootstrap and not fresh_metadata:
+            raise RuntimeError(
+                "Mooncake graph-stable checkpoint resume requires fresh "
+                "bootstrap or remote metadata for the restored node/IP."
+            )
+        resume = self._require_checkpoint_api("checkpoint_resume_graph_stable")
+        try:
+            ret = resume(
+                fresh_bootstrap=fresh_bootstrap,
+                fresh_metadata=fresh_metadata,
+            )
+        except TypeError as e:
+            raise RuntimeError(
+                "Installed Mooncake checkpoint_resume_graph_stable() does not "
+                "accept fresh bootstrap/metadata arguments required for "
+                "graph-stable resume on a restored node/IP."
+            ) from e
+        if ret != 0:
+            raise RuntimeError(
+                "Mooncake graph-stable checkpoint resume failed with "
+                f"return code {ret}. Reload fresh remote bootstrap/address "
+                "metadata before resuming transfers."
+            )
+        self._remote_agents.clear()
+        self._pending_bootstrap_queries.clear()
+        self._checkpoint_graph_stable_paused = False
 
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
         finished_recving_reqs = self.finished_recving_reqs
@@ -1557,6 +1616,8 @@ class MooncakeConnectorWorker:
         worker_addr: str,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError("Mooncake receive attempted while checkpoint paused")
         req_ids = set(pull_metas)
         metadata = MooncakeXferMetadata(
             remote_hostname=self.hostname,
@@ -1635,6 +1696,8 @@ class MooncakeConnectorWorker:
             )
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError("Mooncake bootstrap attempted while checkpoint paused")
         url = remote_bootstrap_addr + "/query"
         try:
             async with httpx.AsyncClient() as client:
@@ -1667,6 +1730,8 @@ class MooncakeConnectorWorker:
         remote_engine_id: EngineId,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError("Mooncake receive attempted while checkpoint paused")
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
@@ -1709,6 +1774,8 @@ class MooncakeConnectorWorker:
     async def _start_load_kv(
         self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]]
     ):
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError("Mooncake load attempted while checkpoint paused")
         for remote_engine_id, pull_metas in reqs_to_recv.items():
             if remote_engine_id not in self._remote_agents:
                 asyncio.create_task(
@@ -1718,6 +1785,8 @@ class MooncakeConnectorWorker:
                 self.receive_kv(remote_engine_id, pull_metas)
 
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError("Mooncake send attempted while checkpoint paused")
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
@@ -1746,6 +1815,8 @@ class MooncakeConnectorWorker:
                 assert not send_meta.ready.is_set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError("Mooncake transfer attempted while checkpoint paused")
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop

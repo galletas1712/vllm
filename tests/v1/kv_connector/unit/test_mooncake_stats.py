@@ -4,6 +4,8 @@
 import threading
 from unittest.mock import MagicMock
 
+import pytest
+
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     MooncakeConnector,
     MooncakeConnectorWorker,
@@ -206,6 +208,7 @@ def _bare_worker() -> MooncakeConnectorWorker:
     worker.async_zmq_ctx = MagicMock()
     worker.is_kv_consumer = True
     worker.is_kv_producer = True
+    worker._checkpoint_graph_stable_paused = False
     return worker
 
 
@@ -256,6 +259,46 @@ def test_get_kv_connector_stats_returns_and_resets():
 
     # Second call returns None because the worker's stats were reset.
     assert worker.get_kv_connector_stats() is None
+
+
+def test_checkpoint_pause_resume_calls_mooncake_engine():
+    worker = _bare_worker()
+    worker._remote_agents = {"old": {}}
+    worker._pending_bootstrap_queries = {"old": MagicMock()}
+    worker.engine.checkpoint_pause_graph_stable.return_value = 0
+    worker.engine.checkpoint_resume_graph_stable.return_value = 0
+
+    worker.checkpoint_pause_graph_stable()
+
+    assert worker._checkpoint_graph_stable_paused
+    assert worker._remote_agents == {}
+    assert worker._pending_bootstrap_queries == {}
+
+    worker.checkpoint_resume_graph_stable(fresh_metadata="new-peer-metadata")
+
+    assert not worker._checkpoint_graph_stable_paused
+    worker.engine.checkpoint_resume_graph_stable.assert_called_once_with(
+        fresh_bootstrap="", fresh_metadata="new-peer-metadata"
+    )
+
+
+def test_checkpoint_resume_requires_pause_and_fresh_metadata():
+    worker = _bare_worker()
+
+    with pytest.raises(RuntimeError, match="before pause"):
+        worker.checkpoint_resume_graph_stable(fresh_metadata="metadata")
+
+    worker._checkpoint_graph_stable_paused = True
+    with pytest.raises(RuntimeError, match="requires fresh"):
+        worker.checkpoint_resume_graph_stable()
+
+
+def test_send_blocks_fails_while_checkpoint_paused():
+    worker = _bare_worker()
+    worker._checkpoint_graph_stable_paused = True
+
+    with pytest.raises(RuntimeError, match="checkpoint paused"):
+        worker._send_blocks("host:1234", [0x1000], [0x2000], [4096])
 
 
 def test_expired_request_bumps_counter():

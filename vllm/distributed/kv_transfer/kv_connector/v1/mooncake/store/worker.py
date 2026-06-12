@@ -73,12 +73,11 @@ logger = init_logger(__name__)
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 
-_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED = (
-    "Mooncake store graph-stable checkpoint pause/resume is not supported in "
-    "vLLM. The store owns Mooncake TransferEngine registrations, RDMA/IPC "
-    "transport state, remote store connections, and background send/recv "
-    "threads that cannot yet be quiesced and refreshed in place while "
-    "preserving CUDA graph-visible addresses."
+_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_API_MISSING = (
+    "Installed Mooncake store lacks graph-stable checkpoint APIs. Upgrade to "
+    "a Mooncake build that exposes checkpoint_pause_graph_stable() and "
+    "checkpoint_resume_graph_stable(), or use the direct Mooncake Transfer "
+    "Engine connector for prototype graph-stable pause/resume hooks."
 )
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
@@ -1071,6 +1070,7 @@ class MooncakeStoreWorker:
         self.kv_send_thread: KVCacheStoreSendingThread | None = None
         self.kv_recv_thread: KVCacheStoreRecvingThread | None = None
         self.finished_store_req: set[str] = set()
+        self._checkpoint_graph_stable_paused = False
         self._kv_connector_stats_lock = threading.Lock()
         self.kv_connector_stats = MooncakeStoreConnectorStats()
 
@@ -1228,17 +1228,90 @@ class MooncakeStoreWorker:
         self.kv_recv_thread.start()
         ready_event_recving.wait()
 
-    def checkpoint_pause_graph_stable(self) -> None:
-        raise NotImplementedError(_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+    def _require_checkpoint_api(self, method_name: str) -> Any:
+        method = getattr(self.store, method_name, None)
+        if method is None or not callable(method):
+            raise RuntimeError(_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_API_MISSING)
+        return method
 
-    def checkpoint_resume_graph_stable(self) -> None:
-        raise NotImplementedError(_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+    def checkpoint_pause_graph_stable(self) -> None:
+        if self._checkpoint_graph_stable_paused:
+            return
+        if (
+            self.kv_send_thread is not None
+            and self.kv_send_thread.stored_requests
+        ):
+            raise RuntimeError(
+                "Mooncake store checkpoint pause requires a quiesced send "
+                "thread; stored requests are still pending."
+            )
+        if self.kv_send_thread is not None:
+            unfinished = getattr(
+                self.kv_send_thread.request_queue, "unfinished_tasks", 0
+            )
+            if unfinished:
+                raise RuntimeError(
+                    "Mooncake store checkpoint pause requires a quiesced send "
+                    f"queue; {unfinished} request(s) are unfinished."
+                )
+        if self.kv_recv_thread is not None:
+            unfinished = getattr(
+                self.kv_recv_thread.request_queue, "unfinished_tasks", 0
+            )
+            if unfinished:
+                raise RuntimeError(
+                    "Mooncake store checkpoint pause requires a quiesced recv "
+                    f"queue; {unfinished} request(s) are unfinished."
+                )
+        pause = self._require_checkpoint_api("checkpoint_pause_graph_stable")
+        ret = pause()
+        if ret != 0:
+            raise RuntimeError(
+                "Mooncake store graph-stable checkpoint pause failed with "
+                f"return code {ret}."
+            )
+        self._checkpoint_graph_stable_paused = True
+
+    def checkpoint_resume_graph_stable(
+        self,
+        fresh_bootstrap: str = "",
+        fresh_metadata: str = "",
+    ) -> None:
+        if not self._checkpoint_graph_stable_paused:
+            raise RuntimeError(
+                "Mooncake store graph-stable checkpoint resume called before pause"
+            )
+        if not fresh_bootstrap and not fresh_metadata:
+            raise RuntimeError(
+                "Mooncake store graph-stable checkpoint resume requires fresh "
+                "bootstrap or remote metadata for the restored node/IP."
+            )
+        resume = self._require_checkpoint_api("checkpoint_resume_graph_stable")
+        try:
+            ret = resume(
+                fresh_bootstrap=fresh_bootstrap,
+                fresh_metadata=fresh_metadata,
+            )
+        except TypeError as e:
+            raise RuntimeError(
+                "Installed Mooncake store checkpoint_resume_graph_stable() "
+                "does not accept fresh bootstrap/metadata arguments required "
+                "for graph-stable resume."
+            ) from e
+        if ret != 0:
+            raise RuntimeError(
+                "Mooncake store graph-stable checkpoint resume failed with "
+                f"return code {ret}."
+            )
+        self._checkpoint_graph_stable_paused = False
 
     def start_load_kv(
         self,
         metadata: MooncakeStoreConnectorMetadata,
     ):
         """No-op: loads are issued in get_finished() for overlap."""
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError("Mooncake store load attempted while checkpoint paused")
         pass
 
     def wait_for_save(
@@ -1246,6 +1319,8 @@ class MooncakeStoreWorker:
         metadata: MooncakeStoreConnectorMetadata,
     ):
         """No-op: stores are issued in get_finished() for overlap."""
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError("Mooncake store save attempted while checkpoint paused")
         pass
 
     def get_finished(
@@ -1259,6 +1334,10 @@ class MooncakeStoreWorker:
         compute is launched on the compute stream) for better
         compute-I/O overlap.
         """
+        if self._checkpoint_graph_stable_paused:
+            raise RuntimeError(
+                "Mooncake store transfer attempted while checkpoint paused"
+            )
         # Issue async loads
         for request in meta.requests:
             load_spec = request.load_spec

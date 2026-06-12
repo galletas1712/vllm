@@ -1139,6 +1139,7 @@ def _make_bare_worker(
     worker.enable_kv_events = False
     worker.kv_send_thread = None
     worker.kv_recv_thread = None
+    worker._checkpoint_graph_stable_paused = False
     worker.tp_size = 1
     worker.num_kv_head = 1
     worker.pp_size = 1
@@ -1558,6 +1559,54 @@ def test_lookup_records_mooncake_metrics():
     assert isinstance(stats, MooncakeStoreConnectorStats)
     assert len(stats.data["lookup_exists"]) == 1
     assert stats.data["lookup_exists"][0]["num_keys"] == 2
+
+
+def test_store_checkpoint_pause_resume_calls_store_hooks():
+    worker = _make_bare_worker()
+    worker.store.checkpoint_pause_graph_stable.return_value = 0
+    worker.store.checkpoint_resume_graph_stable.return_value = 0
+
+    worker.checkpoint_pause_graph_stable()
+
+    assert worker._checkpoint_graph_stable_paused
+    worker.store.checkpoint_pause_graph_stable.assert_called_once_with()
+
+    worker.checkpoint_resume_graph_stable(fresh_metadata="new-store-metadata")
+
+    assert not worker._checkpoint_graph_stable_paused
+    worker.store.checkpoint_resume_graph_stable.assert_called_once_with(
+        fresh_bootstrap="", fresh_metadata="new-store-metadata"
+    )
+
+
+def test_store_checkpoint_pause_requires_quiesced_send_thread():
+    worker = _make_bare_worker()
+    worker.kv_send_thread = MagicMock()
+    worker.kv_send_thread.stored_requests = {"req": 1}
+
+    with pytest.raises(RuntimeError, match="quiesced send"):
+        worker.checkpoint_pause_graph_stable()
+
+
+def test_store_checkpoint_resume_requires_pause_and_fresh_metadata():
+    worker = _make_bare_worker()
+
+    with pytest.raises(RuntimeError, match="before pause"):
+        worker.checkpoint_resume_graph_stable(fresh_metadata="metadata")
+
+    worker._checkpoint_graph_stable_paused = True
+    with pytest.raises(RuntimeError, match="requires fresh"):
+        worker.checkpoint_resume_graph_stable()
+
+
+def test_store_operations_fail_while_checkpoint_paused():
+    worker = _make_bare_worker()
+    worker._checkpoint_graph_stable_paused = True
+
+    with pytest.raises(RuntimeError, match="checkpoint paused"):
+        worker.start_load_kv(MagicMock())
+    with pytest.raises(RuntimeError, match="checkpoint paused"):
+        worker.wait_for_save(MagicMock())
 
 
 def test_store_worker_close_releases_store():

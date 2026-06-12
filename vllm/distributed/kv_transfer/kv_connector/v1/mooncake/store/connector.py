@@ -50,16 +50,6 @@ from .worker import MooncakeStoreWorker
 
 logger = init_logger(__name__)
 
-_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED = (
-    "Mooncake store graph-stable checkpoint pause/resume is not supported in "
-    "vLLM. The store owns Mooncake TransferEngine registrations, RDMA/IPC "
-    "transport state, remote store connections, and background send/recv "
-    "threads that cannot yet be quiesced and refreshed in place while "
-    "preserving CUDA graph-visible addresses. Disable Mooncake store for "
-    "graph-stable checkpointing, or fully tear down and reinitialize the store "
-    "and recapture CUDA graphs."
-)
-
 
 class MooncakeStoreKVEvents(KVConnectorKVEvents):
     """KV event aggregation for MooncakeStoreConnector."""
@@ -273,10 +263,19 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.register_kv_caches(kv_caches)
 
     def checkpoint_pause_graph_stable(self) -> None:
-        raise NotImplementedError(_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+        assert self.connector_worker is not None
+        self.connector_worker.checkpoint_pause_graph_stable()
 
-    def checkpoint_resume_graph_stable(self) -> None:
-        raise NotImplementedError(_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+    def checkpoint_resume_graph_stable(
+        self,
+        fresh_bootstrap: str = "",
+        fresh_metadata: str = "",
+    ) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.checkpoint_resume_graph_stable(
+            fresh_bootstrap=fresh_bootstrap,
+            fresh_metadata=fresh_metadata,
+        )
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type
