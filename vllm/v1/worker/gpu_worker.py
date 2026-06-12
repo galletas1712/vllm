@@ -77,6 +77,12 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+_FLASHINFER_MNNVL_ALL2ALL_BACKENDS = {
+    "flashinfer_all2allv",
+    "flashinfer_nvlink_one_sided",
+    "flashinfer_nvlink_two_sided",
+}
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -161,9 +167,74 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._flashinfer_mnnvl_detached_for_sleep = False
+
+    def _get_flashinfer_mnnvl_all2all_manager(self) -> Any | None:
+        backend = self.vllm_config.parallel_config.all2all_backend
+        if backend not in _FLASHINFER_MNNVL_ALL2ALL_BACKENDS:
+            return None
+
+        from vllm.distributed import get_ep_group
+
+        ep_group = get_ep_group()
+        device_communicator = ep_group.device_communicator
+        if device_communicator is None:
+            if ep_group.world_size == 1:
+                return None
+            raise RuntimeError(
+                "FlashInfer MNNVL all2all backend is configured, but the EP "
+                "group has no device communicator"
+            )
+
+        all2all_manager = device_communicator.all2all_manager
+        if all2all_manager is None:
+            raise RuntimeError(
+                "FlashInfer MNNVL all2all backend is configured, but the "
+                "device communicator has no all2all manager"
+            )
+        return all2all_manager
+
+    def _checkpoint_pause_flashinfer_mnnvl(self) -> bool:
+        all2all_manager = self._get_flashinfer_mnnvl_all2all_manager()
+        if all2all_manager is None:
+            return False
+
+        checkpoint_pause = getattr(all2all_manager, "checkpoint_pause", None)
+        if checkpoint_pause is None:
+            raise RuntimeError(
+                "FlashInfer MNNVL all2all manager does not expose "
+                "checkpoint_pause; install a FlashInfer/vLLM build with "
+                "graph-stable checkpoint support"
+            )
+
+        torch.cuda.synchronize()
+        detached = bool(checkpoint_pause())
+        if detached:
+            logger.info("Detached FlashInfer MNNVL mappings for checkpoint")
+        return detached
+
+    def _checkpoint_resume_flashinfer_mnnvl(self) -> bool:
+        all2all_manager = self._get_flashinfer_mnnvl_all2all_manager()
+        if all2all_manager is None:
+            return False
+
+        checkpoint_resume = getattr(all2all_manager, "checkpoint_resume", None)
+        if checkpoint_resume is None:
+            raise RuntimeError(
+                "FlashInfer MNNVL all2all manager does not expose "
+                "checkpoint_resume; install a FlashInfer/vLLM build with "
+                "graph-stable checkpoint support"
+            )
+
+        remapped = bool(checkpoint_resume())
+        if remapped:
+            torch.cuda.synchronize()
+            logger.info("Remapped FlashInfer MNNVL mappings after checkpoint")
+        return remapped
 
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+        detached_flashinfer_mnnvl = False
 
         # Save the buffers before level 2 sleep
         if level == 2:
@@ -173,7 +244,21 @@ class Worker(WorkerBase):
             }
 
         allocator = get_mem_allocator_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        try:
+            detached_flashinfer_mnnvl = self._checkpoint_pause_flashinfer_mnnvl()
+            self._flashinfer_mnnvl_detached_for_sleep = detached_flashinfer_mnnvl
+            allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        except Exception:
+            if detached_flashinfer_mnnvl:
+                try:
+                    self._checkpoint_resume_flashinfer_mnnvl()
+                    self._flashinfer_mnnvl_detached_for_sleep = False
+                except Exception:
+                    logger.exception(
+                        "Failed to remap FlashInfer MNNVL mappings after "
+                        "sleep failure"
+                    )
+            raise
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -195,6 +280,10 @@ class Worker(WorkerBase):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
+
+        if self._flashinfer_mnnvl_detached_for_sleep:
+            self._checkpoint_resume_flashinfer_mnnvl()
+            self._flashinfer_mnnvl_detached_for_sleep = False
 
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
