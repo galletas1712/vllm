@@ -73,6 +73,14 @@ logger = init_logger(__name__)
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 
+_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED = (
+    "Mooncake store graph-stable checkpoint pause/resume is not supported in "
+    "vLLM. The store owns Mooncake TransferEngine registrations, RDMA/IPC "
+    "transport state, remote store connections, and background send/recv "
+    "threads that cannot yet be quiesced and refreshed in place while "
+    "preserving CUDA graph-visible addresses."
+)
+
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
 
@@ -1219,6 +1227,12 @@ class MooncakeStoreWorker:
         )
         self.kv_recv_thread.start()
         ready_event_recving.wait()
+
+    def checkpoint_pause_graph_stable(self) -> None:
+        raise NotImplementedError(_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+
+    def checkpoint_resume_graph_stable(self) -> None:
+        raise NotImplementedError(_MOONCAKE_STORE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
 
     def start_load_kv(
         self,

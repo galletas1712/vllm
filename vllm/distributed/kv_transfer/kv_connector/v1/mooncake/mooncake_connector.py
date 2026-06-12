@@ -59,6 +59,16 @@ from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
 
+_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED = (
+    "Mooncake KV graph-stable checkpoint pause/resume is not supported in "
+    "vLLM. Preserving CUDA virtual addresses is not sufficient: Mooncake "
+    "Transfer Engine transport state, remote sessions, memory registrations, "
+    "rkeys, IPC handles, and outstanding transfers must be quiesced and "
+    "refreshed in place before an existing CUDA graph can be replayed after "
+    "restore. Disable Mooncake KV for graph-stable checkpointing, or fully "
+    "tear down and reinitialize the connector and recapture CUDA graphs."
+)
+
 try:
     from mooncake.engine import TransferEngine
 except ImportError:
@@ -431,6 +441,12 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
+
+    def checkpoint_pause_graph_stable(self) -> None:
+        raise NotImplementedError(_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+
+    def checkpoint_resume_graph_stable(self) -> None:
+        raise NotImplementedError(_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -1456,6 +1472,12 @@ class MooncakeConnectorWorker:
             self._mooncake_sender_listener(ready_event), self.sender_loop
         )
         ready_event.wait()  # Wait for listener ZMQ socket to be ready.
+
+    def checkpoint_pause_graph_stable(self) -> None:
+        raise NotImplementedError(_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
+
+    def checkpoint_resume_graph_stable(self) -> None:
+        raise NotImplementedError(_MOONCAKE_GRAPH_STABLE_CHECKPOINT_UNSUPPORTED)
 
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
         finished_recving_reqs = self.finished_recving_reqs
