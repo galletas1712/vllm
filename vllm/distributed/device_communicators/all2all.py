@@ -449,6 +449,64 @@ class NixlEPAll2AllManager(All2AllManagerBase):
 
             self._unmask_connected_ranks(target_ep_size)
 
+    def get_graph_visible_addresses(self) -> dict[str, int]:
+        """Return CUDA VAs that NIXL EP kernels may embed in CUDA graphs."""
+        with NixlEPAll2AllManager._lock:
+            assert NixlEPAll2AllManager._buffer is not None
+            buffer = NixlEPAll2AllManager._buffer.buffer
+            if not hasattr(buffer, "get_graph_visible_addresses"):
+                raise RuntimeError("Installed NIXL EP lacks graph-stable CR APIs")
+            return buffer.get_graph_visible_addresses()
+
+    def checkpoint_pause_preserve_va(self) -> dict[str, int]:
+        """
+        Pause NIXL EP for checkpointing while preserving graph-visible VAs.
+
+        This intentionally does not call destroy(); the underlying NIXL EP
+        buffer keeps CUDA virtual address reservations alive while releasing
+        transport-native state that must not be checkpointed.
+        """
+        with NixlEPAll2AllManager._lock:
+            assert NixlEPAll2AllManager._buffer is not None
+            state = NixlEPAll2AllManager._buffer
+            if not hasattr(state.buffer, "checkpoint_pause_preserve_va"):
+                raise RuntimeError("Installed NIXL EP lacks graph-stable CR APIs")
+            return state.buffer.checkpoint_pause_preserve_va()
+
+    def checkpoint_resume_preserve_va(
+        self, expected_addresses: dict[str, int] | None = None
+    ) -> None:
+        """
+        Resume NIXL EP after checkpoint restore at the preserved CUDA VAs.
+
+        Call this from vLLM/Dynamo wake-up handling after CUDA context restore
+        and before any CUDA graph replay that can launch NIXL EP kernels. The
+        underlying NIXL runtime is responsible for supporting both LL and HT
+        graph-stable resume through stable graph-visible indirection.
+        """
+        with NixlEPAll2AllManager._lock:
+            assert NixlEPAll2AllManager._buffer is not None
+            state = NixlEPAll2AllManager._buffer
+            if not hasattr(state.buffer, "checkpoint_resume_preserve_va"):
+                raise RuntimeError("Installed NIXL EP lacks graph-stable CR APIs")
+            state.buffer.set_tcp_store_group(self.tcp_store_group.store)
+
+            state.buffer.checkpoint_resume_preserve_va(
+                list(range(state.connected_ep_size)),
+                activate=False,
+                expected_addresses=expected_addresses,
+            )
+            for rank in range(state.active_ep_size):
+                state.buffer.update_mask_buffer(rank, mask=False)
+
+            if expected_addresses is not None and not (
+                state.buffer.validate_graph_visible_addresses(expected_addresses)
+            ):
+                raise RuntimeError(
+                    "NIXL EP graph-visible CUDA virtual addresses changed "
+                    "across checkpoint resume"
+                )
+
     def _ensure_ep_size(self, *, stage: bool) -> None:
         if stage:
             self._stage_ep_size()
