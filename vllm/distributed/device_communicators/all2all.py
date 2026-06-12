@@ -531,6 +531,22 @@ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
         )
         self.initialized = False
         self.alltoall_info = None
+        self.mapping = None
+        self.mnnvl_config = None
+
+    def _make_mnnvl_config(self):
+        from vllm.distributed.device_communicators.mnnvl_compat import (
+            CustomCommunicator,
+        )
+
+        # MNNVL workspace is allocated per rank in the comm_backend's group; the
+        # flashinfer kernel asserts workspace.size(0) == moe_ep_size, so the backend
+        # must span the EP group (= DP*PCP*TP), not the DP group.
+        return MnnvlConfig(
+            comm_backend=CustomCommunicator(self.cpu_group),
+            fabric_page_size=1 << 29,  # 512MB
+            allocation_granularity=0,  # Auto-detect
+        )
 
     def initialize(
         self,
@@ -551,22 +567,12 @@ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
             tp_size=world_size,
         )
 
-        from vllm.distributed.device_communicators.mnnvl_compat import (
-            CustomCommunicator,
+        self.mnnvl_config = self._make_mnnvl_config()
+        self.workspace_tensor = MnnvlMoe.get_moe_workspaces(
+            self.mapping, self.mnnvl_config
         )
-
-        # MNNVL workspace is allocated per rank in the comm_backend's group; the
-        # flashinfer kernel asserts workspace.size(0) == moe_ep_size, so the backend
-        # must span the EP group (= DP*PCP*TP), not the DP group.
-        ep_config = MnnvlConfig(
-            comm_backend=CustomCommunicator(self.cpu_group),
-            fabric_page_size=1 << 29,  # 512MB
-            allocation_granularity=0,  # Auto-detect
-        )
-
-        self.workspace_tensor = MnnvlMoe.get_moe_workspaces(self.mapping, ep_config)
         self.prepare_workspace_tensor = MnnvlMoe.get_moe_prepare_workspace(
-            self.mapping, ep_config
+            self.mapping, self.mnnvl_config
         )
 
         self.world_size = world_size
@@ -597,6 +603,48 @@ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
     def get_handle(self, kwargs):
         return self
 
+    def checkpoint_pause(self) -> bool:
+        """Detach FlashInfer MNNVL mappings after checkpoint quiesce.
+
+        Checkpoint coordinators should call this after all model work using the
+        EP communicator has drained and before taking a process checkpoint.
+        Captured CUDA graphs remain valid only while the FlashInfer workspace
+        tensor objects and their CUDA virtual addresses stay alive.
+        """
+        if not self.initialized:
+            return False
+
+        if not hasattr(MnnvlMoe, "detach_physical_keep_va"):
+            logger.warning(
+                "Installed FlashInfer does not support graph-stable MNNVL "
+                "checkpoint pause"
+            )
+            return False
+
+        MnnvlMoe.detach_physical_keep_va()
+        return True
+
+    def checkpoint_resume(self) -> bool:
+        """Remap FlashInfer MNNVL mappings before replaying CUDA graphs.
+
+        This recreates the MNNVL communicator wrapper from the current CPU
+        group so FlashInfer exports/imports fresh transport handles while
+        preserving the graph-visible workspace virtual addresses.
+        """
+        if not self.initialized:
+            return False
+
+        if not hasattr(MnnvlMoe, "remap_physical_same_va"):
+            logger.warning(
+                "Installed FlashInfer does not support graph-stable MNNVL "
+                "checkpoint resume"
+            )
+            return False
+
+        self.mnnvl_config = self._make_mnnvl_config()
+        MnnvlMoe.remap_physical_same_va(config=self.mnnvl_config)
+        return True
+
     def cleanup(self):
         """Clean up workspace"""
         if (
@@ -613,6 +661,7 @@ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
                 self.workspace_tensor = None
                 self.prepare_workspace_tensor = None
                 self.mapping = None
+                self.mnnvl_config = None
                 self.initialized = False
 
 
@@ -644,6 +693,19 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         self.max_num_tokens = 0
         self.top_k = 0
         self.num_experts = 0
+        self.mnnvl_config = None
+
+    def _make_mnnvl_config(self):
+        from vllm.distributed.device_communicators.mnnvl_compat import (
+            CustomCommunicator,
+        )
+
+        # MNNVL workspace is allocated per rank in the comm_backend's group; the
+        # flashinfer kernel asserts workspace.size(0) == moe_ep_size, so the backend
+        # must span the EP group (= DP*PCP*TP), not the DP group.
+        return MnnvlConfig(
+            comm_backend=CustomCommunicator(self.cpu_group),
+        )
 
     def initialize(
         self,
@@ -718,24 +780,14 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             moe_ep_size=self.world_size,
         )
 
-        from vllm.distributed.device_communicators.mnnvl_compat import (
-            CustomCommunicator,
-        )
-
-        # MNNVL workspace is allocated per rank in the comm_backend's group; the
-        # flashinfer kernel asserts workspace.size(0) == moe_ep_size, so the backend
-        # must span the EP group (= DP*PCP*TP), not the DP group.
-        ep_config = MnnvlConfig(
-            comm_backend=CustomCommunicator(self.cpu_group),
-        )
-
+        self.mnnvl_config = self._make_mnnvl_config()
         self.moe_alltoall = MoeAlltoAll(
             mapping=self.mapping,
             max_num_tokens=self.max_num_tokens,
             top_k=self.top_k,
             num_experts=self.num_experts,
             workspace_size_per_rank=self.workspace_size,
-            mnnvl_config=ep_config,
+            mnnvl_config=self.mnnvl_config,
         )
 
         self.gpus_per_node = gpus_per_node
@@ -754,6 +806,48 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
     def get_handle(self, kwargs):
         return self
 
+    def checkpoint_pause(self) -> bool:
+        """Detach FlashInfer MNNVL mappings after checkpoint quiesce.
+
+        Checkpoint coordinators should call this after all model work using the
+        EP communicator has drained and before taking a process checkpoint.
+        Captured CUDA graphs remain valid only while the FlashInfer workspace
+        tensor objects and their CUDA virtual addresses stay alive.
+        """
+        if not self.initialized or self.moe_alltoall is None:
+            return False
+
+        if not hasattr(self.moe_alltoall, "detach_physical_keep_va"):
+            logger.warning(
+                "Installed FlashInfer does not support graph-stable MNNVL "
+                "checkpoint pause"
+            )
+            return False
+
+        self.moe_alltoall.detach_physical_keep_va()
+        return True
+
+    def checkpoint_resume(self) -> bool:
+        """Remap FlashInfer MNNVL mappings before replaying CUDA graphs.
+
+        This recreates the MNNVL communicator wrapper from the current CPU
+        group so FlashInfer exports/imports fresh transport handles while
+        preserving the graph-visible workspace virtual addresses.
+        """
+        if not self.initialized or self.moe_alltoall is None:
+            return False
+
+        if not hasattr(self.moe_alltoall, "remap_physical_same_va"):
+            logger.warning(
+                "Installed FlashInfer does not support graph-stable MNNVL "
+                "checkpoint resume"
+            )
+            return False
+
+        self.mnnvl_config = self._make_mnnvl_config()
+        self.moe_alltoall.remap_physical_same_va(config=self.mnnvl_config)
+        return True
+
     def cleanup(self):
         """Clean up resources."""
         if self.initialized and self.moe_alltoall is not None:
@@ -766,6 +860,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             finally:
                 self.moe_alltoall = None
                 self.mapping = None
+                self.mnnvl_config = None
                 self.initialized = False
 
 
