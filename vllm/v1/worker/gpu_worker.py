@@ -162,34 +162,97 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
-        self._all2all_checkpoint_paused = False
+        self._paused_peer_resources: list[tuple[str, Any]] = []
 
-    def _run_all2all_checkpoint_hook(self, hook_name: str) -> bool:
+    @staticmethod
+    def _maybe_cuda_synchronize() -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _get_peer_resources(self) -> list[tuple[str, Any]]:
+        resources: list[tuple[str, Any]] = []
         try:
             ep_group = get_ep_group()
         except AssertionError:
-            return False
+            ep_group = None
 
-        device_communicator = ep_group.device_communicator
-        if device_communicator is None:
-            return False
+        if ep_group is not None:
+            device_communicator = ep_group.device_communicator
+            if device_communicator is not None:
+                all2all_manager = device_communicator.all2all_manager
+                if all2all_manager is not None:
+                    resources.append(("all2all", all2all_manager))
 
-        all2all_manager = device_communicator.all2all_manager
-        if all2all_manager is None:
-            return False
+        try:
+            tp_group = get_tp_group()
+        except AssertionError:
+            tp_group = None
 
-        hook = getattr(all2all_manager, hook_name, None)
-        if hook is None:
-            return False
+        if tp_group is not None:
+            device_communicator = tp_group.device_communicator
+            if device_communicator is not None:
+                fi_ar_comm = getattr(device_communicator, "fi_ar_comm", None)
+                if fi_ar_comm is not None:
+                    resources.append(("flashinfer_allreduce", fi_ar_comm))
 
-        if hook():
+        return resources
+
+    def _pause_peer_resources(self) -> None:
+        """Pause graph-visible peer resources before process checkpoint."""
+        if self._paused_peer_resources:
+            return
+
+        self._maybe_cuda_synchronize()
+        paused_resources: list[tuple[str, Any]] = []
+        try:
+            for name, resource in self._get_peer_resources():
+                pause = getattr(resource, "pause", None)
+                if pause is None:
+                    continue
+                if pause():
+                    paused_resources.append((name, resource))
+                    logger.info(
+                        "Paused %s peer resource on %s.",
+                        name,
+                        resource.__class__.__name__,
+                    )
+        except Exception:
+            for name, resource in reversed(paused_resources):
+                resume = getattr(resource, "resume", None)
+                if resume is None:
+                    continue
+                try:
+                    resume()
+                except Exception:
+                    logger.exception("Failed to resume %s after pause failure.", name)
+            raise
+
+        if paused_resources:
+            self._maybe_cuda_synchronize()
+        self._paused_peer_resources = paused_resources
+
+    def _resume_peer_resources(self) -> None:
+        """Resume graph-visible peer resources after process restore."""
+        if not self._paused_peer_resources:
+            return
+
+        resumed = 0
+        for name, resource in reversed(self._paused_peer_resources):
+            resume = getattr(resource, "resume", None)
+            if resume is None:
+                raise RuntimeError(f"Peer resource {name} does not support resume")
+            if not resume():
+                raise RuntimeError(f"Failed to resume peer resource {name}")
+            resumed += 1
             logger.info(
-                "Ran %s on %s.",
-                hook_name,
-                all2all_manager.__class__.__name__,
+                "Resumed %s peer resource on %s.",
+                name,
+                resource.__class__.__name__,
             )
-            return True
-        return False
+
+        if resumed:
+            self._maybe_cuda_synchronize()
+        self._paused_peer_resources = []
 
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
@@ -212,17 +275,12 @@ class Worker(WorkerBase):
             format_gib(freed_bytes),
             format_gib(used_bytes),
         )
-        self._all2all_checkpoint_paused = self._run_all2all_checkpoint_hook(
-            "checkpoint_pause"
-        )
+        self._pause_peer_resources()
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
-        if self._all2all_checkpoint_paused:
-            if not self._run_all2all_checkpoint_hook("checkpoint_resume"):
-                raise RuntimeError("Failed to resume all2all checkpoint state")
-            self._all2all_checkpoint_paused = False
+        self._resume_peer_resources()
 
         # Restore the buffers after level 2 sleep
         if len(self._sleep_saved_buffers):

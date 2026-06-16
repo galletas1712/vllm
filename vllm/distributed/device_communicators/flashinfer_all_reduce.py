@@ -25,9 +25,6 @@ PDL_ADVANCE_LAUNCH_TOKENS = 16
 fi_ar_available = False
 try:
     import flashinfer.comm as flashinfer_comm  # type: ignore[no-redef]
-    from flashinfer.comm.mnnvl import (
-        TorchDistBackend,  # type: ignore[import-not-found, no-redef]
-    )
 
     fi_ar_available = hasattr(flashinfer_comm, "allreduce_fusion")
 except ImportError:
@@ -49,7 +46,9 @@ def _create_workspace(
     group: ProcessGroup,
 ):
     """Create a flashinfer allreduce workspace, returning None on failure."""
-    comm_backend = TorchDistBackend(group=group)
+    from vllm.distributed.device_communicators.mnnvl_compat import CustomCommunicator
+
+    comm_backend = CustomCommunicator(group)
     rng_state = random.getstate()
     try:
         random.seed(int.from_bytes(os.urandom(16), byteorder="big"))
@@ -89,6 +88,69 @@ def _create_workspace(
         dtype,
     )
     return workspace
+
+
+def _make_comm_backend(group: ProcessGroup):
+    from vllm.distributed.device_communicators.mnnvl_compat import CustomCommunicator
+
+    return CustomCommunicator(group)
+
+
+def _iter_fi_ar_workspaces():
+    seen_ids: set[int] = set()
+    for workspace in (_fi_ar_workspace, _fi_ar_quant_workspace):
+        if workspace is None or id(workspace) in seen_ids:
+            continue
+        seen_ids.add(id(workspace))
+        yield workspace
+
+
+def pause_fi_ar_workspaces() -> bool:
+    """Pause FlashInfer allreduce workspaces while keeping captured VAs stable."""
+    paused_workspaces = []
+    with _fi_ar_workspace_lock:
+        try:
+            for workspace in _iter_fi_ar_workspaces():
+                pause = getattr(workspace, "pause", None)
+                if pause is None:
+                    pause = getattr(workspace, "detach_physical_keep_va", None)
+                if pause is None:
+                    raise RuntimeError(
+                        "FlashInfer allreduce workspace does not support pause"
+                    )
+                pause()
+                paused_workspaces.append(workspace)
+        except Exception:
+            for workspace in reversed(paused_workspaces):
+                resume = getattr(workspace, "resume", None)
+                if resume is not None:
+                    resume()
+                else:
+                    remap = getattr(workspace, "remap_physical_same_va", None)
+                    if remap is not None:
+                        remap()
+            raise
+    return bool(paused_workspaces)
+
+
+def resume_fi_ar_workspaces(group: ProcessGroup) -> bool:
+    """Resume FlashInfer allreduce workspaces at their captured VAs."""
+    resumed = False
+    comm_backend = _make_comm_backend(group)
+    with _fi_ar_workspace_lock:
+        for workspace in _iter_fi_ar_workspaces():
+            resume = getattr(workspace, "resume", None)
+            if resume is not None:
+                resume(comm_backend=comm_backend)
+            else:
+                remap = getattr(workspace, "remap_physical_same_va", None)
+                if remap is None:
+                    raise RuntimeError(
+                        "FlashInfer allreduce workspace does not support resume"
+                    )
+                remap(comm_backend=comm_backend)
+            resumed = True
+    return resumed
 
 
 def _resolve_fi_ar_backend() -> str:
@@ -330,6 +392,16 @@ class FlashInferAllReduce:
             launch_with_pdl=True,
             trigger_completion_at_end=num_tokens > PDL_ADVANCE_LAUNCH_TOKENS,
         )
+
+    def pause(self) -> bool:
+        if self.disabled:
+            return False
+        return pause_fi_ar_workspaces()
+
+    def resume(self) -> bool:
+        if self.disabled:
+            return False
+        return resume_fi_ar_workspaces(self.group)
 
     def destroy(self):
         if not self.disabled:

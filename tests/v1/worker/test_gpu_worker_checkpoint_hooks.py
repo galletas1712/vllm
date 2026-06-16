@@ -25,21 +25,35 @@ class _All2AllManager:
     def __init__(self):
         self.calls = []
 
-    def checkpoint_pause(self):
+    def pause(self):
         self.calls.append("pause")
         return True
 
-    def checkpoint_resume(self):
+    def resume(self):
         self.calls.append("resume")
         return True
 
 
-def test_sleep_wake_run_all2all_checkpoint_hooks(monkeypatch):
+class _FlashInferAllReduce:
+    def __init__(self):
+        self.calls = []
+
+    def pause(self):
+        self.calls.append("pause")
+        return True
+
+    def resume(self):
+        self.calls.append("resume")
+        return True
+
+
+def test_sleep_wake_run_peer_resource_hooks(monkeypatch):
     allocator = _Allocator()
     all2all_manager = _All2AllManager()
+    fi_ar_comm = _FlashInferAllReduce()
     worker = object.__new__(Worker)
     worker._sleep_saved_buffers = {}
-    worker._all2all_checkpoint_paused = False
+    worker._paused_peer_resources = []
     worker.model_runner = SimpleNamespace(post_kv_cache_wake_up=lambda: None)
 
     monkeypatch.setattr(
@@ -59,6 +73,18 @@ def test_sleep_wake_run_all2all_checkpoint_hooks(monkeypatch):
             device_communicator=SimpleNamespace(all2all_manager=all2all_manager),
         ),
     )
+    monkeypatch.setattr(
+        gpu_worker,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            device_communicator=SimpleNamespace(fi_ar_comm=fi_ar_comm),
+        ),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_available",
+        lambda: False,
+    )
 
     Worker.sleep(worker, level=1)
     Worker.wake_up(worker, tags=["weights"])
@@ -67,3 +93,4 @@ def test_sleep_wake_run_all2all_checkpoint_hooks(monkeypatch):
     assert allocator.sleep_calls == [("weights",)]
     assert allocator.wake_calls == [["weights"], ["kv_cache"]]
     assert all2all_manager.calls == ["pause", "resume"]
+    assert fi_ar_comm.calls == ["pause", "resume"]

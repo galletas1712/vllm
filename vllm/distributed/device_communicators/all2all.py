@@ -603,7 +603,7 @@ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
     def get_handle(self, kwargs):
         return self
 
-    def checkpoint_pause(self) -> bool:
+    def pause(self) -> bool:
         """Detach FlashInfer MNNVL mappings after checkpoint quiesce.
 
         Checkpoint coordinators should call this after all model work using the
@@ -614,17 +614,22 @@ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
         if not self.initialized:
             return False
 
-        if not hasattr(MnnvlMoe, "detach_physical_keep_va"):
+        pause = getattr(MnnvlMoe, "pause", None)
+        detach = getattr(MnnvlMoe, "detach_physical_keep_va", None)
+        if pause is None and detach is None:
             logger.warning(
                 "Installed FlashInfer does not support graph-stable MNNVL "
-                "checkpoint pause"
+                "pause"
             )
             return False
 
-        MnnvlMoe.detach_physical_keep_va()
+        if pause is not None:
+            pause()
+        else:
+            detach()
         return True
 
-    def checkpoint_resume(self) -> bool:
+    def resume(self) -> bool:
         """Remap FlashInfer MNNVL mappings before replaying CUDA graphs.
 
         This recreates the MNNVL communicator wrapper from the current CPU
@@ -634,15 +639,20 @@ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
         if not self.initialized:
             return False
 
-        if not hasattr(MnnvlMoe, "remap_physical_same_va"):
+        resume = getattr(MnnvlMoe, "resume", None)
+        remap = getattr(MnnvlMoe, "remap_physical_same_va", None)
+        if resume is None and remap is None:
             logger.warning(
                 "Installed FlashInfer does not support graph-stable MNNVL "
-                "checkpoint resume"
+                "resume"
             )
             return False
 
         self.mnnvl_config = self._make_mnnvl_config()
-        MnnvlMoe.remap_physical_same_va(config=self.mnnvl_config)
+        if resume is not None:
+            resume(config=self.mnnvl_config)
+        else:
+            remap(config=self.mnnvl_config)
         return True
 
     def cleanup(self):
@@ -806,7 +816,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
     def get_handle(self, kwargs):
         return self
 
-    def checkpoint_pause(self) -> bool:
+    def pause(self) -> bool:
         """Detach FlashInfer MNNVL mappings after checkpoint quiesce.
 
         Checkpoint coordinators should call this after all model work using the
@@ -817,17 +827,22 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         if not self.initialized or self.moe_alltoall is None:
             return False
 
-        if not hasattr(self.moe_alltoall, "detach_physical_keep_va"):
+        pause = getattr(self.moe_alltoall, "pause", None)
+        detach = getattr(self.moe_alltoall, "detach_physical_keep_va", None)
+        if pause is None and detach is None:
             logger.warning(
                 "Installed FlashInfer does not support graph-stable MNNVL "
-                "checkpoint pause"
+                "pause"
             )
             return False
 
-        self.moe_alltoall.detach_physical_keep_va()
+        if pause is not None:
+            pause()
+        else:
+            detach()
         return True
 
-    def checkpoint_resume(self) -> bool:
+    def resume(self) -> bool:
         """Remap FlashInfer MNNVL mappings before replaying CUDA graphs.
 
         This recreates the MNNVL communicator wrapper from the current CPU
@@ -837,15 +852,20 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         if not self.initialized or self.moe_alltoall is None:
             return False
 
-        if not hasattr(self.moe_alltoall, "remap_physical_same_va"):
+        resume = getattr(self.moe_alltoall, "resume", None)
+        remap = getattr(self.moe_alltoall, "remap_physical_same_va", None)
+        if resume is None and remap is None:
             logger.warning(
                 "Installed FlashInfer does not support graph-stable MNNVL "
-                "checkpoint resume"
+                "resume"
             )
             return False
 
         self.mnnvl_config = self._make_mnnvl_config()
-        self.moe_alltoall.remap_physical_same_va(config=self.mnnvl_config)
+        if resume is not None:
+            resume(config=self.mnnvl_config)
+        else:
+            remap(config=self.mnnvl_config)
         return True
 
     def cleanup(self):
