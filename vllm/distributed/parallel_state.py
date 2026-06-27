@@ -24,6 +24,7 @@ If you only need to use the distributed environment without model/pipeline
 """
 
 import contextlib
+import functools
 import gc
 import pickle
 import time
@@ -1982,29 +1983,41 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
         _EPLB.prepare_communication_buffer_for_model(model)
 
 
+@functools.cache
+def _get_nccl_checkpoint_library() -> Any | None:
+    try:
+        from nccl_checkpoint import (
+            NCCLCheckpointLibrary,
+            NCCLCheckpointPreloadError,
+        )
+    except ImportError as exc:
+        logger.warning_once("NCCL checkpoint shim unavailable; skipping: %s", exc)
+        return None
+
+    try:
+        return NCCLCheckpointLibrary()
+    except NCCLCheckpointPreloadError as exc:
+        logger.warning_once("NCCL checkpoint shim unavailable; skipping: %s", exc)
+        return None
+
+
 def checkpoint_prepare_distributed_state() -> None:
     torch.cuda.synchronize()
     checkpoint_prepare_device_communicators()
     torch.cuda.synchronize()
-    try:
-        from nccl_checkpoint import NCCLCheckpointLibrary
-    except Exception as exc:
-        logger.warning_once("NCCL checkpoint shim unavailable; skipping: %s", exc)
-    else:
+    nccl_checkpoint_library = _get_nccl_checkpoint_library()
+    if nccl_checkpoint_library is not None:
         logger.info("Calling NCCL checkpoint shim checkpoint_prepare()")
-        NCCLCheckpointLibrary().checkpoint_prepare()
+        nccl_checkpoint_library.checkpoint_prepare()
     torch.cuda.synchronize()
     time.sleep(1)
 
 
 def checkpoint_restore_distributed_state() -> None:
-    try:
-        from nccl_checkpoint import NCCLCheckpointLibrary
-    except Exception as exc:
-        logger.warning_once("NCCL checkpoint shim unavailable; skipping: %s", exc)
-    else:
+    nccl_checkpoint_library = _get_nccl_checkpoint_library()
+    if nccl_checkpoint_library is not None:
         logger.info("Calling NCCL checkpoint shim checkpoint_restore()")
-        NCCLCheckpointLibrary().checkpoint_restore()
+        nccl_checkpoint_library.checkpoint_restore()
     torch.cuda.synchronize()
     checkpoint_restore_device_communicators()
     torch.cuda.synchronize()
@@ -2015,9 +2028,19 @@ def checkpoint_prepare_device_communicators() -> None:
         group = group_ref()
         if group is not None and group.device_communicator is not None:
             group.device_communicator.checkpoint_prepare()
+    from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+        checkpoint_prepare_fi_ar_workspaces,
+    )
+
+    checkpoint_prepare_fi_ar_workspaces()
 
 
 def checkpoint_restore_device_communicators() -> None:
+    from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+        checkpoint_restore_fi_ar_workspaces,
+    )
+
+    checkpoint_restore_fi_ar_workspaces()
     for group_ref in _groups.values():
         group = group_ref()
         if group is not None and group.device_communicator is not None:
