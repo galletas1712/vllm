@@ -31,26 +31,69 @@ def test_nccl_library_loads_with_global_symbols(monkeypatch: pytest.MonkeyPatch)
     calls = []
 
     class FakeNCCLFunction:
-        pass
+        def __init__(self, source):
+            self.source = source
 
     class FakeNCCLLibrary:
+        def __init__(self, source):
+            self.source = source
 
         def __getattr__(self, name):
-            return FakeNCCLFunction()
+            return FakeNCCLFunction(self.source)
 
     def fake_cdll(path, mode=ctypes.DEFAULT_MODE):
         calls.append((path, mode))
-        return FakeNCCLLibrary()
+        return FakeNCCLLibrary(path)
 
+    monkeypatch.delenv("NCCL_CHECKPOINT_SHIM", raising=False)
     monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
     monkeypatch.setattr(NCCLLibrary, "path_to_library_cache", {})
     monkeypatch.setattr(NCCLLibrary, "path_to_dict_mapping", {})
 
-    NCCLLibrary(so_file)
+    library = NCCLLibrary(so_file)
 
     assert calls == [
         (so_file, getattr(ctypes, "RTLD_GLOBAL", ctypes.DEFAULT_MODE)),
     ]
+    assert library.lib.source == so_file
+    assert all(func.source == so_file for func in library._funcs.values())
+
+
+def test_nccl_checkpoint_shim_binds_process_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    so_file = "libnccl-test.so"
+    calls = []
+
+    class FakeNCCLFunction:
+        def __init__(self, source):
+            self.source = source
+
+    class FakeNCCLLibrary:
+        def __init__(self, source):
+            self.source = source
+
+        def __getattr__(self, name):
+            return FakeNCCLFunction(self.source)
+
+    def fake_cdll(path, mode=ctypes.DEFAULT_MODE):
+        calls.append((path, mode))
+        return FakeNCCLLibrary(path)
+
+    monkeypatch.setenv("NCCL_CHECKPOINT_SHIM", "1")
+    monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
+    monkeypatch.setattr(NCCLLibrary, "path_to_library_cache", {})
+    monkeypatch.setattr(NCCLLibrary, "path_to_dict_mapping", {})
+
+    library = NCCLLibrary(so_file)
+
+    assert calls == [
+        (so_file, getattr(ctypes, "RTLD_GLOBAL", ctypes.DEFAULT_MODE)),
+        (None, ctypes.DEFAULT_MODE),
+    ]
+    assert NCCLLibrary.path_to_library_cache[so_file].source == so_file
+    assert library.lib.source is None
+    assert all(func.source is None for func in library._funcs.values())
 
 
 def distributed_run(fn, world_size):

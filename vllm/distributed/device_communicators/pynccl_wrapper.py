@@ -24,6 +24,7 @@
 
 import ctypes
 import functools
+import os
 import platform
 from dataclasses import dataclass
 from typing import Any
@@ -324,22 +325,30 @@ class NCCLLibrary:
     path_to_library_cache: dict[str, Any] = {}
 
     # class attribute to store the mapping from library path
-    #  to the corresponding dictionary
-    path_to_dict_mapping: dict[str, dict[str, Any]] = {}
+    # and binding mode to the corresponding dictionary
+    path_to_dict_mapping: dict[str | tuple[str, str], dict[str, Any]] = {}
 
     def __init__(self, so_file: str | None = None):
         so_file = so_file or find_nccl_library()
+        use_global_namespace = "NCCL_CHECKPOINT_SHIM" in os.environ
+        funcs_key: str | tuple[str, str] = (
+            (so_file, "process-global") if use_global_namespace else so_file
+        )
 
         try:
-            if so_file not in NCCLLibrary.path_to_dict_mapping:
-                # Load globally so LD_PRELOAD/interposition shims can resolve
-                # the real NCCL symbols when vLLM loads NCCL via ctypes.
-                lib = ctypes.CDLL(
+            if so_file not in NCCLLibrary.path_to_library_cache:
+                # Load real NCCL globally so interposition shims can resolve
+                # the underlying symbols with RTLD_NEXT.
+                NCCLLibrary.path_to_library_cache[so_file] = ctypes.CDLL(
                     so_file,
                     mode=getattr(ctypes, "RTLD_GLOBAL", ctypes.DEFAULT_MODE),
                 )
-                NCCLLibrary.path_to_library_cache[so_file] = lib
-            self.lib = NCCLLibrary.path_to_library_cache[so_file]
+            if use_global_namespace:
+                # Bind through RTLD_DEFAULT so LD_PRELOAD wrappers intercept
+                # communicator APIs while real NCCL stays alive above.
+                self.lib = ctypes.CDLL(None)
+            else:
+                self.lib = NCCLLibrary.path_to_library_cache[so_file]
         except Exception as e:
             logger.error(
                 "Failed to load NCCL library from %s. "
@@ -354,7 +363,7 @@ class NCCLLibrary:
             )
             raise e
 
-        if so_file not in NCCLLibrary.path_to_dict_mapping:
+        if funcs_key not in NCCLLibrary.path_to_dict_mapping:
             _funcs: dict[str, Any] = {}
             for func in NCCLLibrary.exported_functions:
                 try:
@@ -381,8 +390,8 @@ class NCCLLibrary:
                             # not allowed during graph capturing
                             continue
                     raise
-            NCCLLibrary.path_to_dict_mapping[so_file] = _funcs
-        self._funcs = NCCLLibrary.path_to_dict_mapping[so_file]
+            NCCLLibrary.path_to_dict_mapping[funcs_key] = _funcs
+        self._funcs = NCCLLibrary.path_to_dict_mapping[funcs_key]
 
     def ncclGetErrorString(self, result: ncclResult_t) -> str:
         return self._funcs["ncclGetErrorString"](result).decode("utf-8")
