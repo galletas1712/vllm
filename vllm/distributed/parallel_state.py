@@ -1983,6 +1983,7 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
 
 
 def checkpoint_prepare_distributed_state() -> None:
+    torch.cuda.synchronize()
     checkpoint_prepare_device_communicators()
     torch.cuda.synchronize()
     try:
@@ -2006,6 +2007,7 @@ def checkpoint_restore_distributed_state() -> None:
         NCCLCheckpointLibrary().checkpoint_restore()
     torch.cuda.synchronize()
     checkpoint_restore_device_communicators()
+    torch.cuda.synchronize()
 
 
 def checkpoint_prepare_device_communicators() -> None:
