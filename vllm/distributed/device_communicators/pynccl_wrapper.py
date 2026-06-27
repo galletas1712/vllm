@@ -332,7 +332,12 @@ class NCCLLibrary:
 
         try:
             if so_file not in NCCLLibrary.path_to_dict_mapping:
-                lib = ctypes.CDLL(so_file)
+                # Load globally so LD_PRELOAD/interposition shims can resolve
+                # the real NCCL symbols when vLLM loads NCCL via ctypes.
+                lib = ctypes.CDLL(
+                    so_file,
+                    mode=getattr(ctypes, "RTLD_GLOBAL", ctypes.DEFAULT_MODE),
+                )
                 NCCLLibrary.path_to_library_cache[so_file] = lib
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
         except Exception as e:

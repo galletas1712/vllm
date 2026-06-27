@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ctypes
 import os
 
 import multiprocess as mp
@@ -23,6 +24,33 @@ from vllm.distributed.parallel_state import (
 from vllm.utils.system_utils import update_environment_variables
 
 mp.set_start_method("spawn", force=True)
+
+
+def test_nccl_library_loads_with_global_symbols(monkeypatch: pytest.MonkeyPatch):
+    so_file = "libnccl-test.so"
+    calls = []
+
+    class FakeNCCLFunction:
+        pass
+
+    class FakeNCCLLibrary:
+
+        def __getattr__(self, name):
+            return FakeNCCLFunction()
+
+    def fake_cdll(path, mode=ctypes.DEFAULT_MODE):
+        calls.append((path, mode))
+        return FakeNCCLLibrary()
+
+    monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
+    monkeypatch.setattr(NCCLLibrary, "path_to_library_cache", {})
+    monkeypatch.setattr(NCCLLibrary, "path_to_dict_mapping", {})
+
+    NCCLLibrary(so_file)
+
+    assert calls == [
+        (so_file, getattr(ctypes, "RTLD_GLOBAL", ctypes.DEFAULT_MODE)),
+    ]
 
 
 def distributed_run(fn, world_size):
