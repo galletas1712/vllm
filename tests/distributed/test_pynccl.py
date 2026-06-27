@@ -26,20 +26,54 @@ from vllm.utils.system_utils import update_environment_variables
 mp.set_start_method("spawn", force=True)
 
 
+SHIM_REQUIRED_NCCL_FUNCTIONS = {
+    "ncclCommInitRank",
+    "ncclAllReduce",
+    "ncclReduce",
+    "ncclAllGather",
+    "ncclReduceScatter",
+    "ncclSend",
+    "ncclRecv",
+    "ncclBroadcast",
+    "ncclCommDestroy",
+    "ncclCommAbort",
+    "ncclCommWindowRegister",
+    "ncclCommWindowDeregister",
+}
+REAL_NCCL_CHECKPOINT_FUNCTIONS = {
+    "ncclGetErrorString",
+    "ncclGetVersion",
+    "ncclGetUniqueId",
+    "ncclGroupStart",
+    "ncclGroupEnd",
+}
+
+
+class FakeNCCLFunction:
+    def __init__(self, source):
+        self.source = source
+
+
+class FakeNCCLLibrary:
+    def __init__(self, source, exported_symbols: set[str] | None = None):
+        self.source = source
+        self.exported_symbols = exported_symbols
+
+    def __getattr__(self, name):
+        if self.exported_symbols is not None and name not in self.exported_symbols:
+            raise AttributeError(name)
+        return FakeNCCLFunction(self.source)
+
+
+def clear_nccl_library_caches(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(NCCLLibrary, "path_to_library_cache", {})
+    monkeypatch.setattr(NCCLLibrary, "path_to_checkpoint_shim_cache", {})
+    monkeypatch.setattr(NCCLLibrary, "path_to_dict_mapping", {})
+
+
 def test_nccl_library_loads_with_global_symbols(monkeypatch: pytest.MonkeyPatch):
     so_file = "libnccl-test.so"
     calls = []
-
-    class FakeNCCLFunction:
-        def __init__(self, source):
-            self.source = source
-
-    class FakeNCCLLibrary:
-        def __init__(self, source):
-            self.source = source
-
-        def __getattr__(self, name):
-            return FakeNCCLFunction(self.source)
 
     def fake_cdll(path, mode=ctypes.DEFAULT_MODE):
         calls.append((path, mode))
@@ -47,8 +81,7 @@ def test_nccl_library_loads_with_global_symbols(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.delenv("NCCL_CHECKPOINT_SHIM", raising=False)
     monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
-    monkeypatch.setattr(NCCLLibrary, "path_to_library_cache", {})
-    monkeypatch.setattr(NCCLLibrary, "path_to_dict_mapping", {})
+    clear_nccl_library_caches(monkeypatch)
 
     library = NCCLLibrary(so_file)
 
@@ -59,41 +92,133 @@ def test_nccl_library_loads_with_global_symbols(monkeypatch: pytest.MonkeyPatch)
     assert all(func.source == so_file for func in library._funcs.values())
 
 
-def test_nccl_checkpoint_shim_binds_process_namespace(
+def test_nccl_checkpoint_shim_binds_required_functions_from_preloaded_shim(
     monkeypatch: pytest.MonkeyPatch,
 ):
     so_file = "libnccl-test.so"
+    shim_env_path = "/env/libnccl_checkpoint.so"
+    shim_dladdr_path = "/loaded/libnccl_checkpoint.so"
     calls = []
-
-    class FakeNCCLFunction:
-        def __init__(self, source):
-            self.source = source
-
-    class FakeNCCLLibrary:
-        def __init__(self, source):
-            self.source = source
-
-        def __getattr__(self, name):
-            return FakeNCCLFunction(self.source)
 
     def fake_cdll(path, mode=ctypes.DEFAULT_MODE):
         calls.append((path, mode))
+        if path is None:
+            return FakeNCCLLibrary(None, {"ncclCheckpointGetVersion"})
         return FakeNCCLLibrary(path)
 
-    monkeypatch.setenv("NCCL_CHECKPOINT_SHIM", "1")
+    monkeypatch.setenv("NCCL_CHECKPOINT_SHIM", shim_env_path)
     monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
-    monkeypatch.setattr(NCCLLibrary, "path_to_library_cache", {})
-    monkeypatch.setattr(NCCLLibrary, "path_to_dict_mapping", {})
+    monkeypatch.setattr(
+        NCCLLibrary,
+        "_get_symbol_dso_path",
+        staticmethod(lambda symbol, process_lib: shim_dladdr_path),
+    )
+    clear_nccl_library_caches(monkeypatch)
 
     library = NCCLLibrary(so_file)
 
     assert calls == [
         (so_file, getattr(ctypes, "RTLD_GLOBAL", ctypes.DEFAULT_MODE)),
         (None, ctypes.DEFAULT_MODE),
+        (shim_dladdr_path, NCCLLibrary._checkpoint_shim_load_mode()),
     ]
     assert NCCLLibrary.path_to_library_cache[so_file].source == so_file
-    assert library.lib.source is None
-    assert all(func.source is None for func in library._funcs.values())
+    assert library.real_lib.source == so_file
+    assert library.lib.source == shim_dladdr_path
+    assert library.checkpoint_shim_lib.source == shim_dladdr_path
+    assert {
+        name for name, func in library._funcs.items() if func.source == shim_dladdr_path
+    } == SHIM_REQUIRED_NCCL_FUNCTIONS
+    assert {
+        name for name, func in library._funcs.items() if func.source == so_file
+    } == REAL_NCCL_CHECKPOINT_FUNCTIONS
+
+
+def test_nccl_checkpoint_shim_falls_back_to_env_path_without_dladdr(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    so_file = "libnccl-test.so"
+    shim_env_path = "/env/libnccl_checkpoint.so"
+    calls = []
+
+    def fake_cdll(path, mode=ctypes.DEFAULT_MODE):
+        calls.append((path, mode))
+        if path is None:
+            return FakeNCCLLibrary(None, {"ncclCheckpointGetVersion"})
+        return FakeNCCLLibrary(path)
+
+    monkeypatch.setenv("NCCL_CHECKPOINT_SHIM", shim_env_path)
+    monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
+    monkeypatch.setattr(
+        NCCLLibrary,
+        "_get_symbol_dso_path",
+        staticmethod(lambda symbol, process_lib: None),
+    )
+    clear_nccl_library_caches(monkeypatch)
+
+    library = NCCLLibrary(so_file)
+
+    assert calls == [
+        (so_file, getattr(ctypes, "RTLD_GLOBAL", ctypes.DEFAULT_MODE)),
+        (None, ctypes.DEFAULT_MODE),
+        (shim_env_path, NCCLLibrary._checkpoint_shim_load_mode()),
+    ]
+    assert library.checkpoint_shim_lib.source == shim_env_path
+
+
+def test_nccl_checkpoint_shim_fails_without_process_global_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    so_file = "libnccl-test.so"
+
+    def fake_cdll(path, mode=ctypes.DEFAULT_MODE):
+        return FakeNCCLLibrary(path, set() if path is None else None)
+
+    monkeypatch.setenv("NCCL_CHECKPOINT_SHIM", "/env/libnccl_checkpoint.so")
+    monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
+    clear_nccl_library_caches(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="ncclCheckpointGetVersion"):
+        NCCLLibrary(so_file)
+
+
+def test_nccl_checkpoint_shim_fails_when_preloaded_shim_cannot_open(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    so_file = "libnccl-test.so"
+    shim_path = "/loaded/libnccl_checkpoint.so"
+
+    def fake_cdll(path, mode=ctypes.DEFAULT_MODE):
+        if path == shim_path:
+            raise OSError("not loaded")
+        if path is None:
+            return FakeNCCLLibrary(None, {"ncclCheckpointGetVersion"})
+        return FakeNCCLLibrary(path)
+
+    monkeypatch.setenv("NCCL_CHECKPOINT_SHIM", "/env/libnccl_checkpoint.so")
+    monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
+    monkeypatch.setattr(
+        NCCLLibrary,
+        "_get_symbol_dso_path",
+        staticmethod(lambda symbol, process_lib: shim_path),
+    )
+    clear_nccl_library_caches(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="could not be opened"):
+        NCCLLibrary(so_file)
+
+
+def test_nccl_check_includes_function_name(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("NCCL_CHECKPOINT_SHIM", raising=False)
+    monkeypatch.setattr(ctypes, "CDLL", lambda path, mode=ctypes.DEFAULT_MODE: None)
+    clear_nccl_library_caches(monkeypatch)
+    library = NCCLLibrary.__new__(NCCLLibrary)
+    monkeypatch.setattr(
+        library, "ncclGetErrorString", lambda result: "invalid argument"
+    )
+
+    with pytest.raises(RuntimeError, match="NCCL error in ncclAllReduce"):
+        library.NCCL_CHECK(1, "ncclAllReduce")
 
 
 def distributed_run(fn, world_size):
