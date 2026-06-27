@@ -3,6 +3,7 @@
 
 
 # ===================== import region =====================
+import os
 import threading
 
 import torch
@@ -97,6 +98,8 @@ class PyNcclCommunicator:
         try:
             self.nccl = NCCLLibrary(library_path)
         except Exception:
+            if "NCCL_CHECKPOINT_SHIM" in os.environ:
+                raise
             # disable because of missing NCCL library
             # e.g. in a non-GPU environment
             self.available = False
