@@ -23,6 +23,7 @@
 # variable in the code.
 
 import ctypes
+import ctypes.util
 import functools
 import os
 import platform
@@ -143,6 +144,15 @@ class Function:
     name: str
     restype: Any
     argtypes: list[Any]
+
+
+class DlInfo(ctypes.Structure):
+    _fields_ = [
+        ("dli_fname", ctypes.c_char_p),
+        ("dli_fbase", ctypes.c_void_p),
+        ("dli_sname", ctypes.c_char_p),
+        ("dli_saddr", ctypes.c_void_p),
+    ]
 
 
 class NCCLLibrary:
@@ -320,20 +330,47 @@ class NCCLLibrary:
         Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
     ]
 
+    checkpoint_shim_functions = frozenset(
+        [
+            "ncclCommInitRank",
+            "ncclAllReduce",
+            "ncclReduce",
+            "ncclAllGather",
+            "ncclReduceScatter",
+            "ncclSend",
+            "ncclRecv",
+            "ncclBroadcast",
+            "ncclCommDestroy",
+            "ncclCommAbort",
+            "ncclCommWindowRegister",
+            "ncclCommWindowDeregister",
+        ]
+    )
+    checkpoint_real_functions = frozenset(
+        [
+            "ncclGetErrorString",
+            "ncclGetVersion",
+            "ncclGetUniqueId",
+            "ncclGroupStart",
+            "ncclGroupEnd",
+        ]
+    )
+
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
     path_to_library_cache: dict[str, Any] = {}
 
+    # class attribute to store the mapping from the checkpoint shim path to
+    # the already-loaded shim DSO handle
+    path_to_checkpoint_shim_cache: dict[str, Any] = {}
+
     # class attribute to store the mapping from library path
     # and binding mode to the corresponding dictionary
-    path_to_dict_mapping: dict[str | tuple[str, str], dict[str, Any]] = {}
+    path_to_dict_mapping: dict[Any, dict[str, Any]] = {}
 
     def __init__(self, so_file: str | None = None):
         so_file = so_file or find_nccl_library()
-        use_global_namespace = "NCCL_CHECKPOINT_SHIM" in os.environ
-        funcs_key: str | tuple[str, str] = (
-            (so_file, "process-global") if use_global_namespace else so_file
-        )
+        use_checkpoint_shim = "NCCL_CHECKPOINT_SHIM" in os.environ
 
         try:
             if so_file not in NCCLLibrary.path_to_library_cache:
@@ -343,12 +380,23 @@ class NCCLLibrary:
                     so_file,
                     mode=getattr(ctypes, "RTLD_GLOBAL", ctypes.DEFAULT_MODE),
                 )
-            if use_global_namespace:
-                # Bind through RTLD_DEFAULT so LD_PRELOAD wrappers intercept
-                # communicator APIs while real NCCL stays alive above.
-                self.lib = ctypes.CDLL(None)
+            self.real_lib = NCCLLibrary.path_to_library_cache[so_file]
+            if use_checkpoint_shim:
+                self.checkpoint_shim_lib, shim_path = (
+                    self._load_preloaded_checkpoint_shim()
+                )
+                self.lib = self.checkpoint_shim_lib
+                funcs_key = (so_file, "checkpoint-shim", shim_path)
+                logger.info(
+                    "NCCL checkpoint mode enabled: real NCCL library %s, "
+                    "checkpoint shim %s",
+                    so_file,
+                    shim_path,
+                )
             else:
-                self.lib = NCCLLibrary.path_to_library_cache[so_file]
+                self.checkpoint_shim_lib = None
+                self.lib = self.real_lib
+                funcs_key = so_file
         except Exception as e:
             logger.error(
                 "Failed to load NCCL library from %s. "
@@ -366,8 +414,24 @@ class NCCLLibrary:
         if funcs_key not in NCCLLibrary.path_to_dict_mapping:
             _funcs: dict[str, Any] = {}
             for func in NCCLLibrary.exported_functions:
+                if use_checkpoint_shim:
+                    if func.name in self.checkpoint_shim_functions:
+                        source_lib = self.checkpoint_shim_lib
+                        source_path = shim_path
+                    elif func.name in self.checkpoint_real_functions:
+                        source_lib = self.real_lib
+                        source_path = so_file
+                    else:
+                        raise RuntimeError(
+                            f"NCCL checkpoint mode does not know whether "
+                            f"{func.name} should bind from real NCCL or the "
+                            "checkpoint shim."
+                        )
+                else:
+                    source_lib = self.real_lib
+                    source_path = so_file
                 try:
-                    f = getattr(self.lib, func.name)
+                    f = getattr(source_lib, func.name)
                     f.restype = func.restype
                     f.argtypes = func.argtypes
                     _funcs[func.name] = f
@@ -383,7 +447,7 @@ class NCCLLibrary:
                                 " please update your NCCL version to >= "
                                 "2.27.03.",
                                 func.name,
-                                so_file,
+                                source_path,
                             )
                         if current_platform.is_rocm():
                             # Having an exception here on ROCm platform is
@@ -393,17 +457,105 @@ class NCCLLibrary:
             NCCLLibrary.path_to_dict_mapping[funcs_key] = _funcs
         self._funcs = NCCLLibrary.path_to_dict_mapping[funcs_key]
 
+    @classmethod
+    def _load_preloaded_checkpoint_shim(cls) -> tuple[Any, str]:
+        shim_path = cls._find_preloaded_checkpoint_shim_path()
+        if shim_path not in cls.path_to_checkpoint_shim_cache:
+            try:
+                cls.path_to_checkpoint_shim_cache[shim_path] = ctypes.CDLL(
+                    shim_path,
+                    mode=cls._checkpoint_shim_load_mode(),
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    "NCCL_CHECKPOINT_SHIM is set and "
+                    "ncclCheckpointGetVersion is present, but the checkpoint "
+                    f"shim DSO {shim_path!r} could not be opened. Ensure the "
+                    "same shim DSO is preloaded before starting vLLM."
+                ) from e
+        return cls.path_to_checkpoint_shim_cache[shim_path], shim_path
+
+    @classmethod
+    def _find_preloaded_checkpoint_shim_path(cls) -> str:
+        try:
+            process_lib = ctypes.CDLL(None)
+            checkpoint_version = process_lib.ncclCheckpointGetVersion
+        except AttributeError as e:
+            raise RuntimeError(
+                "NCCL_CHECKPOINT_SHIM is set, but "
+                "ncclCheckpointGetVersion was not found in the process-global "
+                "namespace. Ensure the NCCLCheckpoint shim is preloaded before "
+                "starting vLLM."
+            ) from e
+
+        shim_path = cls._get_symbol_dso_path(checkpoint_version, process_lib)
+        if shim_path:
+            return shim_path
+
+        shim_path = os.environ.get("NCCL_CHECKPOINT_SHIM")
+        if shim_path:
+            return shim_path
+        raise RuntimeError(
+            "NCCL_CHECKPOINT_SHIM is set and ncclCheckpointGetVersion was "
+            "found, but dladdr did not return a DSO path and "
+            "NCCL_CHECKPOINT_SHIM does not name a shim path."
+        )
+
+    @staticmethod
+    def _get_symbol_dso_path(symbol: Any, process_lib: Any) -> str | None:
+        try:
+            symbol_address = ctypes.cast(symbol, ctypes.c_void_p).value
+        except Exception:
+            return None
+        if not symbol_address:
+            return None
+
+        try:
+            dladdr = process_lib.dladdr
+        except AttributeError:
+            try:
+                libdl_path = ctypes.util.find_library("dl")
+                dladdr_lib = (
+                    ctypes.CDLL(libdl_path) if libdl_path else ctypes.CDLL(None)
+                )
+                dladdr = dladdr_lib.dladdr
+            except Exception:
+                return None
+
+        try:
+            dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(DlInfo)]
+            dladdr.restype = ctypes.c_int
+            info = DlInfo()
+            if dladdr(ctypes.c_void_p(symbol_address), ctypes.byref(info)) == 0:
+                return None
+        except Exception:
+            return None
+        if not info.dli_fname:
+            return None
+        return os.fsdecode(info.dli_fname)
+
+    @staticmethod
+    def _checkpoint_shim_load_mode() -> int:
+        rtld_noload = getattr(os, "RTLD_NOLOAD", None)
+        if rtld_noload is None:
+            return ctypes.DEFAULT_MODE
+        return rtld_noload | getattr(os, "RTLD_NOW", ctypes.DEFAULT_MODE)
+
     def ncclGetErrorString(self, result: ncclResult_t) -> str:
         return self._funcs["ncclGetErrorString"](result).decode("utf-8")
 
-    def NCCL_CHECK(self, result: ncclResult_t) -> None:
+    def NCCL_CHECK(self, result: ncclResult_t, func_name: str | None = None) -> None:
         if result != 0:
             error_str = self.ncclGetErrorString(result)
+            if func_name:
+                raise RuntimeError(f"NCCL error in {func_name}: {error_str}")
             raise RuntimeError(f"NCCL error: {error_str}")
 
     def ncclGetRawVersion(self) -> int:
         version = ctypes.c_int()
-        self.NCCL_CHECK(self._funcs["ncclGetVersion"](ctypes.byref(version)))
+        self.NCCL_CHECK(
+            self._funcs["ncclGetVersion"](ctypes.byref(version)), "ncclGetVersion"
+        )
         # something like 21903
         return version.value
 
@@ -417,7 +569,10 @@ class NCCLLibrary:
 
     def ncclGetUniqueId(self) -> ncclUniqueId:
         unique_id = ncclUniqueId()
-        self.NCCL_CHECK(self._funcs["ncclGetUniqueId"](ctypes.byref(unique_id)))
+        self.NCCL_CHECK(
+            self._funcs["ncclGetUniqueId"](ctypes.byref(unique_id)),
+            "ncclGetUniqueId",
+        )
         return unique_id
 
     def unique_id_from_bytes(self, data: bytes) -> ncclUniqueId:
@@ -436,7 +591,8 @@ class NCCLLibrary:
         self.NCCL_CHECK(
             self._funcs["ncclCommInitRank"](
                 ctypes.byref(comm), world_size, unique_id, rank
-            )
+            ),
+            "ncclCommInitRank",
         )
         return comm
 
@@ -458,7 +614,8 @@ class NCCLLibrary:
         self.NCCL_CHECK(
             self._funcs["ncclAllReduce"](
                 sendbuff, recvbuff, count, datatype, op, comm, stream
-            )
+            ),
+            "ncclAllReduce",
         )
 
     def ncclReduce(
@@ -480,7 +637,8 @@ class NCCLLibrary:
         self.NCCL_CHECK(
             self._funcs["ncclReduce"](
                 sendbuff, recvbuff, count, datatype, op, root, comm, stream
-            )
+            ),
+            "ncclReduce",
         )
 
     def ncclReduceScatter(
@@ -501,7 +659,8 @@ class NCCLLibrary:
         self.NCCL_CHECK(
             self._funcs["ncclReduceScatter"](
                 sendbuff, recvbuff, count, datatype, op, comm, stream
-            )
+            ),
+            "ncclReduceScatter",
         )
 
     def ncclAllGather(
@@ -520,7 +679,8 @@ class NCCLLibrary:
         self.NCCL_CHECK(
             self._funcs["ncclAllGather"](
                 sendbuff, recvbuff, count, datatype, comm, stream
-            )
+            ),
+            "ncclAllGather",
         )
 
     def ncclSend(
@@ -533,7 +693,8 @@ class NCCLLibrary:
         stream: cudaStream_t,
     ) -> None:
         self.NCCL_CHECK(
-            self._funcs["ncclSend"](sendbuff, count, datatype, dest, comm, stream)
+            self._funcs["ncclSend"](sendbuff, count, datatype, dest, comm, stream),
+            "ncclSend",
         )
 
     def ncclRecv(
@@ -546,7 +707,8 @@ class NCCLLibrary:
         stream: cudaStream_t,
     ) -> None:
         self.NCCL_CHECK(
-            self._funcs["ncclRecv"](recvbuff, count, datatype, src, comm, stream)
+            self._funcs["ncclRecv"](recvbuff, count, datatype, src, comm, stream),
+            "ncclRecv",
         )
 
     def ncclBroadcast(
@@ -562,20 +724,21 @@ class NCCLLibrary:
         self.NCCL_CHECK(
             self._funcs["ncclBroadcast"](
                 sendbuff, recvbuff, count, datatype, root, comm, stream
-            )
+            ),
+            "ncclBroadcast",
         )
 
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
-        self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))
+        self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm), "ncclCommDestroy")
 
     def ncclCommAbort(self, comm: ncclComm_t) -> None:
-        self.NCCL_CHECK(self._funcs["ncclCommAbort"](comm))
+        self.NCCL_CHECK(self._funcs["ncclCommAbort"](comm), "ncclCommAbort")
 
     def ncclGroupStart(self) -> None:
-        self.NCCL_CHECK(self._funcs["ncclGroupStart"]())
+        self.NCCL_CHECK(self._funcs["ncclGroupStart"](), "ncclGroupStart")
 
     def ncclGroupEnd(self) -> None:
-        self.NCCL_CHECK(self._funcs["ncclGroupEnd"]())
+        self.NCCL_CHECK(self._funcs["ncclGroupEnd"](), "ncclGroupEnd")
 
     def ncclCommWindowRegister(
         self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int
@@ -584,12 +747,16 @@ class NCCLLibrary:
         self.NCCL_CHECK(
             self._funcs["ncclCommWindowRegister"](
                 comm, buff, size, ctypes.byref(window), win_flags
-            )
+            ),
+            "ncclCommWindowRegister",
         )
         return window
 
     def ncclCommWindowDeregister(self, comm: ncclComm_t, window: ncclWindow_t) -> None:
-        self.NCCL_CHECK(self._funcs["ncclCommWindowDeregister"](comm, window))
+        self.NCCL_CHECK(
+            self._funcs["ncclCommWindowDeregister"](comm, window),
+            "ncclCommWindowDeregister",
+        )
 
 
 __all__ = [
