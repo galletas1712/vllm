@@ -342,10 +342,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # uses dim=0 with tp-aligned (uniform) shards.
         if dim < 0:
             dim += input_.dim()
-        if dim == 0 and should_nccl_symm_mem_ag_rs():
-            return self._all_gather_symm_mem(input_.contiguous())
         if self.disable_nccl:
             return self._flashinfer_all_gather(input_, dim)
+        if dim == 0 and should_nccl_symm_mem_ag_rs():
+            return self._all_gather_symm_mem(input_.contiguous())
         return super().all_gather(input_, dim)
 
     def _flashinfer_all_gather(

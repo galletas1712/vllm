@@ -64,6 +64,25 @@ def test_unsupported_collectives_fail_closed():
         communicator.all_gatherv(torch.empty(1), sizes=[1, 2])
 
 
+def test_all_gather_policy_overrides_nccl_symmetric_memory():
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.disable_nccl = True
+    input_ = torch.empty(1)
+    expected = torch.empty(2)
+    communicator._flashinfer_all_gather = MagicMock(return_value=expected)
+    communicator._all_gather_symm_mem = MagicMock()
+
+    with patch(
+        "vllm.distributed.device_communicators.cuda_communicator."
+        "should_nccl_symm_mem_ag_rs",
+        return_value=True,
+    ):
+        assert communicator.all_gather(input_, dim=0) is expected
+
+    communicator._flashinfer_all_gather.assert_called_once_with(input_, 0)
+    communicator._all_gather_symm_mem.assert_not_called()
+
+
 def test_deepep_v2_probe_is_skipped(monkeypatch):
     monkeypatch.setenv("VLLM_DISABLE_NCCL", "1")
 
