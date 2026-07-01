@@ -1259,6 +1259,13 @@ def init_worker_distributed_environment(
 ) -> None:
     """Initialize the distributed environment."""
     parallel_config = vllm_config.parallel_config
+    if envs.VLLM_DISABLE_NCCL:
+        backend = "gloo"
+        parallel_config.disable_nccl_for_dp_synchronization = True
+        if vllm_config.weight_transfer_config is not None:
+            raise ValueError(
+                "VLLM_DISABLE_NCCL does not support weight transfer engines"
+            )
     from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
     init_batch_invariance()

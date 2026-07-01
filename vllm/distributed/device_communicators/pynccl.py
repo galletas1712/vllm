@@ -64,6 +64,13 @@ class PyNcclCommunicator:
         device: int | str | torch.device,
         library_path: str | None = None,
     ):
+        from vllm.distributed.nccl_audit import record_nccl_event
+
+        record_nccl_event("pynccl_communicator_create")
+        if envs.VLLM_DISABLE_NCCL:
+            raise RuntimeError(
+                "PyNcclCommunicator creation is forbidden by VLLM_DISABLE_NCCL"
+            )
         """
         Args:
             group: the process group to work on. If None, it will use the

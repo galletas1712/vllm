@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
+    VLLM_DISABLE_NCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -1815,6 +1816,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_NCCL_SYMM_MEM": lambda: bool(
         int(os.getenv("VLLM_USE_NCCL_SYMM_MEM", "0"))
     ),
+    # Run supported CUDA collectives through non-NCCL implementations only.
+    # Unsupported collective paths fail instead of falling back to NCCL.
+    "VLLM_DISABLE_NCCL": lambda: bool(int(os.getenv("VLLM_DISABLE_NCCL", "0"))),
     # NCCL header path
     "VLLM_NCCL_INCLUDE_PATH": lambda: os.environ.get("VLLM_NCCL_INCLUDE_PATH", None),
     # GC debug config

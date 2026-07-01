@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
 
 import torch
 from torch.distributed import ProcessGroup
@@ -58,6 +59,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
+        self.disable_nccl = envs.VLLM_DISABLE_NCCL
+        if self.disable_nccl:
+            if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+                raise ValueError("VLLM_DISABLE_NCCL does not support split_group")
+            if self.use_all2all and (
+                self.all2all_backend != "flashinfer_nvlink_one_sided"
+            ):
+                raise ValueError(
+                    "VLLM_DISABLE_NCCL requires "
+                    "all2all_backend=flashinfer_nvlink_one_sided"
+                )
+            use_custom_allreduce = False
+            use_torch_symm_mem = False
+            self.use_custom_allreduce = False
+            self.use_torch_symm_mem = False
+            if "tp" in unique_name:
+                self.use_flashinfer_allreduce = True
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -73,7 +91,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm: PyNcclCommunicator | None = None
-        if self.world_size > 1:
+        if self.world_size > 1 and not self.disable_nccl:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group if tcp_store_group is None else tcp_store_group,
                 device=self.device,
@@ -85,6 +103,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
+        self.fi_ag_workspaces: dict[tuple[torch.dtype, int], Any] = {}
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -281,6 +300,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = fi_ar_comm.all_reduce(input_)
             assert out is not None
             return out
+        if self.disable_nccl:
+            raise RuntimeError(
+                "VLLM_DISABLE_NCCL requires this CUDA all-reduce to be handled "
+                "by FlashInfer; its shape, dtype, or size is unsupported"
+            )
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
@@ -320,9 +344,52 @@ class CudaCommunicator(DeviceCommunicatorBase):
             dim += input_.dim()
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
+        if self.disable_nccl:
+            return self._flashinfer_all_gather(input_, dim)
         return super().all_gather(input_, dim)
 
+    def _flashinfer_all_gather(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        if dim < 0:
+            dim += input_.dim()
+        if (
+            not input_.is_cuda
+            or input_.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or input_.numel() == 0
+        ):
+            raise RuntimeError(
+                "VLLM_DISABLE_NCCL only supports non-empty CUDA float16, "
+                "bfloat16, or float32 equal-size all-gather inputs"
+            )
+        from flashinfer.comm import SymmetricAllGatherWorkspace
+        from flashinfer.comm.mnnvl import TorchDistBackend
+
+        contiguous = input_.contiguous()
+        key = (contiguous.dtype, contiguous.numel())
+        workspace = self.fi_ag_workspaces.get(key)
+        if workspace is None:
+            workspace = SymmetricAllGatherWorkspace(
+                max_elems=contiguous.numel(),
+                world_size=self.world_size,
+                rank=self.rank,
+                comm_backend=TorchDistBackend(group=self.cpu_group),
+                dtype=contiguous.dtype,
+            )
+            self.fi_ag_workspaces[key] = workspace
+        output = workspace.all_gather(contiguous)
+        input_size = input_.size()
+        output = output.reshape((self.world_size,) + input_size)
+        output = output.movedim(0, dim)
+        return output.reshape(
+            input_size[:dim]
+            + (self.world_size * input_size[dim],)
+            + input_size[dim + 1 :]
+        )
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        if self.disable_nccl:
+            raise RuntimeError("VLLM_DISABLE_NCCL does not support reduce-scatter")
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -352,6 +419,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):
+        if self.disable_nccl:
+            raise RuntimeError(
+                "VLLM_DISABLE_NCCL does not support variable reduce-scatter"
+            )
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -466,6 +537,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
+        if self.disable_nccl:
+            raise RuntimeError("VLLM_DISABLE_NCCL does not support GPU P2P")
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
@@ -480,6 +553,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ) -> torch.Tensor:
         """Receives a tensor from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
+        if self.disable_nccl:
+            raise RuntimeError("VLLM_DISABLE_NCCL does not support GPU P2P")
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
 
@@ -495,6 +570,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """Broadcast a tensor from source rank to all ranks."""
         if self.world_size == 1:
             return tensor
+        if self.disable_nccl:
+            raise RuntimeError("VLLM_DISABLE_NCCL does not support GPU broadcast")
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -515,6 +592,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]
+        for workspace in self.fi_ag_workspaces.values():
+            workspace.destroy()
+        self.fi_ag_workspaces.clear()
+
+    def checkpoint_prepare(self) -> None:
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_prepare()
+        for workspace in self.fi_ag_workspaces.values():
+            workspace.checkpoint_prepare()
+
+    def checkpoint_restore(self) -> None:
+        from flashinfer.comm.mnnvl import TorchDistBackend
+
+        for workspace in self.fi_ag_workspaces.values():
+            workspace.checkpoint_restore(TorchDistBackend(group=self.cpu_group))
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_restore()
 
     def all_gatherv(
         self,
@@ -525,6 +619,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if dim != 0:
             raise NotImplementedError("only dim 0 all-gatherv is supported")
         world_size = self.world_size
+        if self.disable_nccl:
+            if sizes is not None and any(size != sizes[0] for size in sizes):
+                raise RuntimeError(
+                    "VLLM_DISABLE_NCCL does not support variable all-gather"
+                )
+            if isinstance(input_, torch.Tensor):
+                return self._flashinfer_all_gather(input_, dim=0)
+            return [self._flashinfer_all_gather(inp, dim=0) for inp in input_]
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None and not pynccl_comm.disabled
 

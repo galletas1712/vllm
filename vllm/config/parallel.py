@@ -789,6 +789,33 @@ class ParallelConfig:
         return hash_factors(factors)
 
     def __post_init__(self) -> None:
+        if envs.VLLM_DISABLE_NCCL:
+            if self.pipeline_parallel_size != 1:
+                raise ValueError("VLLM_DISABLE_NCCL requires pipeline_parallel_size=1")
+            if self.enable_elastic_ep:
+                raise ValueError("VLLM_DISABLE_NCCL does not support elastic EP")
+            if self.enable_eplb:
+                raise ValueError("VLLM_DISABLE_NCCL does not support EPLB")
+            if self.data_parallel_backend == "ray":
+                raise ValueError(
+                    "VLLM_DISABLE_NCCL does not support the Ray DP backend"
+                )
+            if self.distributed_executor_backend == "ray":
+                raise ValueError(
+                    "VLLM_DISABLE_NCCL does not support the Ray executor"
+                )
+            if (
+                self.data_parallel_size > 1
+                and self.all2all_backend != "flashinfer_nvlink_one_sided"
+            ):
+                raise ValueError(
+                    "VLLM_DISABLE_NCCL requires "
+                    "all2all_backend=flashinfer_nvlink_one_sided for DP/EP"
+                )
+            if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+                raise ValueError("VLLM_DISABLE_NCCL does not support split_group")
+            self.disable_nccl_for_dp_synchronization = True
+
         # Continue with the rest of the initialization
         self.world_size = (
             self.pipeline_parallel_size

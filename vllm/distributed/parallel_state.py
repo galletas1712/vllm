@@ -270,6 +270,10 @@ def _create_subgroups_split_group(
     the subgroup it belongs to.
     """
     device_backend_str = _device_backend_str(torch_distributed_backend)
+    if "nccl" in device_backend_str:
+        from vllm.distributed.nccl_audit import record_nccl_event
+
+        record_nccl_event("process_group_nccl_split")
     self_device_group = torch.distributed.split_group(
         split_ranks=group_ranks,
         group_desc=f"{group_name}:device",
@@ -387,6 +391,8 @@ class GroupCoordinator:
         group_name: str | None = None,
     ):
         group_name = group_name or "anonymous"
+        if envs.VLLM_DISABLE_NCCL:
+            torch_distributed_backend = "gloo"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
@@ -504,6 +510,8 @@ class GroupCoordinator:
         This is a collective call: every world rank must invoke it. Used where we
         want to issue ops that can run concurrently with ops on `device_group`.
         """
+        if envs.VLLM_DISABLE_NCCL:
+            raise RuntimeError("VLLM_DISABLE_NCCL does not support sibling groups")
         sibling: ProcessGroup | None = None
         for ranks in self.group_ranks:
             pg = torch.distributed.new_group(
@@ -732,6 +740,8 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        if envs.VLLM_DISABLE_NCCL and input_.is_cuda:
+            raise RuntimeError("VLLM_DISABLE_NCCL does not support GPU broadcast")
         # Broadcast.
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group
@@ -855,6 +865,17 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return tensor_dict
+        if (
+            envs.VLLM_DISABLE_NCCL
+            and tensor_dict is not None
+            and any(
+                isinstance(value, torch.Tensor) and value.is_cuda
+                for value in tensor_dict.values()
+            )
+        ):
+            raise RuntimeError(
+                "VLLM_DISABLE_NCCL does not support GPU tensor broadcast"
+            )
 
         group = self.device_group
         metadata_group = self.cpu_group
@@ -1017,6 +1038,10 @@ class GroupCoordinator:
         for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 continue
+            if envs.VLLM_DISABLE_NCCL and tensor.is_cuda:
+                raise RuntimeError(
+                    "VLLM_DISABLE_NCCL does not support GPU tensor P2P"
+                )
 
             if self._should_use_all_gather(
                 key, tensor.numel(), all_gather_group, all_gather_tensors
@@ -1115,6 +1140,10 @@ class GroupCoordinator:
                 full_tensor = torch.empty(
                     value.size, dtype=value.dtype, device=value.device
                 )
+                if envs.VLLM_DISABLE_NCCL and full_tensor.is_cuda:
+                    raise RuntimeError(
+                        "VLLM_DISABLE_NCCL does not support GPU tensor P2P"
+                    )
                 if full_tensor.numel() == 0:
                     tensor_dict[key] = full_tensor
                     continue
@@ -1541,6 +1570,8 @@ def init_distributed_environment(
     backend: str = "nccl",
     timeout: timedelta | None = None,
 ):
+    if envs.VLLM_DISABLE_NCCL:
+        backend = "gloo"
     logger.debug(
         "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
         world_size,
@@ -1553,6 +1584,14 @@ def init_distributed_environment(
 
     config = get_current_vllm_config_or_none()
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
+    if envs.VLLM_DISABLE_NCCL and enable_elastic_ep:
+        raise ValueError("VLLM_DISABLE_NCCL does not support elastic EP")
+    if (
+        envs.VLLM_DISABLE_NCCL
+        and config is not None
+        and config.parallel_config.pipeline_parallel_size != 1
+    ):
+        raise ValueError("VLLM_DISABLE_NCCL requires pipeline_parallel_size=1")
     if (
         config is not None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
@@ -1606,6 +1645,10 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available."
             )
             backend = "gloo"
+        if "nccl" in str(backend):
+            from vllm.distributed.nccl_audit import record_nccl_event
+
+            record_nccl_event("process_group_nccl_init")
         if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
             # split_group needs local_rank early to compute device_id for
             # the eager init. local_rank is not available in torch
@@ -1999,6 +2042,34 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
         _EP.prepare_communication_buffer_for_model(model)
     if _EPLB is not None:
         _EPLB.prepare_communication_buffer_for_model(model)
+
+
+def checkpoint_prepare_distributed_state() -> None:
+    torch.cuda.synchronize()
+    for group_ref in _groups.values():
+        group = group_ref()
+        if group is not None and group.device_communicator is not None:
+            group.device_communicator.checkpoint_prepare()
+    from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+        checkpoint_prepare_fi_ar_workspaces,
+    )
+
+    checkpoint_prepare_fi_ar_workspaces()
+    torch.cuda.synchronize()
+
+
+def checkpoint_restore_distributed_state() -> None:
+    torch.cuda.synchronize()
+    from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+        checkpoint_restore_fi_ar_workspaces,
+    )
+
+    checkpoint_restore_fi_ar_workspaces()
+    for group_ref in _groups.values():
+        group = group_ref()
+        if group is not None and group.device_communicator is not None:
+            group.device_communicator.checkpoint_restore()
+    torch.cuda.synchronize()
 
 
 def model_parallel_is_initialized():
