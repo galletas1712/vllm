@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
 
 import torch
 from torch.distributed import ProcessGroup
@@ -85,6 +86,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
+        self.fi_ag_workspaces: dict[tuple[torch.dtype, int], Any] = {}
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -318,9 +320,50 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # uses dim=0 with tp-aligned (uniform) shards.
         if dim < 0:
             dim += input_.dim()
+        if envs.VLLM_ALLGATHER_USE_FLASHINFER:
+            return self._flashinfer_all_gather(input_, dim)
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
         return super().all_gather(input_, dim)
+
+    def _flashinfer_all_gather(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        if dim < 0:
+            dim += input_.dim()
+        if (
+            not input_.is_cuda
+            or input_.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or input_.numel() == 0
+        ):
+            raise ValueError(
+                "FlashInfer symmetric all-gather requires a non-empty CUDA "
+                "float16, bfloat16, or float32 tensor"
+            )
+        from flashinfer.comm import SymmetricAllGatherWorkspace
+        from flashinfer.comm.mnnvl import TorchDistBackend
+
+        contiguous = input_.contiguous()
+        key = (contiguous.dtype, contiguous.numel())
+        workspace = self.fi_ag_workspaces.get(key)
+        if workspace is None:
+            workspace = SymmetricAllGatherWorkspace(
+                max_elems=contiguous.numel(),
+                world_size=self.world_size,
+                rank=self.rank,
+                comm_backend=TorchDistBackend(group=self.cpu_group),
+                dtype=contiguous.dtype,
+            )
+            self.fi_ag_workspaces[key] = workspace
+        output = workspace.all_gather(contiguous)
+        input_size = input_.size()
+        output = output.reshape((self.world_size,) + input_size)
+        output = output.movedim(0, dim)
+        return output.reshape(
+            input_size[:dim]
+            + (self.world_size * input_size[dim],)
+            + input_size[dim + 1 :]
+        )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
@@ -515,6 +558,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]
+        for workspace in self.fi_ag_workspaces.values():
+            workspace.destroy()
+        self.fi_ag_workspaces.clear()
+
+    def checkpoint_prepare(self) -> None:
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_prepare()
+        for workspace in self.fi_ag_workspaces.values():
+            workspace.checkpoint_prepare()
+
+    def checkpoint_restore(self) -> None:
+        from flashinfer.comm.mnnvl import TorchDistBackend
+
+        for workspace in self.fi_ag_workspaces.values():
+            workspace.checkpoint_restore(TorchDistBackend(group=self.cpu_group))
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_restore()
 
     def all_gatherv(
         self,
@@ -532,6 +592,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # shape
         if sizes is not None and all(s == sizes[0] for s in sizes):
             sizes = None
+
+        if sizes is None and envs.VLLM_ALLGATHER_USE_FLASHINFER:
+            if isinstance(input_, torch.Tensor):
+                return self._flashinfer_all_gather(input_, dim=0)
+            return [self._flashinfer_all_gather(inp, dim=0) for inp in input_]
 
         # Symmetric memory is only used when all ranks have uniform sizes.
         # ncclCommWindowRegister is collective: asymmetric pool allocations

@@ -37,6 +37,7 @@ except ImportError:
 _fi_ar_workspace = None
 # Extra workspace for quant fusion patterns (only supported by trtllm backend)
 _fi_ar_quant_workspace = None
+_fi_ar_workspace_groups: dict[int, ProcessGroup] = {}
 
 
 def _create_workspace(
@@ -89,6 +90,7 @@ def _create_workspace(
         hidden_dim,
         dtype,
     )
+    _fi_ar_workspace_groups[id(workspace)] = group
     return workspace
 
 
@@ -240,6 +242,28 @@ def destroy_fi_ar_workspace():
             _fi_ar_quant_workspace.destroy()
 
         _fi_ar_workspace = _fi_ar_quant_workspace = None
+        _fi_ar_workspace_groups.clear()
+
+
+def _fi_ar_workspaces():
+    seen = set()
+    for workspace in (_fi_ar_workspace, _fi_ar_quant_workspace):
+        if workspace is not None and id(workspace) not in seen:
+            seen.add(id(workspace))
+            yield workspace
+
+
+def checkpoint_prepare_fi_ar_workspaces() -> None:
+    for workspace in _fi_ar_workspaces():
+        workspace.checkpoint_prepare()
+
+
+def checkpoint_restore_fi_ar_workspaces() -> None:
+    for workspace in _fi_ar_workspaces():
+        group = _fi_ar_workspace_groups.get(id(workspace))
+        if group is None:
+            raise RuntimeError("FlashInfer all-reduce workspace group was not retained")
+        workspace.checkpoint_restore(TorchDistBackend(group=group))
 
 
 atexit.register(destroy_fi_ar_workspace)
