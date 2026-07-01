@@ -15,6 +15,10 @@ for control groups, FlashInfer for supported CUDA all-reduce and equal-size
 all-gather operations, and `flashinfer_nvlink_one_sided` for expert-parallel
 dispatch and combine.
 
+At import time, the policy discards inherited `NCCL_*`, `TORCH_NCCL_*`, and
+`DYN_SNAPSHOT_NCCL_KVS_ENDPOINT` settings so checkpoint-shim, transport, and
+debug configuration cannot accidentally activate an NCCL path.
+
 The policy requires pipeline parallel size 1. It rejects unsupported
 reduce-scatter, variable all-gather, GPU point-to-point and broadcast,
 split-group, elastic EP, EPLB, Ray, and weight-transfer paths instead of

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,24 @@ from vllm.distributed.nccl_audit import (
 def test_disable_nccl_env(monkeypatch):
     monkeypatch.setenv("VLLM_DISABLE_NCCL", "1")
     assert envs.VLLM_DISABLE_NCCL is True
+
+
+def test_disable_nccl_removes_runtime_configuration(monkeypatch):
+    monkeypatch.setenv("VLLM_DISABLE_NCCL", "1")
+    legacy_env = {
+        "NCCL_CHECKPOINT_SHIM": "/opt/nccl-checkpoint/lib/shim.so",
+        "NCCL_DEBUG": "INFO",
+        "TORCH_NCCL_ENABLE_MONITORING": "1",
+        "DYN_SNAPSHOT_NCCL_KVS_ENDPOINT": "redis://legacy",
+    }
+    for name, value in legacy_env.items():
+        monkeypatch.setenv(name, value)
+
+    envs._remove_nccl_environment_for_no_nccl_policy()
+
+    for name in legacy_env:
+        assert name not in os.environ
+    assert os.environ["VLLM_DISABLE_NCCL"] == "1"
 
 
 def test_pynccl_creation_is_rejected_and_audited(monkeypatch):

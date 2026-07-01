@@ -11,6 +11,20 @@ import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
+
+def _remove_nccl_environment_for_no_nccl_policy() -> None:
+    if os.environ.get("VLLM_DISABLE_NCCL") != "1":
+        return
+
+    for name in tuple(os.environ):
+        if name.startswith(("NCCL_", "TORCH_NCCL_")) or (
+            name == "DYN_SNAPSHOT_NCCL_KVS_ENDPOINT"
+        ):
+            os.environ.pop(name)
+
+
+_remove_nccl_environment_for_no_nccl_policy()
+
 if TYPE_CHECKING:
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
