@@ -981,9 +981,14 @@ class GPUModelRunner(
             return
 
         kv_caches = getattr(self, "kv_caches", [])
-        for cache_tensor in kv_caches:
-            if cache_tensor is not None:
-                cache_tensor.zero_()
+        for cache_entry in kv_caches:
+            if cache_entry is None:
+                continue
+            if isinstance(cache_entry, list):
+                for cache_tensor in cache_entry:
+                    cache_tensor.zero_()
+            else:
+                cache_entry.zero_()
 
         k_attr_names = ("_k_scale", "k_scale")
         v_attr_names = ("_v_scale", "v_scale")
