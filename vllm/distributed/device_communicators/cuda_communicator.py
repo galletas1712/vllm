@@ -423,6 +423,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]
 
+    def checkpoint_prepare(self) -> None:
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_prepare()
+
+    def checkpoint_restore(self) -> None:
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_restore()
+
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],

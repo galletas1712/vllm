@@ -2001,6 +2001,32 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
         _EPLB.prepare_communication_buffer_for_model(model)
 
 
+def checkpoint_prepare_distributed_state() -> None:
+    torch.cuda.synchronize()
+    checkpoint_prepare_device_communicators()
+    torch.cuda.synchronize()
+
+
+def checkpoint_restore_distributed_state() -> None:
+    torch.cuda.synchronize()
+    checkpoint_restore_device_communicators()
+    torch.cuda.synchronize()
+
+
+def checkpoint_prepare_device_communicators() -> None:
+    for group_ref in _groups.values():
+        group = group_ref()
+        if group is not None and group.device_communicator is not None:
+            group.device_communicator.checkpoint_prepare()
+
+
+def checkpoint_restore_device_communicators() -> None:
+    for group_ref in _groups.values():
+        group = group_ref()
+        if group is not None and group.device_communicator is not None:
+            group.device_communicator.checkpoint_restore()
+
+
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
     return _TP is not None and _PP is not None
