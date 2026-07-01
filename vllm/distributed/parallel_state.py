@@ -24,8 +24,10 @@ If you only need to use the distributed environment without model/pipeline
 """
 
 import contextlib
+import functools
 import gc
 import pickle
+import time
 import weakref
 from collections import namedtuple
 from collections.abc import Callable
@@ -2001,13 +2003,41 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
         _EPLB.prepare_communication_buffer_for_model(model)
 
 
+@functools.cache
+def _get_nccl_checkpoint_library() -> Any | None:
+    try:
+        from nccl_checkpoint import (
+            NCCLCheckpointLibrary,
+            NCCLCheckpointPreloadError,
+        )
+    except ImportError as exc:
+        logger.warning_once("NCCL checkpoint shim unavailable; skipping: %s", exc)
+        return None
+
+    try:
+        return NCCLCheckpointLibrary()
+    except NCCLCheckpointPreloadError as exc:
+        logger.warning_once("NCCL checkpoint shim unavailable; skipping: %s", exc)
+        return None
+
+
 def checkpoint_prepare_distributed_state() -> None:
     torch.cuda.synchronize()
     checkpoint_prepare_device_communicators()
     torch.cuda.synchronize()
+    nccl_checkpoint_library = _get_nccl_checkpoint_library()
+    if nccl_checkpoint_library is not None:
+        logger.info("Calling NCCL checkpoint shim checkpoint_prepare()")
+        nccl_checkpoint_library.checkpoint_prepare()
+    torch.cuda.synchronize()
+    time.sleep(1)
 
 
 def checkpoint_restore_distributed_state() -> None:
+    nccl_checkpoint_library = _get_nccl_checkpoint_library()
+    if nccl_checkpoint_library is not None:
+        logger.info("Calling NCCL checkpoint shim checkpoint_restore()")
+        nccl_checkpoint_library.checkpoint_restore()
     torch.cuda.synchronize()
     checkpoint_restore_device_communicators()
     torch.cuda.synchronize()
