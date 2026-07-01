@@ -140,21 +140,22 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     Without autotuning, FlashInfer will rely on heuristics, which may
     be significantly slower.
 
-    Tuning is performed only on rank 0. The resulting cache is broadcast
-    to every rank so all ranks dispatch the same kernel tactic.
+    Persistent-cache tuning is performed only on rank 0. Backends whose
+    collectives require lockstep progress tune on every rank instead.
     """
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
     use_persistent_cache = True
 
-    deepep_a2a_backends = {
+    synchronized_a2a_backends = {
         "deepep_high_throughput",
         "deepep_low_latency",
         "deepep_v2",
+        "flashinfer_nvlink_one_sided",
     }
-    if runner.vllm_config.parallel_config.all2all_backend in deepep_a2a_backends:
-        # DeepEP dispatch/combine can timeout when only rank 0
+    if runner.vllm_config.parallel_config.all2all_backend in synchronized_a2a_backends:
+        # Collective dispatch/combine can timeout when only rank 0
         # performs autotune and falls behind other ranks.
         # Thus we skip persistent cache in this case.
         use_persistent_cache = False
