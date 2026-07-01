@@ -583,6 +583,13 @@ class CudaPlatformBase(Platform):
         group_size: int,
         timeout: timedelta,
     ) -> ProcessGroup:
+        if envs.VLLM_DISABLE_NCCL:
+            from vllm.distributed.nccl_audit import record_nccl_event
+
+            record_nccl_event("stateless_process_group_nccl_init")
+            raise RuntimeError(
+                "Stateless ProcessGroupNCCL creation is forbidden by VLLM_DISABLE_NCCL"
+            )
         assert is_nccl_available()
         pg: ProcessGroup = ProcessGroup(
             prefix_store,

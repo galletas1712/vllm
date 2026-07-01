@@ -33,15 +33,21 @@ def assert_no_nccl_communicators() -> dict[str, str]:
     if dist.is_initialized():
         backends["default"] = str(dist.get_backend())
 
+    from torch.distributed.distributed_c10d import _world
+
+    for index, process_group in enumerate(list(_world.pg_map)):
+        backends[f"torch_pg_{index}"] = str(dist.get_backend(process_group))
+
     for name, group_ref in list(parallel_state._groups.items()):
         coordinator = group_ref()
         if coordinator is None:
             continue
 
         communicator: Any = coordinator.device_communicator
-        if communicator is not None and getattr(
-            communicator, "pynccl_comm", None
-        ) is not None:
+        if (
+            communicator is not None
+            and getattr(communicator, "pynccl_comm", None) is not None
+        ):
             raise RuntimeError(f"NCCL PyNccl communicator exists for group {name}")
 
         for kind in ("cpu_group", "device_group"):

@@ -51,17 +51,53 @@ def test_nccl_audit_rejects_recorded_creation_attempt():
 def test_unsupported_collectives_fail_closed():
     communicator = CudaCommunicator.__new__(CudaCommunicator)
     communicator.disable_nccl = True
+    communicator.world_size = 2
+    communicator.rank_in_group = 0
 
     with pytest.raises(RuntimeError, match="reduce-scatter"):
         communicator.reduce_scatter(torch.empty(1))
     with pytest.raises(RuntimeError, match="GPU P2P"):
         communicator.send(torch.empty(1))
+    with pytest.raises(RuntimeError, match="one size per rank"):
+        communicator.all_gatherv(torch.empty(1), sizes=[1])
+    with pytest.raises(RuntimeError, match="variable all-gather"):
+        communicator.all_gatherv(torch.empty(1), sizes=[1, 2])
+
+
+def test_deepep_v2_probe_is_skipped(monkeypatch):
+    monkeypatch.setenv("VLLM_DISABLE_NCCL", "1")
+
+    with (
+        patch("vllm.utils.import_utils._has_module") as has_module,
+        patch(
+            "vllm.utils.import_utils._get_runtime_nccl_version"
+        ) as get_runtime_nccl_version,
+    ):
+        from vllm.utils.import_utils import has_deep_ep_v2
+
+        assert has_deep_ep_v2() is False
+
+    has_module.assert_not_called()
+    get_runtime_nccl_version.assert_not_called()
+
+
+def test_stateless_process_group_nccl_is_rejected(monkeypatch):
+    monkeypatch.setenv("VLLM_DISABLE_NCCL", "1")
+    reset_nccl_audit_events()
+
+    from vllm.platforms.cuda import CudaPlatformBase
+
+    with pytest.raises(RuntimeError, match="ProcessGroupNCCL"):
+        CudaPlatformBase.stateless_init_device_torch_dist_pg(
+            "nccl", MagicMock(), 0, 1, MagicMock()
+        )
+
+    assert get_nccl_audit_events() == {"stateless_process_group_nccl_init": 1}
+    reset_nccl_audit_events()
 
 
 def test_two_sided_checkpoint_is_rejected():
-    manager = FlashInferNVLinkTwoSidedManager.__new__(
-        FlashInferNVLinkTwoSidedManager
-    )
+    manager = FlashInferNVLinkTwoSidedManager.__new__(FlashInferNVLinkTwoSidedManager)
     manager.initialized = True
 
     with pytest.raises(NotImplementedError, match="one_sided"):
@@ -71,9 +107,7 @@ def test_two_sided_checkpoint_is_rejected():
 
 
 def test_one_sided_restore_uses_fresh_control_backend():
-    manager = FlashInferNVLinkOneSidedManager.__new__(
-        FlashInferNVLinkOneSidedManager
-    )
+    manager = FlashInferNVLinkOneSidedManager.__new__(FlashInferNVLinkOneSidedManager)
     manager.initialized = True
     manager.cpu_group = MagicMock()
     manager.moe_alltoall = MagicMock()

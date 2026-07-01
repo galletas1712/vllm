@@ -620,10 +620,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError("only dim 0 all-gatherv is supported")
         world_size = self.world_size
         if self.disable_nccl:
-            if sizes is not None and any(size != sizes[0] for size in sizes):
-                raise RuntimeError(
-                    "VLLM_DISABLE_NCCL does not support variable all-gather"
-                )
+            if sizes is not None:
+                if len(sizes) != world_size:
+                    raise RuntimeError(
+                        "VLLM_DISABLE_NCCL all-gather requires one size per rank"
+                    )
+                if any(size != sizes[0] for size in sizes):
+                    raise RuntimeError(
+                        "VLLM_DISABLE_NCCL does not support variable all-gather"
+                    )
+                inputs = [input_] if isinstance(input_, torch.Tensor) else input_
+                if any(
+                    tensor.shape[0] != sizes[self.rank_in_group] for tensor in inputs
+                ):
+                    raise RuntimeError(
+                        "VLLM_DISABLE_NCCL all-gather input shape does not match "
+                        "the declared equal rank size"
+                    )
             if isinstance(input_, torch.Tensor):
                 return self._flashinfer_all_gather(input_, dim=0)
             return [self._flashinfer_all_gather(inp, dim=0) for inp in input_]

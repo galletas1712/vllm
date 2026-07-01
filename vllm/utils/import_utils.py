@@ -451,6 +451,10 @@ def has_deep_ep_v2() -> bool:
     Requires both the ElasticBuffer class in the deep_ep module and
     NCCL >= 2.30.4 (GIN backend), checked against the runtime library.
     """
+    from vllm import envs
+
+    if envs.VLLM_DISABLE_NCCL:
+        return False
     if not _has_module("deep_ep"):
         return False
     import deep_ep  # type: ignore[import-not-found]
