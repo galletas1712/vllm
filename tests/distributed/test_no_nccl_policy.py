@@ -14,7 +14,9 @@ from vllm.distributed.device_communicators.all2all import (
 )
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.distributed.nccl_audit import (
+    assert_no_nccl_communicators,
     get_nccl_audit_events,
+    record_nccl_event,
     reset_nccl_audit_events,
 )
 
@@ -34,6 +36,16 @@ def test_pynccl_creation_is_rejected_and_audited(monkeypatch):
         PyNcclCommunicator(MagicMock(), "cuda:0")
 
     assert get_nccl_audit_events() == {"pynccl_communicator_create": 1}
+
+
+def test_nccl_audit_rejects_recorded_creation_attempt():
+    reset_nccl_audit_events()
+    record_nccl_event("process_group_nccl_init")
+
+    with pytest.raises(RuntimeError, match="creation was attempted"):
+        assert_no_nccl_communicators()
+
+    reset_nccl_audit_events()
 
 
 def test_unsupported_collectives_fail_closed():
