@@ -226,6 +226,24 @@ def destroy_fi_ar_workspace():
         _fi_ar_workspace = _fi_ar_quant_workspace = None
 
 
+def _fi_ar_workspaces():
+    seen = set()
+    for workspace in (_fi_ar_workspace, _fi_ar_quant_workspace):
+        if workspace is not None and id(workspace) not in seen:
+            seen.add(id(workspace))
+            yield workspace
+
+
+def checkpoint_prepare_fi_ar_workspaces() -> None:
+    for workspace in _fi_ar_workspaces():
+        workspace.detach_handles()
+
+
+def checkpoint_restore_fi_ar_workspaces() -> None:
+    for workspace in _fi_ar_workspaces():
+        workspace.reattach_handles()
+
+
 atexit.register(destroy_fi_ar_workspace)
 
 
