@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -89,6 +90,7 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_workspace_buffer = None
+_native_workspace_ptrs: set[int] = set()
 
 
 def _get_trtllm_workspace_buffer():
@@ -96,6 +98,14 @@ def _get_trtllm_workspace_buffer():
     if trtllm_workspace_buffer is None:
         trtllm_workspace_buffer = torch.zeros(
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
+        )
+        ptr = trtllm_workspace_buffer.data_ptr()
+        logger.info(
+            "FlashInfer direct-TRT workspace receipt: allocated=true bytes=%d "
+            "pointer=%#x aliases_native_wrapper=%s",
+            trtllm_workspace_buffer.numel() * trtllm_workspace_buffer.element_size(),
+            ptr,
+            ptr in _native_workspace_ptrs,
         )
     return trtllm_workspace_buffer
 
@@ -612,6 +622,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.model_config = vllm_config.model_config
         self.attention_config = vllm_config.attention_config
         self._workspace_buffer = None
+        self._workspace_buffer_provider: Callable[[str], torch.Tensor] | None = None
         self._prefill_wrapper: (
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
@@ -890,18 +901,55 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
-    def _get_workspace_buffer(self):
+    def _get_workspace_buffer(
+        self, reason: str = "eager-attention-backend-initialization"
+    ) -> torch.Tensor:
         if self._workspace_buffer is None:
-            buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
-            if envs.VLLM_BATCH_INVARIANT:
-                buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
-            self._workspace_buffer = torch.zeros(
-                buffer_size, dtype=torch.uint8, device=self.device
+            if self._workspace_buffer_provider is not None:
+                self._workspace_buffer = self._workspace_buffer_provider(reason)
+            else:
+                buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
+                if envs.VLLM_BATCH_INVARIANT:
+                    buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
+                self._workspace_buffer = torch.zeros(
+                    buffer_size, dtype=torch.uint8, device=self.device
+                )
+                assert self._workspace_buffer is not None
+                ptr = self._workspace_buffer.data_ptr()
+                _native_workspace_ptrs.add(ptr)
+                direct_ptr = (
+                    trtllm_workspace_buffer.data_ptr()
+                    if trtllm_workspace_buffer is not None
+                    else None
+                )
+                logger.info(
+                    "FlashInfer native wrapper workspace receipt: allocated=true "
+                    "reason=%s bytes=%d pointer=%#x direct_trt_pointer=%s "
+                    "aliases_direct_trt=%s",
+                    reason,
+                    self._workspace_buffer.numel()
+                    * self._workspace_buffer.element_size(),
+                    ptr,
+                    f"{direct_ptr:#x}" if direct_ptr is not None else "unallocated",
+                    ptr == direct_ptr,
+                )
+        if self._workspace_buffer is None:
+            raise RuntimeError(
+                "FlashInfer native wrapper workspace was not initialized before use"
             )
         return self._workspace_buffer
 
     def set_workspace_buffer(self, workspace_buffer: torch.Tensor):
         self._workspace_buffer = workspace_buffer
+
+    def set_workspace_buffer_provider(
+        self, provider: Callable[[str], torch.Tensor]
+    ) -> None:
+        if self._workspace_buffer is not None:
+            raise RuntimeError(
+                "Cannot install a lazy FlashInfer workspace provider after allocation"
+            )
+        self._workspace_buffer_provider = provider
 
     @staticmethod
     def _get_flashinfer_trtllm_api_decode_kernel() -> FlashInferDecodeKernel:
@@ -926,7 +974,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
             if self._noncausal_prefill_wrapper is None:
                 self._noncausal_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                    self._get_workspace_buffer(),
+                    self._get_workspace_buffer(reason="noncausal-prefill-wrapper"),
                     get_kv_cache_layout(),
                     backend="auto",
                 )
@@ -935,7 +983,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if self._prefill_wrapper is None:
             if self.use_dcp:
                 self._prefill_wrapper = BatchDCPPrefillWrapper(
-                    workspace_buffer=self._get_workspace_buffer(),
+                    workspace_buffer=self._get_workspace_buffer(
+                        reason="dcp-prefill-wrapper"
+                    ),
                     dcp_a2a=self.dcp_a2a,
                 )
             else:
@@ -943,7 +993,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # the wrapper; fa2/fa3 do not support nvfp4.
                 backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
                 self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                    self._get_workspace_buffer(),
+                    self._get_workspace_buffer(reason="prefill-wrapper"),
                     get_kv_cache_layout(),
                     backend=backend,
                 )
@@ -969,7 +1019,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # the wrapper; fa2/fa3 do not support nvfp4.
             backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                self._get_workspace_buffer(),
+                self._get_workspace_buffer(
+                    reason=(
+                        "cudagraph-decode-wrapper"
+                        if use_cudagraph
+                        else "decode-wrapper"
+                    )
+                ),
                 get_kv_cache_layout(),
                 use_cuda_graph=use_cudagraph,
                 paged_kv_indptr_buffer=paged_kv_indptr,
@@ -993,7 +1049,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_cascade_wrapper(self):
         if self._cascade_wrapper is None:
             self._cascade_wrapper = MultiLevelCascadeAttentionWrapper(
-                2, self._get_workspace_buffer(), get_kv_cache_layout()
+                2,
+                self._get_workspace_buffer(reason="cascade-wrapper"),
+                get_kv_cache_layout(),
             )
         return self._cascade_wrapper
 
