@@ -65,7 +65,13 @@ from vllm.tracing import instrument
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.mem_utils import (
+    MemorySnapshot,
+    flush_experimental_pinned_host_cache,
+    format_gib,
+    memory_profiling,
+    run_experimental_checkpoint_heap_cleanup,
+)
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -213,6 +219,12 @@ class Worker(WorkerBase):
             format_gib(freed_bytes),
             format_gib(used_bytes),
         )
+        if envs.VLLM_EXPERIMENT_CHECKPOINT_PINNED_HOST_CACHE_FLUSH:
+            flush_experimental_pinned_host_cache(role="vllm-gpu-worker", rank=self.rank)
+        if envs.VLLM_EXPERIMENT_CHECKPOINT_HEAP_CLEANUP:
+            run_experimental_checkpoint_heap_cleanup(
+                role=f"vllm-gpu-worker-rank-{self.rank}"
+            )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self._get_sleep_mode_backend().resume(tags)

@@ -40,6 +40,7 @@ from vllm.utils.gc_utils import (
     maybe_attach_gc_debug_callback,
 )
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.utils.mem_utils import run_experimental_checkpoint_heap_cleanup
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.core.kv_cache_utils import (
@@ -778,9 +779,8 @@ class EngineCore:
             return pause_future
 
         # Level 1+: Delegate to executor for GPU memory management
-        model_executor = self.model_executor
         if pause_future is None:
-            model_executor.sleep(level)
+            self._sleep_executor_and_cleanup(level)
             return None
 
         future = Future[Any]()
@@ -788,13 +788,21 @@ class EngineCore:
         def pause_complete(f: Future):
             try:
                 f.result()  # propagate any exception
-                future.set_result(model_executor.sleep(level))
+                future.set_result(self._sleep_executor_and_cleanup(level))
             except Exception as e:
                 future.set_exception(e)
 
         logger.info("Waiting for in-flight requests to complete before sleeping...")
         pause_future.add_done_callback(pause_complete)
         return future
+
+    def _sleep_executor_and_cleanup(self, level: int) -> None:
+        self.model_executor.sleep(level)
+        if envs.VLLM_EXPERIMENT_CHECKPOINT_HEAP_CLEANUP:
+            dp_rank = self.vllm_config.parallel_config.data_parallel_index
+            run_experimental_checkpoint_heap_cleanup(
+                role=f"vllm-engine-core-dp-rank-{dp_rank}"
+            )
 
     def wake_up(self, tags: list[str] | None = None):
         """Wake up the engine from sleep.

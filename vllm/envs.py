@@ -193,6 +193,9 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+    VLLM_EXPERIMENT_LAZY_FLASHINFER_WRAPPER_WORKSPACE: bool = False
+    VLLM_EXPERIMENT_CHECKPOINT_HEAP_CLEANUP: bool = False
+    VLLM_EXPERIMENT_CHECKPOINT_PINNED_HOST_CACHE_FLUSH: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1579,6 +1582,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
+    ),
+    "VLLM_EXPERIMENT_LAZY_FLASHINFER_WRAPPER_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_EXPERIMENT_LAZY_FLASHINFER_WRAPPER_WORKSPACE", "0"))
+    ),
+    "VLLM_EXPERIMENT_CHECKPOINT_HEAP_CLEANUP": lambda: bool(
+        int(os.getenv("VLLM_EXPERIMENT_CHECKPOINT_HEAP_CLEANUP", "0"))
+    ),
+    "VLLM_EXPERIMENT_CHECKPOINT_PINNED_HOST_CACHE_FLUSH": lambda: bool(
+        int(os.getenv("VLLM_EXPERIMENT_CHECKPOINT_PINNED_HOST_CACHE_FLUSH", "0"))
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
