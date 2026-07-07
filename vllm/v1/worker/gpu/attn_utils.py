@@ -7,11 +7,13 @@ from typing import Any, cast
 
 import torch
 
+from vllm import envs
 from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size
@@ -33,6 +35,8 @@ from vllm.v1.worker.utils import (
     bind_kv_cache,
     prepare_kernel_block_sizes,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,7 @@ def init_attn_backend(
 
     # Phase 3: create metadata builders and determine cudagraph support.
     attn_backend_workspace: torch.Tensor | None = None
+    attn_backend_workspace_owner: Any | None = None
     min_cg_support = AttentionCGSupport.ALWAYS
     min_cg_attn_backend = None
     for kv_cache_group_id, groups in enumerate(attn_groups):
@@ -144,7 +149,37 @@ def init_attn_backend(
             builder = group.get_metadata_builder(0)
             if attn_backend_workspace is None:
                 if hasattr(builder, "_get_workspace_buffer"):
-                    attn_backend_workspace = builder._get_workspace_buffer()
+                    supports_lazy_workspace = callable(
+                        getattr(builder, "set_workspace_buffer_provider", None)
+                    )
+                    if (
+                        envs.VLLM_EXPERIMENT_LAZY_FLASHINFER_WRAPPER_WORKSPACE
+                        and supports_lazy_workspace
+                    ):
+                        if attn_backend_workspace_owner is None:
+                            attn_backend_workspace_owner = builder
+                            logger.info(
+                                "FlashInfer native wrapper workspace receipt: "
+                                "allocated=false reason=lazy-experiment-gate "
+                                "bytes=%d; allocation remains mandatory before "
+                                "native wrapper planning or capture",
+                                envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
+                            )
+                        else:
+                            set_provider = getattr(
+                                builder, "set_workspace_buffer_provider", None
+                            )
+                            if not callable(set_provider):
+                                raise RuntimeError(
+                                    "Lazy FlashInfer wrapper workspace experiment "
+                                    "requires builders to support a shared lazy "
+                                    "workspace provider"
+                                )
+                            set_provider(
+                                attn_backend_workspace_owner._get_workspace_buffer
+                            )
+                    else:
+                        attn_backend_workspace = builder._get_workspace_buffer()
             else:
                 if hasattr(builder, "set_workspace_buffer"):
                     builder.set_workspace_buffer(attn_backend_workspace)

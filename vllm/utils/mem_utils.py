@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import ctypes
 import gc
+import json
+import os
 import time
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -17,6 +20,107 @@ from vllm.platforms import current_platform
 from .mem_constants import GiB_bytes, KiB_bytes, MiB_bytes
 
 logger = init_logger(__name__)
+
+
+class _Mallinfo2(ctypes.Structure):
+    _fields_ = [
+        ("arena", ctypes.c_size_t),
+        ("ordblks", ctypes.c_size_t),
+        ("smblks", ctypes.c_size_t),
+        ("hblks", ctypes.c_size_t),
+        ("hblkhd", ctypes.c_size_t),
+        ("usmblks", ctypes.c_size_t),
+        ("fsmblks", ctypes.c_size_t),
+        ("uordblks", ctypes.c_size_t),
+        ("fordblks", ctypes.c_size_t),
+        ("keepcost", ctypes.c_size_t),
+    ]
+
+
+def _process_host_memory_snapshot(libc: ctypes.CDLL) -> dict[str, int | None]:
+    heap_used_bytes = None
+    heap_free_bytes = None
+    mallinfo2 = getattr(libc, "mallinfo2", None)
+    if mallinfo2 is not None:
+        mallinfo2.argtypes = []
+        mallinfo2.restype = _Mallinfo2
+        info = mallinfo2()
+        heap_used_bytes = info.uordblks
+        heap_free_bytes = info.fordblks
+    return {
+        "rss_bytes": psutil.Process().memory_info().rss,
+        "heap_used_bytes": heap_used_bytes,
+        "heap_free_bytes": heap_free_bytes,
+    }
+
+
+def run_experimental_checkpoint_heap_cleanup(role: str) -> dict[str, object]:
+    """Collect Python garbage and release free libc heap pages."""
+    libc = ctypes.CDLL(None)
+    malloc_trim = getattr(libc, "malloc_trim", None)
+    if malloc_trim is None:
+        raise RuntimeError(
+            "checkpoint heap cleanup experiment requires libc malloc_trim"
+        )
+    malloc_trim.argtypes = [ctypes.c_size_t]
+    malloc_trim.restype = ctypes.c_int
+
+    before = _process_host_memory_snapshot(libc)
+    gc_start = time.perf_counter()
+    gc_collected = gc.collect()
+    gc_duration_s = time.perf_counter() - gc_start
+    trim_start = time.perf_counter()
+    trim_result = malloc_trim(0)
+    trim_duration_s = time.perf_counter() - trim_start
+    after = _process_host_memory_snapshot(libc)
+    receipt: dict[str, object] = {
+        "experiment": "checkpoint_heap_cleanup",
+        "pid": os.getpid(),
+        "role": role,
+        "gc_collected": gc_collected,
+        "gc_duration_s": gc_duration_s,
+        "malloc_trim_supported": True,
+        "malloc_trim_result": trim_result,
+        "malloc_trim_duration_s": trim_duration_s,
+        "before": before,
+        "after": after,
+    }
+    logger.info(
+        "Checkpoint heap cleanup receipt: %s",
+        json.dumps(receipt, sort_keys=True),
+    )
+    return receipt
+
+
+def flush_experimental_pinned_host_cache(role: str, rank: int) -> dict[str, object]:
+    """Release cached, unused blocks from PyTorch's pinned-host allocator."""
+    host_stats = getattr(torch.cuda.memory, "host_memory_stats", None)
+    empty_cache = getattr(torch._C, "_host_emptyCache", None)
+    if not callable(empty_cache):
+        raise RuntimeError(
+            "checkpoint pinned-host cache experiment requires torch._C._host_emptyCache"
+        )
+
+    before = dict(host_stats()) if callable(host_stats) else None
+    start = time.perf_counter()
+    empty_cache()
+    duration_s = time.perf_counter() - start
+    after = dict(host_stats()) if callable(host_stats) else None
+    receipt: dict[str, object] = {
+        "experiment": "checkpoint_pinned_host_cache_flush",
+        "pid": os.getpid(),
+        "role": role,
+        "rank": rank,
+        "capability_path": "torch._C._host_emptyCache",
+        "duration_s": duration_s,
+        "host_memory_stats_before": before,
+        "host_memory_stats_after": after,
+    }
+    logger.info(
+        "Checkpoint pinned-host cache flush receipt: %s",
+        json.dumps(receipt, sort_keys=True),
+    )
+    return receipt
 
 
 def format_kib(b: int) -> str:
