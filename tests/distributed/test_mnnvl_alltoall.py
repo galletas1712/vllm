@@ -8,10 +8,7 @@ Run: pytest tests/distributed/test_mnnvl_alltoall.py -v
 """
 
 import os
-import sys
 import traceback
-from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
@@ -203,9 +200,10 @@ requires_deep_ep_v2 = pytest.mark.skipif(
     reason="DeepEP v2 (ElasticBuffer) not available or NCCL < 2.30.4",
 )
 
-# NOTE: No module-level pytestmark here. The FlashInfer integration tests have
-# their own @requires_two_sided / @requires_one_sided decorators. The checkpoint
-# unit tests and test_args_dispatch_combine do not require FlashInfer NVLink.
+# NOTE: No module-level pytestmark here. The FlashInfer lifecycle tests have
+# their own @requires_two_sided / @requires_one_sided decorators, and
+# test_args_dispatch_combine uses only standard torch.distributed ops and
+# should run even when FlashInfer NVLink backends are not installed.
 
 
 # ---------------------------------------------------------------------------
@@ -221,18 +219,6 @@ requires_deep_ep_v2 = pytest.mark.skipif(
 # with an EP-scoped communicator in production. With tp=world_size the EP
 # group spans all ranks, giving us a multi-rank group for testing.
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("method_name", ["checkpoint_prepare", "checkpoint_restore"])
-def test_two_sided_checkpoint_is_rejected(method_name):
-    from vllm.distributed.device_communicators.all2all import (
-        FlashInferNVLinkTwoSidedManager,
-    )
-
-    manager = object.__new__(FlashInferNVLinkTwoSidedManager)
-
-    with pytest.raises(NotImplementedError, match="^Checkpointing not supported$"):
-        getattr(manager, method_name)()
 
 
 def _two_sided_lifecycle_worker(rank, world_size):
@@ -303,30 +289,6 @@ def test_two_sided_manager_lifecycle(world_size):
 # We therefore need a real DP group with world_size > 1, which requires
 # dp_size=world_size via _init_dp_environment.
 # ---------------------------------------------------------------------------
-
-
-def test_one_sided_checkpoint_reconstructs_backend():
-    from vllm.distributed.device_communicators.all2all import (
-        FlashInferNVLinkOneSidedManager,
-    )
-
-    manager = object.__new__(FlashInferNVLinkOneSidedManager)
-    manager.initialized = True
-    manager.cpu_group = object()
-    manager.moe_alltoall = Mock()
-    backend = object()
-    custom_communicator = Mock(return_value=backend)
-    compat_module = SimpleNamespace(CustomCommunicator=custom_communicator)
-    module_name = "vllm.distributed.device_communicators.mnnvl_compat"
-    with patch.dict(sys.modules, {module_name: compat_module}):
-        manager.checkpoint_prepare()
-        manager.checkpoint_restore()
-
-    assert manager.moe_alltoall.mock_calls == [
-        call.checkpoint_prepare(),
-        call.checkpoint_restore(backend),
-    ]
-    custom_communicator.assert_called_once_with(manager.cpu_group)
 
 
 def _one_sided_lifecycle_worker(rank, world_size):

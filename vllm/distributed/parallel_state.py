@@ -127,6 +127,41 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def _apply_to_device_comms(label: str, action: Callable[[Any], None]) -> None:
+    """Apply ``action`` to every group's device communicator, collectively.
+
+    Walks the registered parallel groups and skips those without a device
+    communicator (absent at ``world_size == 1``). Each communicator's
+    ``suspend``/``resume`` is a no-op unless it holds releasable device memory
+    (see ``DeviceCommunicatorBase``). Collective across ranks and synchronous
+    on return, so no extra sync is needed.
+    """
+    comms = []
+    for group_ref in _groups.values():
+        group = group_ref()
+        if group is None:
+            continue
+        dc = group.device_communicator
+        if dc is None:
+            continue
+        comms.append(dc)
+    if not comms:
+        return
+
+    free_before = torch.accelerator.get_memory_info()[0]
+    for dc in comms:
+        action(dc)
+    delta = torch.accelerator.get_memory_info()[0] - free_before
+    direction = "freed" if delta > 0 else "allocated"
+    logger.info(
+        "device-comm %s: %d comms, %.1f MiB %s",
+        label,
+        len(comms),
+        abs(delta) / 1024**2,
+        direction,
+    )
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -2020,16 +2055,6 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
         _EPLB.prepare_communication_buffer_for_model(model)
 
 
-def _checkpoint_device_communicators(method_name: str) -> None:
-    seen = set()
-    for group in (_WORLD, _TP, _DCP, _PCP, _PP, _DP, _EP, _EPLB):
-        if group is None or id(group) in seen:
-            continue
-        seen.add(id(group))
-        if group.device_communicator is not None:
-            getattr(group.device_communicator, method_name)()
-
-
 def checkpoint_prepare_distributed_state() -> None:
     """Prepare FlashInfer communication state for a process checkpoint.
 
@@ -2042,7 +2067,7 @@ def checkpoint_prepare_distributed_state() -> None:
     )
 
     torch.accelerator.synchronize()
-    _checkpoint_device_communicators("checkpoint_prepare")
+    _apply_to_device_comms("checkpoint_prepare", lambda c: c.checkpoint_prepare())
     checkpoint_prepare_fi_ar_workspaces()
     torch.accelerator.synchronize()
 
@@ -2059,7 +2084,7 @@ def checkpoint_restore_distributed_state() -> None:
 
     torch.accelerator.synchronize()
     checkpoint_restore_fi_ar_workspaces()
-    _checkpoint_device_communicators("checkpoint_restore")
+    _apply_to_device_comms("checkpoint_restore", lambda c: c.checkpoint_restore())
     torch.accelerator.synchronize()
 
 

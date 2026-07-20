@@ -198,10 +198,10 @@ class DeviceCommunicatorBase:
         return input_
 
     def checkpoint_prepare(self) -> None:
-        raise NotImplementedError("Checkpointing not supported")
+        """Prepare reclaimable communicator state for checkpoint (default: no-op)."""
 
     def checkpoint_restore(self) -> None:
-        raise NotImplementedError("Checkpointing not supported")
+        """Restore communicator state after checkpoint (default: no-op)."""
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
