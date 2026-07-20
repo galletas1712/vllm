@@ -572,26 +572,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.all2all_manager = None  # type: ignore[assignment]
 
     def checkpoint_prepare(self) -> None:
-        self._checkpoint_children("checkpoint_prepare")
+        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
+        if self.fi_ar_comm is not None:
+            self.fi_ar_comm.checkpoint_prepare()
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_prepare()
 
     def checkpoint_restore(self) -> None:
-        self._checkpoint_children("checkpoint_restore")
-
-    def _checkpoint_children(self, method_name: str) -> None:
-        for child in (
-            self.pynccl_comm,
-            self.ca_comm,
-            self.qr_comm,
-            self.symm_mem_comm,
-            self.aiter_ar_comm,
-            self.fi_ar_comm,
-            self.all2all_manager,
-        ):
-            if child is None:
-                continue
-            method = getattr(child, method_name, None)
-            if callable(method):
-                method()
+        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
+        if self.fi_ar_comm is not None:
+            self.fi_ar_comm.checkpoint_restore()
+        if self.all2all_manager is not None:
+            self.all2all_manager.checkpoint_restore()
 
     def all_gatherv(
         self,
