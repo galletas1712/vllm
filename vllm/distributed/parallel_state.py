@@ -2056,34 +2056,15 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
 
 
 def checkpoint_prepare_distributed_state() -> None:
-    """Prepare device-communicator state for a process checkpoint.
-
-    Walks every group's device communicator; each forwards to children that
-    implement the hook (others no-op). This transition must not be composed
-    with communicator memory suspension.
-    """
-    from vllm.distributed.device_communicators.flashinfer_all_reduce import (
-        reset_fi_ar_checkpoint_gates,
-    )
-
+    """Prepare every device communicator for a process checkpoint."""
     torch.accelerator.synchronize()
-    reset_fi_ar_checkpoint_gates()
     _apply_to_device_comms("checkpoint_prepare", lambda c: c.checkpoint_prepare())
     torch.accelerator.synchronize()
 
 
 def checkpoint_restore_distributed_state() -> None:
-    """Restore device-communicator state after a process checkpoint.
-
-    Same walk as prepare. Children that own shared globals (FlashInfer
-    all-reduce workspaces) dedupe so aliased communicators run once.
-    """
-    from vllm.distributed.device_communicators.flashinfer_all_reduce import (
-        reset_fi_ar_checkpoint_gates,
-    )
-
+    """Restore every device communicator after a process checkpoint."""
     torch.accelerator.synchronize()
-    reset_fi_ar_checkpoint_gates()
     _apply_to_device_comms("checkpoint_restore", lambda c: c.checkpoint_restore())
     torch.accelerator.synchronize()
 

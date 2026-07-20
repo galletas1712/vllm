@@ -40,6 +40,9 @@ _fi_ar_workspace = None
 # available on the current topology.
 _fi_ar_quant_workspace = None
 _fi_ar_workspace_groups: dict[int, ProcessGroup] = {}
+# Dedupe shared workspaces when multiple FlashInferAllReduce wrappers exist.
+_fi_ar_prepared_ids: set[int] = set()
+_fi_ar_restored_ids: set[int] = set()
 
 
 def _create_workspace(
@@ -278,6 +281,8 @@ def destroy_fi_ar_workspace():
 
         _fi_ar_workspace = _fi_ar_quant_workspace = None
         _fi_ar_workspace_groups.clear()
+        _fi_ar_prepared_ids.clear()
+        _fi_ar_restored_ids.clear()
 
 
 def _fi_ar_workspaces():
@@ -288,49 +293,35 @@ def _fi_ar_workspaces():
             yield workspace
 
 
-_fi_ar_prepare_done = False
-_fi_ar_restore_done = False
-
-
-def reset_fi_ar_checkpoint_gates() -> None:
-    """Allow the next prepare/restore to run once across aliased fi_ar_comms."""
-    global _fi_ar_prepare_done, _fi_ar_restore_done
-    _fi_ar_prepare_done = False
-    _fi_ar_restore_done = False
-
-
-def _fi_ar_checkpoint_workspaces(method_name: str):
-    checkpoint_workspaces = []
+def checkpoint_prepare_fi_ar_workspaces() -> None:
+    _fi_ar_restored_ids.clear()
     for workspace in _fi_ar_workspaces():
-        group = _fi_ar_workspace_groups.get(id(workspace))
+        workspace_id = id(workspace)
+        if workspace_id in _fi_ar_prepared_ids:
+            continue
+        method = getattr(workspace, "checkpoint_prepare", None)
+        if not callable(method):
+            continue
+        method()
+        _fi_ar_prepared_ids.add(workspace_id)
+
+
+def checkpoint_restore_fi_ar_workspaces() -> None:
+    _fi_ar_prepared_ids.clear()
+    for workspace in _fi_ar_workspaces():
+        workspace_id = id(workspace)
+        if workspace_id in _fi_ar_restored_ids:
+            continue
+        group = _fi_ar_workspace_groups.get(workspace_id)
         if group is None:
             raise RuntimeError(
                 "FlashInfer all-reduce workspace process group was not retained"
             )
-        method = getattr(workspace, method_name, None)
+        method = getattr(workspace, "checkpoint_restore", None)
         if not callable(method):
-            # Workspace present but FlashInfer build lacks the hook: skip.
             continue
-        checkpoint_workspaces.append((method, group))
-    return checkpoint_workspaces
-
-
-def checkpoint_prepare_fi_ar_workspaces() -> None:
-    global _fi_ar_prepare_done
-    if _fi_ar_prepare_done:
-        return
-    _fi_ar_prepare_done = True
-    for checkpoint_prepare, _ in _fi_ar_checkpoint_workspaces("checkpoint_prepare"):
-        checkpoint_prepare()
-
-
-def checkpoint_restore_fi_ar_workspaces() -> None:
-    global _fi_ar_restore_done
-    if _fi_ar_restore_done:
-        return
-    _fi_ar_restore_done = True
-    for checkpoint_restore, group in _fi_ar_checkpoint_workspaces("checkpoint_restore"):
-        checkpoint_restore(TorchDistBackend(group=group))
+        method(TorchDistBackend(group=group))
+        _fi_ar_restored_ids.add(workspace_id)
 
 
 atexit.register(destroy_fi_ar_workspace)

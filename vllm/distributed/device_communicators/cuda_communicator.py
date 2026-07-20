@@ -578,30 +578,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self._checkpoint_children("checkpoint_restore")
 
     def _checkpoint_children(self, method_name: str) -> None:
-        # Unsupported children simply omit the hook and are skipped.
-        # Prepare: MoE all2all before FlashInfer all-reduce globals.
-        # Restore: FlashInfer all-reduce globals before MoE all2all.
-        if method_name == "checkpoint_restore":
-            children = [
-                self.fi_ar_comm,
-                self.pynccl_comm,
-                self.ca_comm,
-                self.qr_comm,
-                self.symm_mem_comm,
-                self.aiter_ar_comm,
-                self.all2all_manager,
-            ]
-        else:
-            children = [
-                self.pynccl_comm,
-                self.ca_comm,
-                self.qr_comm,
-                self.symm_mem_comm,
-                self.aiter_ar_comm,
-                self.all2all_manager,
-                self.fi_ar_comm,
-            ]
-        for child in children:
+        for child in (
+            self.pynccl_comm,
+            self.ca_comm,
+            self.qr_comm,
+            self.symm_mem_comm,
+            self.aiter_ar_comm,
+            self.fi_ar_comm,
+            self.all2all_manager,
+        ):
             if child is None:
                 continue
             method = getattr(child, method_name, None)
