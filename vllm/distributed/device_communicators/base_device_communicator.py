@@ -118,10 +118,10 @@ class All2AllManagerBase:
         return None  # None means it could use the whole GPU
 
     def checkpoint_prepare(self) -> None:
-        raise NotImplementedError("Checkpointing not supported")
+        """Prepare reclaimable all2all state for checkpoint (default: no-op)."""
 
     def checkpoint_restore(self) -> None:
-        raise NotImplementedError("Checkpointing not supported")
+        """Restore all2all state after checkpoint (default: no-op)."""
 
     def combine(self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False):
         raise NotImplementedError

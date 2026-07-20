@@ -2056,34 +2056,34 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
 
 
 def checkpoint_prepare_distributed_state() -> None:
-    """Prepare FlashInfer communication state for a process checkpoint.
+    """Prepare device-communicator state for a process checkpoint.
 
-    Device communicators prepare before global all-reduce workspaces. A future
-    NCCL checkpoint layer can prepare after this function returns. This
-    transition must not be composed with communicator memory suspension.
+    Walks every group's device communicator; each forwards to children that
+    implement the hook (others no-op). This transition must not be composed
+    with communicator memory suspension.
     """
     from vllm.distributed.device_communicators.flashinfer_all_reduce import (
-        checkpoint_prepare_fi_ar_workspaces,
+        reset_fi_ar_checkpoint_gates,
     )
 
     torch.accelerator.synchronize()
+    reset_fi_ar_checkpoint_gates()
     _apply_to_device_comms("checkpoint_prepare", lambda c: c.checkpoint_prepare())
-    checkpoint_prepare_fi_ar_workspaces()
     torch.accelerator.synchronize()
 
 
 def checkpoint_restore_distributed_state() -> None:
-    """Restore FlashInfer communication state after a process checkpoint.
+    """Restore device-communicator state after a process checkpoint.
 
-    Global all-reduce workspaces restore before device communicators. A future
-    NCCL checkpoint layer can restore before this function is called.
+    Same walk as prepare. Children that own shared globals (FlashInfer
+    all-reduce workspaces) dedupe so aliased communicators run once.
     """
     from vllm.distributed.device_communicators.flashinfer_all_reduce import (
-        checkpoint_restore_fi_ar_workspaces,
+        reset_fi_ar_checkpoint_gates,
     )
 
     torch.accelerator.synchronize()
-    checkpoint_restore_fi_ar_workspaces()
+    reset_fi_ar_checkpoint_gates()
     _apply_to_device_comms("checkpoint_restore", lambda c: c.checkpoint_restore())
     torch.accelerator.synchronize()
 

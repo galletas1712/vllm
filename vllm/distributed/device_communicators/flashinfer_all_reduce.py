@@ -288,6 +288,17 @@ def _fi_ar_workspaces():
             yield workspace
 
 
+_fi_ar_prepare_done = False
+_fi_ar_restore_done = False
+
+
+def reset_fi_ar_checkpoint_gates() -> None:
+    """Allow the next prepare/restore to run once across aliased fi_ar_comms."""
+    global _fi_ar_prepare_done, _fi_ar_restore_done
+    _fi_ar_prepare_done = False
+    _fi_ar_restore_done = False
+
+
 def _fi_ar_checkpoint_workspaces(method_name: str):
     checkpoint_workspaces = []
     for workspace in _fi_ar_workspaces():
@@ -298,17 +309,26 @@ def _fi_ar_checkpoint_workspaces(method_name: str):
             )
         method = getattr(workspace, method_name, None)
         if not callable(method):
-            raise NotImplementedError("Checkpointing not supported")
+            # Workspace present but FlashInfer build lacks the hook: skip.
+            continue
         checkpoint_workspaces.append((method, group))
     return checkpoint_workspaces
 
 
 def checkpoint_prepare_fi_ar_workspaces() -> None:
+    global _fi_ar_prepare_done
+    if _fi_ar_prepare_done:
+        return
+    _fi_ar_prepare_done = True
     for checkpoint_prepare, _ in _fi_ar_checkpoint_workspaces("checkpoint_prepare"):
         checkpoint_prepare()
 
 
 def checkpoint_restore_fi_ar_workspaces() -> None:
+    global _fi_ar_restore_done
+    if _fi_ar_restore_done:
+        return
+    _fi_ar_restore_done = True
     for checkpoint_restore, group in _fi_ar_checkpoint_workspaces("checkpoint_restore"):
         checkpoint_restore(TorchDistBackend(group=group))
 
@@ -418,6 +438,14 @@ class FlashInferAllReduce:
             launch_with_pdl=True,
             trigger_completion_at_end=num_tokens > PDL_ADVANCE_LAUNCH_TOKENS,
         )
+
+    def checkpoint_prepare(self) -> None:
+        if not self.disabled:
+            checkpoint_prepare_fi_ar_workspaces()
+
+    def checkpoint_restore(self) -> None:
+        if not self.disabled:
+            checkpoint_restore_fi_ar_workspaces()
 
     def destroy(self):
         if not self.disabled:
