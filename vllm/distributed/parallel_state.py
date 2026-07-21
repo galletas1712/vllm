@@ -2055,8 +2055,17 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
         _EPLB.prepare_communication_buffer_for_model(model)
 
 
+_CHECKPOINT_RESTORE_COMPLETED = False
+
+
+def _is_checkpoint_restore_completed() -> bool:
+    return _CHECKPOINT_RESTORE_COMPLETED
+
+
 def checkpoint_prepare_distributed_state() -> None:
     """Prepare every device communicator for a process checkpoint."""
+    global _CHECKPOINT_RESTORE_COMPLETED
+    _CHECKPOINT_RESTORE_COMPLETED = False
     torch.accelerator.synchronize()
     _apply_to_device_comms("checkpoint_prepare", lambda c: c.checkpoint_prepare())
     torch.accelerator.synchronize()
@@ -2064,9 +2073,12 @@ def checkpoint_prepare_distributed_state() -> None:
 
 def checkpoint_restore_distributed_state() -> None:
     """Restore every device communicator after a process checkpoint."""
+    global _CHECKPOINT_RESTORE_COMPLETED
+    _CHECKPOINT_RESTORE_COMPLETED = False
     torch.accelerator.synchronize()
     _apply_to_device_comms("checkpoint_restore", lambda c: c.checkpoint_restore())
     torch.accelerator.synchronize()
+    _CHECKPOINT_RESTORE_COMPLETED = True
 
 
 def model_parallel_is_initialized():
