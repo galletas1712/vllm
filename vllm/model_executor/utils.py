@@ -66,6 +66,7 @@ def replace_parameter(
             a new parameter. This preserves the parameter's storage address
             (``data_ptr``), which is required for captured CUDA graphs to
             remain valid across weight updates (e.g. in RL training loops).
+            Otherwise, register a parameter with private cloned storage.
     """
     # should not be used on a tied/shared param
 
@@ -89,7 +90,9 @@ def replace_parameter(
         old_param.copy_(new_data)
         return
 
-    new_param = torch.nn.Parameter(new_data, requires_grad=False)
+    new_param = torch.nn.Parameter(
+        new_data.clone() if prefer_copy else new_data, requires_grad=False
+    )
 
     if old_param is not None and hasattr(old_param, "weight_loader"):
         weight_loader = old_param.weight_loader
