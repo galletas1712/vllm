@@ -51,9 +51,7 @@ def _diagnostic_sync_after_restore(
     k_cache_prefix: LayerNameType,
     boundary: str,
 ) -> None:
-    if not parallel_state._is_checkpoint_restore_completed():
-        return
-    if os.getenv("VLLM_GMS_DIAGNOSTIC_SYNC_SPARSE_INDEXER") != "1":
+    if not _gms_diagnostic_enabled():
         return
 
     rank = torch.distributed.get_rank()
@@ -64,6 +62,200 @@ def _diagnostic_sync_after_restore(
     logger.warning(marker, rank, pid, k_cache_prefix, boundary, "BEGIN")
     torch.accelerator.synchronize()
     logger.warning(marker, rank, pid, k_cache_prefix, boundary, "PASS")
+
+
+def _gms_diagnostic_enabled() -> bool:
+    return (
+        parallel_state._is_checkpoint_restore_completed()
+        and os.getenv("VLLM_GMS_DIAGNOSTIC_SYNC_SPARSE_INDEXER") == "1"
+    )
+
+
+def _diagnostic_mapping_envelope(tensor: torch.Tensor) -> str:
+    storage = tensor.untyped_storage()
+    storage_start = storage.data_ptr()
+    storage_end = storage_start + storage.nbytes()
+    data_ptr = tensor.data_ptr()
+    if tensor.numel() == 0:
+        logical_end = data_ptr
+    else:
+        max_element_offset = sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape, tensor.stride())
+            if size
+        )
+        logical_end = data_ptr + (max_element_offset + 1) * tensor.element_size()
+
+    owner = "unmanaged"
+    try:
+        from gpu_memory_service.client.torch.allocator import (
+            get_gms_client_memory_managers,
+        )
+
+        for manager in get_gms_client_memory_managers():
+            for base, mapping in manager.mappings.items():
+                mapped_end = base + mapping.aligned_size
+                reserved_end = base + mapping.va_reserved_size
+                if base <= storage_start < reserved_end:
+                    if storage_end <= mapped_end:
+                        coverage = "mapped"
+                    elif storage_start >= mapped_end:
+                        coverage = "scratch-only-tail"
+                    else:
+                        coverage = "crosses-mapped-end"
+                    owner = (
+                        f"gms:{mapping.tag}:{coverage}:base=0x{base:x}:"
+                        f"mapped_end=0x{mapped_end:x}:reserved_end=0x{reserved_end:x}"
+                    )
+                    break
+            if owner != "unmanaged":
+                break
+    except ImportError:
+        owner = "gms-unavailable"
+
+    return (
+        f"shape={tuple(tensor.shape)} stride={tensor.stride()} "
+        f"dtype={tensor.dtype} ptr=0x{data_ptr:x} ptr_mod_16={data_ptr % 16} "
+        f"storage=[0x{storage_start:x},0x{storage_end:x}) "
+        f"logical_end=0x{logical_end:x} owner={owner}"
+    )
+
+
+def _diagnostic_validate_gather_operands(
+    k_cache_prefix: LayerNameType,
+    kv_cache: torch.Tensor,
+    dst_k: torch.Tensor,
+    dst_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+) -> None:
+    if not _gms_diagnostic_enabled():
+        return
+
+    rank = torch.distributed.get_rank()
+    marker = (
+        f"GMS_SPARSE_GATHER_OPERAND rank={rank} "
+        f"k_cache_prefix={k_cache_prefix}"
+    )
+    for name, tensor in (
+        ("kv_cache", kv_cache),
+        ("dst_k", dst_k),
+        ("dst_scale", dst_scale),
+        ("block_table", block_table),
+        ("cu_seq_lens", cu_seq_lens),
+    ):
+        logger.warning(
+            "%s tensor=%s %s",
+            marker,
+            name,
+            _diagnostic_mapping_envelope(tensor),
+        )
+
+    logger.warning("%s stage=cu_seq_lens_copy BEGIN", marker)
+    cu_seq_lens_host = cu_seq_lens.detach().cpu()
+    logger.warning(
+        "%s stage=cu_seq_lens_copy PASS values=%s",
+        marker,
+        cu_seq_lens_host.tolist(),
+    )
+
+    logger.warning("%s stage=block_table_copy BEGIN", marker)
+    block_table_host = block_table.detach().cpu()
+    logger.warning("%s stage=block_table_copy PASS", marker)
+
+    batch_size = block_table.shape[0]
+    if block_table.dtype != torch.int32 or not block_table.is_contiguous():
+        raise RuntimeError(
+            "Sparse gather block_table must be contiguous int32; "
+            f"got dtype={block_table.dtype}, stride={block_table.stride()}"
+        )
+    if cu_seq_lens.dtype != torch.int32 or not cu_seq_lens.is_contiguous():
+        raise RuntimeError(
+            "Sparse gather cu_seq_lens must be contiguous int32; "
+            f"got dtype={cu_seq_lens.dtype}, stride={cu_seq_lens.stride()}"
+        )
+    if cu_seq_lens_host.numel() != batch_size + 1:
+        raise RuntimeError(
+            "Sparse gather cumulative-length extent mismatch: "
+            f"{cu_seq_lens_host.numel()} != {batch_size + 1}"
+        )
+
+    cumulative_lengths = [int(value) for value in cu_seq_lens_host.tolist()]
+    if not cumulative_lengths or cumulative_lengths[0] != 0:
+        raise RuntimeError(
+            f"Sparse gather cumulative lengths must start at zero: "
+            f"{cumulative_lengths}"
+        )
+    if any(
+        end < start
+        for start, end in zip(cumulative_lengths, cumulative_lengths[1:])
+    ):
+        raise RuntimeError(
+            f"Sparse gather cumulative lengths are not monotonic: "
+            f"{cumulative_lengths}"
+        )
+    if cumulative_lengths[-1] > dst_k.shape[0]:
+        raise RuntimeError(
+            "Sparse gather destination has too few rows: "
+            f"{cumulative_lengths[-1]} > {dst_k.shape[0]}"
+        )
+
+    cache_block_size = kv_cache.shape[1]
+    used_blocks: list[int] = []
+    required_columns: list[int] = []
+    for batch_idx, (start, end) in enumerate(
+        zip(cumulative_lengths, cumulative_lengths[1:])
+    ):
+        columns = (end - start + cache_block_size - 1) // cache_block_size
+        required_columns.append(columns)
+        if columns > block_table.shape[1]:
+            raise RuntimeError(
+                "Sparse gather block table has too few columns for batch "
+                f"{batch_idx}: {columns} > {block_table.shape[1]}"
+            )
+        used_blocks.extend(
+            int(value) for value in block_table_host[batch_idx, :columns].tolist()
+        )
+
+    invalid_blocks = [
+        block for block in used_blocks if block < 0 or block >= kv_cache.shape[0]
+    ]
+    if invalid_blocks:
+        raise RuntimeError(
+            "Sparse gather block IDs are outside the KV cache: "
+            f"invalid={invalid_blocks}, num_blocks={kv_cache.shape[0]}"
+        )
+
+    logger.warning(
+        "%s stage=metadata_validation PASS total_rows=%d required_columns=%s "
+        "used_blocks=%s",
+        marker,
+        cumulative_lengths[-1],
+        required_columns,
+        sorted(set(used_blocks)),
+    )
+
+    logger.warning("%s stage=source_probe BEGIN", marker)
+    if used_blocks:
+        block_indices = torch.tensor(
+            sorted(set(used_blocks)),
+            dtype=torch.int64,
+            device=kv_cache.device,
+        )
+        source_checksum = kv_cache.index_select(0, block_indices).sum().item()
+    else:
+        source_checksum = 0
+    logger.warning(
+        "%s stage=source_probe PASS checksum=%s",
+        marker,
+        source_checksum,
+    )
+
+    logger.warning("%s stage=destination_probe BEGIN", marker)
+    dst_k.zero_()
+    dst_scale.zero_()
+    torch.accelerator.synchronize()
+    logger.warning("%s stage=destination_probe PASS", marker)
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -444,6 +636,14 @@ def sparse_attn_indexer(
             k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
             if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
+                _diagnostic_validate_gather_operands(
+                    k_cache_prefix,
+                    kv_cache,
+                    k_quant,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.local_cu_seq_lens,
+                )
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
                     k_quant,
