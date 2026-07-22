@@ -1155,6 +1155,13 @@ class Worker(WorkerBase):
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
 
+    def set_gms_pre_capture_diagnostic_enabled(self, enabled: bool) -> None:
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            set_gms_pre_capture_diagnostic_enabled,
+        )
+
+        set_gms_pre_capture_diagnostic_enabled(enabled)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
 

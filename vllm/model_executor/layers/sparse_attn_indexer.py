@@ -45,30 +45,41 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+_GMS_PRE_CAPTURE_DIAGNOSTIC_ENABLED = False
 
 
-def _diagnostic_sync_after_restore(
+def set_gms_pre_capture_diagnostic_enabled(enabled: bool) -> None:
+    global _GMS_PRE_CAPTURE_DIAGNOSTIC_ENABLED
+    _GMS_PRE_CAPTURE_DIAGNOSTIC_ENABLED = enabled
+
+
+def _diagnostic_sync(
     k_cache_prefix: LayerNameType,
     boundary: str,
 ) -> None:
-    if not _gms_diagnostic_enabled():
+    phase = _gms_diagnostic_phase()
+    if phase is None:
         return
 
     rank = torch.distributed.get_rank()
     pid = os.getpid()
     marker = (
-        "GMS_SPARSE_INDEXER_SYNC rank=%d pid=%d k_cache_prefix=%s boundary=%s %s"
+        "GMS_SPARSE_INDEXER_SYNC phase=%s rank=%d pid=%d "
+        "k_cache_prefix=%s boundary=%s %s"
     )
-    logger.warning(marker, rank, pid, k_cache_prefix, boundary, "BEGIN")
+    logger.warning(marker, phase, rank, pid, k_cache_prefix, boundary, "BEGIN")
     torch.accelerator.synchronize()
-    logger.warning(marker, rank, pid, k_cache_prefix, boundary, "PASS")
+    logger.warning(marker, phase, rank, pid, k_cache_prefix, boundary, "PASS")
 
 
-def _gms_diagnostic_enabled() -> bool:
-    return (
-        parallel_state._is_checkpoint_restore_completed()
-        and os.getenv("VLLM_GMS_DIAGNOSTIC_SYNC_SPARSE_INDEXER") == "1"
-    )
+def _gms_diagnostic_phase() -> str | None:
+    if os.getenv("VLLM_GMS_DIAGNOSTIC_SYNC_SPARSE_INDEXER") != "1":
+        return None
+    if parallel_state._is_checkpoint_restore_completed():
+        return "post_restore"
+    if _GMS_PRE_CAPTURE_DIAGNOSTIC_ENABLED:
+        return "pre_capture"
+    return None
 
 
 def _diagnostic_mapping_envelope(tensor: torch.Tensor) -> str:
@@ -129,12 +140,13 @@ def _diagnostic_validate_gather_operands(
     block_table: torch.Tensor,
     cu_seq_lens: torch.Tensor,
 ) -> None:
-    if not _gms_diagnostic_enabled():
+    phase = _gms_diagnostic_phase()
+    if phase is None:
         return
 
     rank = torch.distributed.get_rank()
     marker = (
-        f"GMS_SPARSE_GATHER_OPERAND rank={rank} "
+        f"GMS_SPARSE_GATHER_OPERAND phase={phase} rank={rank} "
         f"k_cache_prefix={k_cache_prefix}"
     )
     for name, tensor in (
@@ -183,16 +195,13 @@ def _diagnostic_validate_gather_operands(
     cumulative_lengths = [int(value) for value in cu_seq_lens_host.tolist()]
     if not cumulative_lengths or cumulative_lengths[0] != 0:
         raise RuntimeError(
-            f"Sparse gather cumulative lengths must start at zero: "
-            f"{cumulative_lengths}"
+            f"Sparse gather cumulative lengths must start at zero: {cumulative_lengths}"
         )
     if any(
-        end < start
-        for start, end in zip(cumulative_lengths, cumulative_lengths[1:])
+        end < start for start, end in zip(cumulative_lengths, cumulative_lengths[1:])
     ):
         raise RuntimeError(
-            f"Sparse gather cumulative lengths are not monotonic: "
-            f"{cumulative_lengths}"
+            f"Sparse gather cumulative lengths are not monotonic: {cumulative_lengths}"
         )
     if cumulative_lengths[-1] > dst_k.shape[0]:
         raise RuntimeError(
@@ -532,7 +541,6 @@ def sparse_attn_indexer(
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
-    _diagnostic_sync_after_restore(k_cache_prefix, "entry")
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
@@ -571,6 +579,7 @@ def sparse_attn_indexer(
             skip_k_cache_insert,
             use_fp4_cache,
         )
+    _diagnostic_sync(k_cache_prefix, "entry")
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
     slot_mapping = attn_metadata_narrowed.slot_mapping
@@ -603,7 +612,7 @@ def sparse_attn_indexer(
             quant_block_size,
             scale_fmt,
         )
-        _diagnostic_sync_after_restore(k_cache_prefix, "k_cache_insert")
+        _diagnostic_sync(k_cache_prefix, "k_cache_insert")
 
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
@@ -612,7 +621,7 @@ def sparse_attn_indexer(
     # fill.
     if not skip_topk_buffer_clear:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
-        _diagnostic_sync_after_restore(k_cache_prefix, "topk_sentinel_clear")
+        _diagnostic_sync(k_cache_prefix, "topk_sentinel_clear")
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -651,9 +660,7 @@ def sparse_attn_indexer(
                     chunk.block_table,
                     chunk.local_cu_seq_lens,
                 )
-                _diagnostic_sync_after_restore(
-                    k_cache_prefix, "prefill_k_gather"
-                )
+                _diagnostic_sync(k_cache_prefix, "prefill_k_gather")
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
@@ -691,9 +698,7 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                     )
                 else:
-                    _diagnostic_sync_after_restore(
-                        k_cache_prefix, "prefill_logits_before"
-                    )
+                    _diagnostic_sync(k_cache_prefix, "prefill_logits_before")
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
                         (k_quant_cast, k_scale_cast),
@@ -702,9 +707,7 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                         clean_logits=False,
                     )
-                    _diagnostic_sync_after_restore(
-                        k_cache_prefix, "prefill_logits_after"
-                    )
+                    _diagnostic_sync(k_cache_prefix, "prefill_logits_after")
                 num_rows = logits.shape[0]
                 ops.top_k_per_row_prefill(
                     logits,
@@ -716,7 +719,7 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
-                _diagnostic_sync_after_restore(k_cache_prefix, "prefill_topk")
+                _diagnostic_sync(k_cache_prefix, "prefill_topk")
 
             _merge_dcp_topk_global(
                 logits,
@@ -794,9 +797,7 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
-            _diagnostic_sync_after_restore(
-                k_cache_prefix, "decode_logits_before"
-            )
+            _diagnostic_sync(k_cache_prefix, "decode_logits_before")
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
@@ -807,9 +808,7 @@ def sparse_attn_indexer(
                 max_model_len=max_model_len,
                 clean_logits=False,
             )
-            _diagnostic_sync_after_restore(
-                k_cache_prefix, "decode_logits_after"
-            )
+            _diagnostic_sync(k_cache_prefix, "decode_logits_after")
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
@@ -863,7 +862,7 @@ def sparse_attn_indexer(
                 logits.stride(1),
                 topk_tokens,
             )
-        _diagnostic_sync_after_restore(k_cache_prefix, "decode_topk")
+        _diagnostic_sync(k_cache_prefix, "decode_topk")
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
