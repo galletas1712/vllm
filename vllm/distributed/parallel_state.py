@@ -127,14 +127,13 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
-def _apply_to_device_comms(label: str, action: Callable[[Any], None]) -> None:
-    """Apply ``action`` to every group's device communicator, collectively.
+def _apply_to_device_comms(
+    action: Callable[[DeviceCommunicatorBase], None],
+) -> None:
+    """Apply ``action`` to every group's device communicator.
 
     Walks the registered parallel groups and skips those without a device
-    communicator (absent at ``world_size == 1``). Each communicator's
-    ``suspend``/``resume`` is a no-op unless it holds releasable device memory
-    (see ``DeviceCommunicatorBase``). Collective across ranks and synchronous
-    on return, so no extra sync is needed.
+    communicator (absent at ``world_size == 1``).
     """
     comms = []
     for group_ref in _groups.values():
@@ -145,21 +144,9 @@ def _apply_to_device_comms(label: str, action: Callable[[Any], None]) -> None:
         if dc is None:
             continue
         comms.append(dc)
-    if not comms:
-        return
 
-    free_before = torch.accelerator.get_memory_info()[0]
     for dc in comms:
         action(dc)
-    delta = torch.accelerator.get_memory_info()[0] - free_before
-    direction = "freed" if delta > 0 else "allocated"
-    logger.info(
-        "device-comm %s: %d comms, %.1f MiB %s",
-        label,
-        len(comms),
-        abs(delta) / 1024**2,
-        direction,
-    )
 
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
@@ -2058,14 +2045,14 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
 def checkpoint_prepare_distributed_state() -> None:
     """Prepare every device communicator for a process checkpoint."""
     torch.accelerator.synchronize()
-    _apply_to_device_comms("checkpoint_prepare", lambda c: c.checkpoint_prepare())
+    _apply_to_device_comms(lambda comm: comm.checkpoint_prepare())
     torch.accelerator.synchronize()
 
 
 def checkpoint_restore_distributed_state() -> None:
     """Restore every device communicator after a process checkpoint."""
     torch.accelerator.synchronize()
-    _apply_to_device_comms("checkpoint_restore", lambda c: c.checkpoint_restore())
+    _apply_to_device_comms(lambda comm: comm.checkpoint_restore())
     torch.accelerator.synchronize()
 
 

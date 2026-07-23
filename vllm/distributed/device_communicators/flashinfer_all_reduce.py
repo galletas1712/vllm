@@ -40,9 +40,6 @@ _fi_ar_workspace = None
 # available on the current topology.
 _fi_ar_quant_workspace = None
 _fi_ar_workspace_groups: dict[int, ProcessGroup] = {}
-# Dedupe shared workspaces when multiple FlashInferAllReduce wrappers exist.
-_fi_ar_prepared_ids: set[int] = set()
-_fi_ar_restored_ids: set[int] = set()
 
 
 def _create_workspace(
@@ -281,47 +278,37 @@ def destroy_fi_ar_workspace():
 
         _fi_ar_workspace = _fi_ar_quant_workspace = None
         _fi_ar_workspace_groups.clear()
-        _fi_ar_prepared_ids.clear()
-        _fi_ar_restored_ids.clear()
-
-
-def _fi_ar_workspaces():
-    seen = set()
-    for workspace in (_fi_ar_workspace, _fi_ar_quant_workspace):
-        if workspace is not None and id(workspace) not in seen:
-            seen.add(id(workspace))
-            yield workspace
 
 
 def checkpoint_prepare_fi_ar_workspaces() -> None:
-    _fi_ar_restored_ids.clear()
-    for workspace in _fi_ar_workspaces():
-        workspace_id = id(workspace)
-        if workspace_id in _fi_ar_prepared_ids:
+    workspaces = [_fi_ar_workspace]
+    if _fi_ar_quant_workspace is not _fi_ar_workspace:
+        workspaces.append(_fi_ar_quant_workspace)
+
+    for workspace in workspaces:
+        if workspace is None:
             continue
         method = getattr(workspace, "checkpoint_prepare", None)
-        if not callable(method):
-            continue
-        method()
-        _fi_ar_prepared_ids.add(workspace_id)
+        if callable(method):
+            method()
 
 
 def checkpoint_restore_fi_ar_workspaces() -> None:
-    _fi_ar_prepared_ids.clear()
-    for workspace in _fi_ar_workspaces():
-        workspace_id = id(workspace)
-        if workspace_id in _fi_ar_restored_ids:
+    workspaces = [_fi_ar_workspace]
+    if _fi_ar_quant_workspace is not _fi_ar_workspace:
+        workspaces.append(_fi_ar_quant_workspace)
+
+    for workspace in workspaces:
+        if workspace is None:
             continue
-        group = _fi_ar_workspace_groups.get(workspace_id)
-        if group is None:
-            raise RuntimeError(
-                "FlashInfer all-reduce workspace process group was not retained"
-            )
         method = getattr(workspace, "checkpoint_restore", None)
-        if not callable(method):
-            continue
-        method(TorchDistBackend(group=group))
-        _fi_ar_restored_ids.add(workspace_id)
+        if callable(method):
+            group = _fi_ar_workspace_groups.get(id(workspace))
+            if group is None:
+                raise RuntimeError(
+                    "FlashInfer all-reduce workspace process group was not retained"
+                )
+            method(TorchDistBackend(group=group))
 
 
 atexit.register(destroy_fi_ar_workspace)
