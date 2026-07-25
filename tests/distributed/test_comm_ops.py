@@ -16,11 +16,12 @@ import torch
 from vllm.distributed import (
     broadcast_tensor_dict,
     get_pp_group,
+    parallel_state,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
-from vllm.distributed.device_communicators import flashinfer_all_reduce
+from vllm.distributed.device_communicators import flashinfer_all_reduce, pynccl
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.distributed.parallel_state import GroupCoordinator, TensorMetadata
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
@@ -316,6 +317,92 @@ def test_cuda_communicator_checkpoints_flashinfer_workspaces(
     for workspace in unique_workspaces:
         workspace.checkpoint_prepare.assert_called_once_with()
         workspace.checkpoint_restore.assert_called_once_with(group)
+
+
+def test_checkpoint_lifecycle_orders_process_global_nccl_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    communicators = [Mock(), Mock()]
+
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda: events.append("synchronize")
+    )
+
+    def apply_to_device_comms(action):
+        for communicator in communicators:
+            action(communicator)
+
+    monkeypatch.setattr(parallel_state, "_apply_to_device_comms", apply_to_device_comms)
+    monkeypatch.setattr(
+        pynccl, "checkpoint_prepare", lambda: events.append("nccl_prepare")
+    )
+    monkeypatch.setattr(
+        pynccl, "checkpoint_restore", lambda: events.append("nccl_restore")
+    )
+    for index, communicator in enumerate(communicators):
+        communicator.checkpoint_prepare.side_effect = lambda i=index: events.append(
+            f"local_prepare_{i}"
+        )
+        communicator.checkpoint_restore.side_effect = lambda i=index: events.append(
+            f"local_restore_{i}"
+        )
+
+    parallel_state.checkpoint_prepare_distributed_state()
+    assert events == [
+        "synchronize",
+        "local_prepare_0",
+        "local_prepare_1",
+        "nccl_prepare",
+        "synchronize",
+    ]
+
+    events.clear()
+    parallel_state.checkpoint_restore_distributed_state()
+    assert events == [
+        "synchronize",
+        "nccl_restore",
+        "local_restore_0",
+        "local_restore_1",
+        "synchronize",
+    ]
+
+
+def test_checkpoint_prepare_stops_after_local_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    synchronize = Mock()
+    checkpoint_prepare = Mock()
+    communicator = Mock()
+    communicator.checkpoint_prepare.side_effect = RuntimeError("local prepare failed")
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    monkeypatch.setattr(
+        parallel_state, "_apply_to_device_comms", lambda action: action(communicator)
+    )
+    monkeypatch.setattr(pynccl, "checkpoint_prepare", checkpoint_prepare)
+
+    with pytest.raises(RuntimeError, match="local prepare failed"):
+        parallel_state.checkpoint_prepare_distributed_state()
+
+    synchronize.assert_called_once_with()
+    checkpoint_prepare.assert_not_called()
+
+
+def test_checkpoint_restore_stops_after_nccl_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    synchronize = Mock()
+    apply_to_device_comms = Mock()
+    checkpoint_restore = Mock(side_effect=RuntimeError("NCCL restore failed"))
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    monkeypatch.setattr(parallel_state, "_apply_to_device_comms", apply_to_device_comms)
+    monkeypatch.setattr(pynccl, "checkpoint_restore", checkpoint_restore)
+
+    with pytest.raises(RuntimeError, match="NCCL restore failed"):
+        parallel_state.checkpoint_restore_distributed_state()
+
+    synchronize.assert_called_once_with()
+    apply_to_device_comms.assert_not_called()
 
 
 def test_async_intermediate_tensors_lazy_wait() -> None:

@@ -28,6 +28,16 @@ logger = init_logger(__name__)
 _NCCL_SYMM_OPS_REGISTERED = False
 
 
+def checkpoint_prepare() -> None:
+    """Prepare all NCCL communicators tracked by the preload checkpoint shim."""
+    NCCLLibrary().ncclCheckpointPrepare()
+
+
+def checkpoint_restore() -> None:
+    """Restore all NCCL communicators tracked by the preload checkpoint shim."""
+    NCCLLibrary().ncclCheckpointRestore()
+
+
 def register_nccl_symmetric_ops(pynccl_comm):
     from vllm.distributed.device_communicators.pynccl_allocator import (
         nccl_symm_mem_context,

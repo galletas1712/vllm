@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ctypes
 import os
 
 import multiprocess as mp
@@ -24,6 +25,125 @@ from vllm.distributed.parallel_state import (
 from vllm.utils.system_utils import update_environment_variables
 
 mp.set_start_method("spawn", force=True)
+
+
+class _FakeNcclFunction:
+    def __init__(self, result=0):
+        self.result = result
+
+    def __call__(self, *args):
+        return self.result
+
+
+class _FakeNcclLibrary:
+    def __init__(self, functions):
+        self.functions = functions
+
+    def __getattr__(self, name):
+        try:
+            return self.functions[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+class _FakeNcclLoader:
+    def __init__(self, explicit_lib, process_functions):
+        self.explicit_lib = explicit_lib
+        self.process_functions = process_functions
+        self.global_lib = _FakeNcclLibrary(explicit_lib.functions.copy())
+        self.calls = []
+        self.is_global = False
+
+    def __call__(self, path, mode=None):
+        self.calls.append((path, mode))
+        if path is None:
+            functions = self.process_functions.copy()
+            if self.is_global:
+                functions.update(
+                    {
+                        name: function
+                        for name, function in self.global_lib.functions.items()
+                        if name not in functions
+                    }
+                )
+            return _FakeNcclLibrary(functions)
+        if mode == ctypes.RTLD_GLOBAL:
+            self.is_global = True
+            return self.global_lib
+        return self.explicit_lib
+
+
+def _fake_nccl_library(**functions):
+    all_functions = {
+        function.name: _FakeNcclFunction()
+        for function in NCCLLibrary.exported_functions
+    }
+    all_functions["ncclGetErrorString"] = _FakeNcclFunction(b"checkpoint failed")
+    all_functions.update(functions)
+    return _FakeNcclLibrary(all_functions)
+
+
+def _reset_nccl_library_cache(monkeypatch):
+    monkeypatch.setattr(NCCLLibrary, "path_to_library_cache", {})
+    monkeypatch.setattr(NCCLLibrary, "path_to_dict_mapping", {})
+
+
+def test_checkpoint_shim_binds_nccl_through_process_namespace(monkeypatch):
+    _reset_nccl_library_cache(monkeypatch)
+    explicit_lib = _fake_nccl_library()
+    shim_functions = {
+        name: _FakeNcclFunction()
+        for name in ("ncclCommInitRank", "ncclCommAbort", "ncclCommDestroy")
+    }
+    shim_functions.update(
+        ncclCheckpointPrepare=_FakeNcclFunction(1),
+        ncclCheckpointRestore=_FakeNcclFunction(1),
+    )
+    loader = _FakeNcclLoader(explicit_lib, shim_functions)
+    monkeypatch.setattr(ctypes, "CDLL", loader)
+
+    lib = NCCLLibrary("libnccl.so")
+
+    assert loader.calls == [
+        ("libnccl.so", None),
+        (None, None),
+        ("libnccl.so", ctypes.RTLD_GLOBAL),
+        (None, None),
+    ]
+    assert lib.lib is loader.global_lib
+    assert NCCLLibrary.path_to_library_cache["libnccl.so"] is loader.global_lib
+    for name in ("ncclCommInitRank", "ncclCommAbort", "ncclCommDestroy"):
+        assert lib._funcs[name] is shim_functions[name]
+        assert lib._funcs[name] is not explicit_lib.functions[name]
+    assert lib._funcs["ncclAllReduce"] is explicit_lib.functions["ncclAllReduce"]
+    with pytest.raises(RuntimeError, match="NCCL error: checkpoint failed"):
+        lib.ncclCheckpointPrepare()
+    with pytest.raises(RuntimeError, match="NCCL error: checkpoint failed"):
+        lib.ncclCheckpointRestore()
+
+
+@pytest.mark.parametrize(
+    "process_functions",
+    [{}, {"ncclCheckpointPrepare": _FakeNcclFunction()}],
+    ids=["absent", "incomplete"],
+)
+def test_missing_checkpoint_shim_preserves_explicit_nccl_binding(
+    monkeypatch, process_functions
+):
+    _reset_nccl_library_cache(monkeypatch)
+    explicit_lib = _fake_nccl_library()
+    loader = _FakeNcclLoader(explicit_lib, process_functions)
+    monkeypatch.setattr(ctypes, "CDLL", loader)
+
+    lib = NCCLLibrary("libnccl.so")
+
+    assert loader.calls == [("libnccl.so", None), (None, None)]
+    assert lib.lib is explicit_lib
+    assert lib._funcs["ncclCommInitRank"] is explicit_lib.functions["ncclCommInitRank"]
+    with pytest.raises(RuntimeError, match="ncclCheckpointPrepare is unavailable"):
+        lib.ncclCheckpointPrepare()
+    with pytest.raises(RuntimeError, match="ncclCheckpointRestore is unavailable"):
+        lib.ncclCheckpointRestore()
 
 
 def distributed_run(fn, world_size):

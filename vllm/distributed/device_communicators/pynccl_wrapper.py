@@ -165,6 +165,11 @@ class Function:
 
 
 class NCCLLibrary:
+    checkpoint_functions = [
+        Function("ncclCheckpointPrepare", ncclResult_t, []),
+        Function("ncclCheckpointRestore", ncclResult_t, []),
+    ]
+
     exported_functions = [
         # const char* ncclGetErrorString(ncclResult_t result)
         Function("ncclGetErrorString", ctypes.c_char_p, [ncclResult_t]),
@@ -376,10 +381,30 @@ class NCCLLibrary:
             raise e
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
+            process_lib = ctypes.CDLL(None)
+            try:
+                checkpoint_funcs = {
+                    func.name: getattr(process_lib, func.name)
+                    for func in NCCLLibrary.checkpoint_functions
+                }
+            except AttributeError:
+                checkpoint_funcs = {}
+                function_lib = self.lib
+            else:
+                lib = ctypes.CDLL(so_file, mode=ctypes.RTLD_GLOBAL)
+                NCCLLibrary.path_to_library_cache[so_file] = lib
+                self.lib = lib
+                process_lib = ctypes.CDLL(None)
+                checkpoint_funcs = {
+                    func.name: getattr(process_lib, func.name)
+                    for func in NCCLLibrary.checkpoint_functions
+                }
+                function_lib = process_lib
+
             _funcs: dict[str, Any] = {}
             for func in NCCLLibrary.exported_functions:
                 try:
-                    f = getattr(self.lib, func.name)
+                    f = getattr(function_lib, func.name)
                     f.restype = func.restype
                     f.argtypes = func.argtypes
                     _funcs[func.name] = f
@@ -405,6 +430,12 @@ class NCCLLibrary:
                         # Optional on NCCL versions older than 2.29.
                         continue
                     raise
+            for func in NCCLLibrary.checkpoint_functions:
+                f = checkpoint_funcs.get(func.name)
+                if f is not None:
+                    f.restype = func.restype
+                    f.argtypes = func.argtypes
+                    _funcs[func.name] = f
             NCCLLibrary.path_to_dict_mapping[so_file] = _funcs
         self._funcs = NCCLLibrary.path_to_dict_mapping[so_file]
 
@@ -591,6 +622,26 @@ class NCCLLibrary:
 
     def ncclGroupEnd(self) -> None:
         self.NCCL_CHECK(self._funcs["ncclGroupEnd"]())
+
+    def ncclCheckpointPrepare(self) -> None:
+        try:
+            checkpoint_prepare = self._funcs["ncclCheckpointPrepare"]
+        except KeyError:
+            raise RuntimeError(
+                "ncclCheckpointPrepare is unavailable; preload the NCCL "
+                "checkpoint shim before starting Python."
+            ) from None
+        self.NCCL_CHECK(checkpoint_prepare())
+
+    def ncclCheckpointRestore(self) -> None:
+        try:
+            checkpoint_restore = self._funcs["ncclCheckpointRestore"]
+        except KeyError:
+            raise RuntimeError(
+                "ncclCheckpointRestore is unavailable; preload the NCCL "
+                "checkpoint shim before starting Python."
+            ) from None
+        self.NCCL_CHECK(checkpoint_restore())
 
     def ncclCommWindowRegister(
         self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int

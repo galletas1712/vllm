@@ -2052,14 +2052,20 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
 
 def checkpoint_prepare_distributed_state() -> None:
     """Prepare every device communicator for a process checkpoint."""
+    from .device_communicators.pynccl import checkpoint_prepare
+
     torch.accelerator.synchronize()
     _apply_to_device_comms(lambda comm: comm.checkpoint_prepare())
+    checkpoint_prepare()
     torch.accelerator.synchronize()
 
 
 def checkpoint_restore_distributed_state() -> None:
     """Restore every device communicator after a process checkpoint."""
+    from .device_communicators.pynccl import checkpoint_restore
+
     torch.accelerator.synchronize()
+    checkpoint_restore()
     _apply_to_device_comms(lambda comm: comm.checkpoint_restore())
     torch.accelerator.synchronize()
 
