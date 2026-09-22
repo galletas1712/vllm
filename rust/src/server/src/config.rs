@@ -208,6 +208,9 @@ impl FromStr for LoraModulePath {
 #[derive(Educe, Clone, PartialEq, Eq, Serialize)]
 #[educe(Debug)]
 pub struct Config {
+    /// Inherited checkpoint control socket owned by this frontend, if enabled.
+    #[serde(skip_serializing)]
+    pub checkpoint_control_fd: Option<i32>,
     /// Frontend-to-engine transport setup.
     pub transport_mode: TransportMode,
     /// Requested frontend-side coordinator behavior.

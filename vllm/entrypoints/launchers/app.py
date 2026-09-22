@@ -20,6 +20,8 @@ def build_app(
     args: Namespace,
     supported_tasks: tuple["SupportedTask", ...] | None = None,
     model_config: ModelConfig | None = None,
+    *,
+    checkpoint=None,
 ) -> FastAPI:
     if supported_tasks is None:
         warnings.warn(
@@ -52,5 +54,7 @@ def build_app(
 
     init_exception_handler(app)
     init_entrypoints_middleware(args, app, supported_tasks)
+    if checkpoint is not None:
+        checkpoint.attach(app)
     app = sagemaker_standards_bootstrap(app)
     return app

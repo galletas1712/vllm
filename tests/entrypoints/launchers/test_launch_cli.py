@@ -3,6 +3,7 @@
 """Unit tests for the `vllm launch` CLI subcommand."""
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -1150,3 +1151,240 @@ def test_snapshot_runtime_installer_logs_the_failing_exit_code():
 
     assert result.returncode == 7
     assert "(exit 7)" in result.stdout
+
+
+@asynccontextmanager
+async def _checkpoint_http_group(call, *, clear_cache=False, root_path=""):
+    import httpx
+    from fastapi import FastAPI
+
+    from vllm.snapshot.lifecycle.coordinator import CheckpointCoordinator
+    from vllm.snapshot.lifecycle.frontend import CheckpointFrontend
+
+    async def clear():
+        await call("frontend_clear_cache")
+
+    coordinator = CheckpointCoordinator(2)
+    group = asyncio.create_task(
+        coordinator.run(
+            policy="custom.Policy",
+            options={"retain": True},
+            clear_cache=clear_cache,
+        )
+    )
+    frontends = [CheckpointFrontend(call, clear) for _ in range(2)]
+    clients = []
+    apps = []
+    try:
+        await asyncio.gather(
+            *(
+                frontend.connect(sock)
+                for frontend, sock in zip(frontends, coordinator.frontend_sockets)
+            )
+        )
+        for frontend in frontends:
+            app = FastAPI(root_path=root_path)
+            frontend.attach(app)
+            apps.append(app)
+            clients.append(
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                )
+            )
+        yield apps, clients
+    finally:
+        await asyncio.gather(*(client.aclose() for client in clients))
+        group.cancel()
+        await asyncio.gather(group, return_exceptions=True)
+        await asyncio.gather(*(frontend.close() for frontend in frontends))
+        coordinator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_path", ["", "/proxy"])
+async def test_checkpoint_http_drains_all_frontends_before_preparing(root_path):
+    """Prepare waits for streaming responses; resume waits for engine recovery."""
+    from starlette.responses import StreamingResponse
+
+    calls = []
+    stream_started = asyncio.Event()
+    finish_stream = asyncio.Event()
+    restore_started = asyncio.Event()
+    finish_restore = asyncio.Event()
+
+    async def call(method, *args):
+        calls.append((method, args))
+        if method == "checkpoint_restore":
+            restore_started.set()
+            await finish_restore.wait()
+
+    async with _checkpoint_http_group(call, clear_cache=True, root_path=root_path) as (
+        apps,
+        clients,
+    ):
+
+        async def stream():
+            yield b"first"
+            stream_started.set()
+            await finish_stream.wait()
+            yield b"last"
+
+        @apps[1].get("/inference")
+        async def inference():
+            return StreamingResponse(stream())
+
+        request = asyncio.create_task(clients[1].get("/inference"))
+        await asyncio.wait_for(stream_started.wait(), 5)
+        preparing = asyncio.create_task(clients[0].post("/checkpoint/prepare"))
+        # A status round trip observes the transition without waiting for drain.
+        while (await clients[1].get("/checkpoint/status")).json()["state"] == "running":
+            await asyncio.sleep(0)
+        assert (await clients[1].get("/health")).status_code == 503
+        assert not preparing.done()
+        assert calls == []
+        finish_stream.set()
+        assert (await request).text == "firstlast"
+        assert (await asyncio.wait_for(preparing, 5)).json() == {"state": "prepared"}
+        assert calls == [
+            ("pause_scheduler", ("wait", True)),
+            ("frontend_clear_cache", ()),
+            ("frontend_clear_cache", ()),
+            ("checkpoint_prepare", ("custom.Policy", {"retain": True})),
+        ]
+        # Either API process can retry or release the same service-wide operation.
+        assert (await clients[1].post("/checkpoint/prepare")).json() == {
+            "state": "prepared"
+        }
+        assert len(calls) == 4
+        resuming = asyncio.create_task(clients[1].post("/checkpoint/resume"))
+        await asyncio.wait_for(restore_started.wait(), 5)
+        assert (await clients[0].get("/checkpoint/status")).json() == {
+            "state": "resuming"
+        }
+        assert (await clients[0].get("/health")).status_code == 503
+        finish_restore.set()
+        assert (await asyncio.wait_for(resuming, 5)).json() == {"state": "running"}
+        assert (await clients[0].post("/checkpoint/resume")).json() == {
+            "state": "running"
+        }
+        assert [method for method, _ in calls[-2:]] == [
+            "checkpoint_restore",
+            "resume_scheduler",
+        ]
+        assert (await clients[1].get("/inference")).text == "firstlast"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_method", ["checkpoint_prepare", "checkpoint_restore"])
+async def test_checkpoint_http_policy_failure_keeps_admission_closed(failed_method):
+    calls = []
+
+    async def call(method, *args):
+        calls.append(method)
+        if method == failed_method:
+            raise RuntimeError("policy failed")
+
+    async with _checkpoint_http_group(call) as (_, clients):
+        response = await clients[0].post("/checkpoint/prepare")
+        if failed_method == "checkpoint_restore":
+            assert response.status_code == 200
+            response = await clients[1].post("/checkpoint/resume")
+        assert response.status_code == 503
+        assert "policy failed" in response.text
+        assert "resume_scheduler" not in calls
+        assert "frontend_clear_cache" not in calls
+        for client in clients:
+            assert (await client.get("/checkpoint/status")).json() == {
+                "state": "failed"
+            }
+            assert (await client.get("/health")).status_code == 503
+            assert (await client.post("/checkpoint/resume")).status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_http_disconnect_does_not_cancel_preparation():
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    calls = []
+
+    async def call(method, *args):
+        calls.append(method)
+        if method == "checkpoint_prepare":
+            started.set()
+            await finish.wait()
+
+    async with _checkpoint_http_group(call) as (_, clients):
+        preparing = asyncio.create_task(clients[0].post("/checkpoint/prepare"))
+        await asyncio.wait_for(started.wait(), 5)
+        preparing.cancel()
+        await asyncio.gather(preparing, return_exceptions=True)
+        finish.set()
+        assert (await clients[1].post("/checkpoint/prepare")).json() == {
+            "state": "prepared"
+        }
+        assert calls.count("checkpoint_prepare") == 1
+        assert (await clients[0].post("/checkpoint/resume")).json() == {
+            "state": "running"
+        }
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_prepare_drains_background_responses():
+    """A Responses background task can submit work after its HTTP response ends."""
+    from types import SimpleNamespace
+
+    finish = asyncio.Event()
+    background_started = asyncio.Event()
+    calls = []
+
+    async def call(method, *args):
+        calls.append(method)
+
+    async def background():
+        background_started.set()
+        await finish.wait()
+
+    task = asyncio.create_task(background())
+    try:
+        async with _checkpoint_http_group(call) as (apps, clients):
+            apps[1].state.openai_serving_responses = SimpleNamespace(
+                background_tasks={"response": task}
+            )
+            await background_started.wait()
+            preparing = asyncio.create_task(clients[0].post("/checkpoint/prepare"))
+            while (await clients[1].get("/checkpoint/status")).json()[
+                "state"
+            ] == "running":
+                await asyncio.sleep(0)
+            assert not preparing.done()
+            assert not calls
+            finish.set()
+            assert (await asyncio.wait_for(preparing, 5)).json() == {
+                "state": "prepared"
+            }
+            assert task.done()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_checkpoint_routes_registered_before_hosting_bootstrap(monkeypatch):
+    """Hosting adapters may finalize the middleware stack during build_app."""
+    from vllm.entrypoints.launchers import app as app_module
+    from vllm.entrypoints.launchers.cli_args import make_arg_parser
+    from vllm.snapshot.lifecycle.frontend import CheckpointFrontend
+
+    async def unused(*args):
+        raise AssertionError("App construction must not call the engine")
+
+    def bootstrap(app):
+        app.middleware_stack = app.build_middleware_stack()
+        return app
+
+    monkeypatch.setattr(app_module, "sagemaker_standards_bootstrap", bootstrap)
+    args = make_arg_parser(FlexibleArgumentParser()).parse_args([])
+    checkpoint = CheckpointFrontend(unused, unused)
+    app = app_module.build_app(args, ("generate",), checkpoint=checkpoint)
+    assert {"/checkpoint/prepare", "/checkpoint/resume", "/checkpoint/status"} <= {
+        route.path for route in app.routes
+    }
