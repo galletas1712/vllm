@@ -711,3 +711,63 @@ def test_pause_synchronizes_device_before_cache_reset(deferred: bool):
     else:
         assert result is None
     assert order == ["synchronize_device", "reset_caches"]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        "vllm.snapshot.lifecycle.ResidentPolicy",
+        "vllm.snapshot.policies.ReloadWeightsPolicy",
+    ],
+)
+def test_checkpoint_resource_policy_keeps_scheduler_paused(policy):
+    """Resident and compact policies recover resources without admitting work."""
+    core = _pausable_engine_core_proc()
+    core._checkpoint_policy = None
+    core.scheduler.pause_state = PauseState.PAUSED_ALL
+    core.scheduler.has_unfinished_requests.return_value = False
+    core.checkpoint_prepare(policy, {})
+    assert core.is_scheduler_paused()
+    core.checkpoint_restore()
+    core.scheduler.set_pause_state.assert_not_called()
+    if policy.endswith("ResidentPolicy"):
+        core.model_executor.sleep.assert_not_called()
+        core.model_executor.wake_up.assert_not_called()
+    else:
+        core.model_executor.sleep.assert_called_once_with(level=2)
+        assert core.model_executor.wake_up.call_count == 2
+    core.model_executor.collective_rpc.assert_any_call(
+        "synchronize_device", None, (), None
+    )
+
+
+def test_checkpoint_custom_policy_keeps_constructor_options_and_prepared_state(
+    monkeypatch,
+):
+    """Recovery uses the integration's prepared policy instance, not a new one."""
+    events = []
+
+    class Policy:
+        def __init__(self, resource):
+            self.resource = resource
+            self.prepared = False
+
+        def prepare(self, core):
+            events.append(("release", self.resource))
+            self.prepared = True
+
+        def restore(self, core):
+            assert self.prepared
+            events.append(("recreate", self.resource))
+
+    monkeypatch.setattr(
+        "vllm.utils.import_utils.resolve_obj_by_qualname", lambda name: Policy
+    )
+    core = _pausable_engine_core_proc()
+    core._checkpoint_policy = None
+    core.scheduler.pause_state = PauseState.PAUSED_ALL
+    core.scheduler.has_unfinished_requests.return_value = False
+    core.checkpoint_prepare("integration.Policy", {"resource": "custom-channel"})
+    core.checkpoint_restore()
+    assert events == [("release", "custom-channel"), ("recreate", "custom-channel")]
+    core.scheduler.set_pause_state.assert_not_called()

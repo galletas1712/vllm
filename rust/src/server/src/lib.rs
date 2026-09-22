@@ -3,6 +3,7 @@
 
 //! Minimal OpenAI-compatible HTTP server above [`vllm_chat`].
 
+mod checkpoint;
 mod config;
 mod error;
 mod grpc;
@@ -215,6 +216,12 @@ where
         result = build_state(&config) => result?,
         _ = shutdown.cancelled() => return Ok(()),
     };
+    if let Some(fd) = config.checkpoint_control_fd {
+        tokio::select! {
+            result = checkpoint::join(fd, state.engine_core_client()) => result?,
+            _ = shutdown.cancelled() => return Ok(()),
+        }
+    }
     let model = state.primary_model_name().to_owned();
     let app = extend_router(build_router(state.clone()));
 

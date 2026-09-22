@@ -182,10 +182,21 @@ async def run_server_worker(
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
+    client_config = dict(client_config or {})
+    checkpoint_socket = client_config.pop("checkpoint_socket", None)
     async with build_async_engine_client(
         args,
         client_config=client_config,
     ) as engine_client:
+        if checkpoint_socket is not None:
+            from vllm.snapshot.lifecycle.coordinator import join_checkpoint
+            from vllm.v1.engine.async_llm import AsyncLLM
+
+            assert isinstance(engine_client, AsyncLLM)
+
+            await join_checkpoint(
+                checkpoint_socket, engine_client.engine_core.call_utility_async
+            )
         shutdown_task = await build_and_serve(
             engine_client, listen_address, sock, args, **uvicorn_kwargs
         )

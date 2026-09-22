@@ -4,4 +4,7 @@
 
 For Kubernetes deployment instructions and examples (including vLLM), see the [Deploying Dynamo on Kubernetes](https://github.com/ai-dynamo/dynamo/blob/main/docs/kubernetes/README.md) guide.
 
+For native `vllm serve` startup checkpoint coordination with ai-dynamo/snapshot,
+see [Externally orchestrated startup checkpoints](snapshot.md).
+
 Background reading: InfoQ news coverage — [NVIDIA Dynamo simplifies Kubernetes deployment for LLM inference](https://www.infoq.com/news/2025/12/nvidia-dynamo-kubernetes/).

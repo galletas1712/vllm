@@ -511,6 +511,7 @@ impl SharedRuntimeArgs {
         let profiler = self.profiler();
 
         Config {
+            checkpoint_control_fd: None,
             transport_mode: TransportMode::Bootstrapped {
                 input_address,
                 output_address,
@@ -572,6 +573,7 @@ impl SharedRuntimeArgs {
         let profiler = self.profiler();
 
         Config {
+            checkpoint_control_fd: None,
             transport_mode: TransportMode::HandshakeOwner {
                 handshake_address,
                 advertised_host,
@@ -676,6 +678,9 @@ fn parse_runtime_args_json(value: &str) -> Result<SharedRuntimeArgs, String> {
 #[derive(Educe, Clone, Args, PartialEq, Eq)]
 #[educe(Debug)]
 pub struct FrontendArgs {
+    /// Inherited private checkpoint barrier socket from the Python launcher.
+    #[arg(long)]
+    pub checkpoint_control_fd: Option<i32>,
     /// Inherited listening socket file descriptor passed by the Python
     /// supervisor.
     #[arg(long)]
@@ -713,7 +718,7 @@ impl FrontendArgs {
     /// Convert the CLI arguments into the OpenAI server's runtime config.
     pub fn into_config(self) -> Config {
         let data_parallel_size = self.data_parallel_size.unwrap_or(self.engine_count);
-        self.runtime.into_bootstrapped_config(
+        let mut config = self.runtime.into_bootstrapped_config(
             self.listen_fd,
             self.input_address,
             self.output_address,
@@ -721,7 +726,9 @@ impl FrontendArgs {
             self.engine_start_index,
             self.engine_count,
             data_parallel_size,
-        )
+        );
+        config.checkpoint_control_fd = self.checkpoint_control_fd;
+        config
     }
 }
 

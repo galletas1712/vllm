@@ -3,6 +3,7 @@
 """Unit tests for the `vllm launch` CLI subcommand."""
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -1150,3 +1151,134 @@ def test_snapshot_runtime_installer_logs_the_failing_exit_code():
 
     assert result.returncode == 7
     assert "(exit 7)" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_group_waits_for_all_frontends_and_external_restore(tmp_path):
+    """One leader prepares all engines; no frontend serves before recovery."""
+    from vllm.snapshot.lifecycle.coordinator import (
+        CheckpointCoordinator,
+        join_checkpoint,
+    )
+    from vllm.snapshot.lifecycle.signaling import FileCheckpointSignal
+
+    events = []
+    ready = asyncio.Event()
+    restore_started = asyncio.Event()
+    finish_restore = asyncio.Event()
+
+    class ObservedSignal(FileCheckpointSignal):
+        async def ready(self):
+            await super().ready()
+            ready.set()
+
+    async def call(method, *args):
+        events.append((method, args))
+        if method == "checkpoint_restore":
+            restore_started.set()
+            await finish_restore.wait()
+
+    signal = ObservedSignal(tmp_path)
+    (tmp_path / "ready-for-snapshot").touch()
+    (tmp_path / "restore-complete").touch()
+    signal.start_capture()
+    assert not (tmp_path / "ready-for-snapshot").exists()
+    assert not (tmp_path / "restore-complete").exists()
+    coordinator = CheckpointCoordinator(2)
+    group = asyncio.create_task(
+        coordinator.run(
+            signal,
+            policy="custom.Policy",
+            options={"retain": True},
+            clear_cache=False,
+        )
+    )
+    participants = [
+        asyncio.create_task(join_checkpoint(sock, call))
+        for sock in coordinator.frontend_sockets
+    ]
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        assert events == [
+            ("pause_scheduler", ("wait", False)),
+            ("checkpoint_prepare", ("custom.Policy", {"retain": True})),
+        ]
+        assert all(not task.done() for task in participants)
+        (tmp_path / "restore-complete").touch()
+        await asyncio.wait_for(restore_started.wait(), 5)
+        assert all(not task.done() for task in participants)
+        finish_restore.set()
+        await asyncio.wait_for(asyncio.gather(group, *participants), 5)
+        assert [event[0] for event in events] == [
+            "pause_scheduler",
+            "checkpoint_prepare",
+            "checkpoint_restore",
+            "resume_scheduler",
+        ]
+    finally:
+        for task in [group, *participants]:
+            task.cancel()
+        await asyncio.gather(group, *participants, return_exceptions=True)
+        coordinator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_method", ["checkpoint_prepare", "checkpoint_restore"])
+async def test_checkpoint_failure_never_opens_frontends(tmp_path, failed_method):
+    from vllm.snapshot.lifecycle.coordinator import (
+        CheckpointCoordinator,
+        join_checkpoint,
+    )
+    from vllm.snapshot.lifecycle.signaling import FileCheckpointSignal
+
+    class ImmediateRelease(FileCheckpointSignal):
+        async def wait_for_restore(self):
+            return
+
+    calls = []
+
+    async def call(method, *args):
+        calls.append(method)
+        if method == failed_method:
+            raise RuntimeError("policy failed")
+
+    coordinator = CheckpointCoordinator(2)
+    signal = ImmediateRelease(tmp_path)
+    group = coordinator.run(
+        signal, policy="custom.Policy", options={}, clear_cache=True
+    )
+    try:
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(
+                group,
+                *(join_checkpoint(sock, call) for sock in coordinator.frontend_sockets),
+                return_exceptions=True,
+            ),
+            5,
+        )
+        assert all(isinstance(outcome, RuntimeError) for outcome in outcomes)
+        assert "resume_scheduler" not in calls
+        assert (tmp_path / "ready-for-snapshot").exists() == (
+            failed_method == "checkpoint_restore"
+        )
+    finally:
+        coordinator.close()
+
+
+def test_snapshot_standby_does_not_start_engines_or_remove_markers(
+    tmp_path, monkeypatch
+):
+    from vllm.entrypoints.cli.serve import ServeSubcommand
+
+    marker = tmp_path / "restore-complete"
+    marker.touch()
+    monkeypatch.setenv("SNAPSHOT_RESTORE_STANDBY", "1")
+    monkeypatch.setenv("SNAPSHOT_CONTROL_DIR", str(tmp_path))
+
+    def stopped():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(signal, "pause", stopped)
+    with pytest.raises(KeyboardInterrupt):
+        ServeSubcommand.cmd(argparse.Namespace())
+    assert marker.exists()

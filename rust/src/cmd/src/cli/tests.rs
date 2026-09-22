@@ -1005,6 +1005,7 @@ fn frontend_args_accept_json() {
         Cli {
             command: Frontend(
                 FrontendArgs {
+                    checkpoint_control_fd: None,
                     listen_fd: 3,
                     input_address: "ipc:///tmp/input.sock",
                     output_address: "ipc:///tmp/output.sock",
@@ -1827,6 +1828,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
 
     expect![[r#"
         Config {
+            checkpoint_control_fd: None,
             transport_mode: HandshakeOwner {
                 handshake_address: "tcp://10.99.48.128:29550",
                 advertised_host: "10.99.48.128",
@@ -1924,6 +1926,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
 
     expect![[r#"
         Config {
+            checkpoint_control_fd: None,
             transport_mode: HandshakeOwner {
                 handshake_address: "tcp://10.99.48.128:29550",
                 advertised_host: "10.99.48.128",
@@ -2037,6 +2040,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
 
     expect![[r#"
         Config {
+            checkpoint_control_fd: None,
             transport_mode: Bootstrapped {
                 input_address: "ipc:///tmp/input.sock",
                 output_address: "ipc:///tmp/output.sock",

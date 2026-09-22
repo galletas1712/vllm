@@ -35,6 +35,7 @@ from vllm.multimodal.cache import (
     MultiModalCacheMissError,
     engine_receiver_cache_from_config,
 )
+from vllm.snapshot.lifecycle import CheckpointPolicy
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -124,6 +125,7 @@ class EngineCore:
 
         load_general_plugins()
 
+        self._checkpoint_policy: CheckpointPolicy | None = None
         self.vllm_config = vllm_config
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
@@ -1029,6 +1031,26 @@ class EngineCore:
         self.model_executor.save_sharded_state(
             path=path, pattern=pattern, max_size=max_size
         )
+
+    def checkpoint_prepare(self, policy: str, options: dict[str, Any]) -> None:
+        """Prepare resources after a completed scheduler pause."""
+        from vllm.utils.import_utils import resolve_obj_by_qualname
+
+        if not self.is_scheduler_paused() or self.scheduler.has_unfinished_requests():
+            raise RuntimeError("checkpoint_prepare requires a drained, paused engine")
+        if self._checkpoint_policy is not None:
+            raise RuntimeError("A checkpoint policy is already prepared")
+        self._checkpoint_policy = resolve_obj_by_qualname(policy)(**options)
+        self._checkpoint_policy.prepare(self)
+        self.collective_rpc("synchronize_device")
+
+    def checkpoint_restore(self) -> None:
+        """Recover resources, leaving scheduling paused until group recovery."""
+        if self._checkpoint_policy is None:
+            raise RuntimeError("No checkpoint policy was prepared")
+        self._checkpoint_policy.restore(self)
+        self.collective_rpc("synchronize_device")
+        self._checkpoint_policy = None
 
     def collective_rpc(
         self,

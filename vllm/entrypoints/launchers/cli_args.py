@@ -435,6 +435,23 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help="Launch a gRPC server instead of the HTTP OpenAI-compatible "
         "server. Requires: pip install vllm[grpc].",
     )
+    snapshot = parser.add_argument_group("Snapshot lifecycle")
+    snapshot.add_argument(
+        "--snapshot-control-dir",
+        help="Prepare at startup and wait for an external checkpoint orchestrator. "
+        "Also settable with VLLM_SNAPSHOT_CONTROL_DIR or SNAPSHOT_CONTROL_DIR.",
+    )
+    snapshot.add_argument(
+        "--snapshot-policy",
+        default="vllm.snapshot.lifecycle.ResidentPolicy",
+        help="Qualified CheckpointPolicy class, instantiated on each EngineCore.",
+    )
+    snapshot.add_argument("--snapshot-policy-options", type=json.loads, default={})
+    snapshot.add_argument(
+        "--snapshot-clear-cache",
+        action="store_true",
+        help="Clear prefix, multimodal and encoder caches before preparation.",
+    )
     parser = FrontendArgs.add_cli_args(parser)
     parser = AsyncEngineArgs.add_cli_args(parser)
 

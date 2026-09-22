@@ -182,6 +182,7 @@ class APIServerProcessManager:
         target_server_fn: Callable | None = None,
         stats_update_address: str | None = None,
         tensor_queue: Queue | None = None,
+        checkpoint_sockets: list[Any] | None = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -201,6 +202,7 @@ class APIServerProcessManager:
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address
             tensor_queue: Optional tensor IPC queue for sharing MM tensors
+            checkpoint_sockets: Private launcher barrier sockets, one per frontend
 
         """
         self.listen_address = listen_address
@@ -229,6 +231,8 @@ class APIServerProcessManager:
                 "client_count": num_servers,
                 "client_index": i,
             }
+            if checkpoint_sockets is not None:
+                client_config["checkpoint_socket"] = checkpoint_sockets[i]
             if admission_counters is not None:
                 client_config["mp_admission_counters"] = admission_counters
             if stats_update_address is not None:
@@ -354,6 +358,7 @@ class RustFrontendProcessManager:
         engine_count: int,
         data_parallel_size: int,
         stats_update_address: str | None = None,
+        checkpoint_socket: Any = None,
     ):
         import os
         import subprocess
@@ -377,6 +382,11 @@ class RustFrontendProcessManager:
             "--data-parallel-size",
             str(data_parallel_size),
         ]
+        pass_fds = [fd]
+        if checkpoint_socket is not None:
+            control_fd = checkpoint_socket.fileno()
+            pass_fds.append(control_fd)
+            cmd.extend(["--checkpoint-control-fd", str(control_fd)])
         if stats_update_address is not None:
             cmd.extend(["--coordinator-address", stats_update_address])
         from vllm.entrypoints.serve.utils.api_utils import jsonify_non_default_args
@@ -385,6 +395,10 @@ class RustFrontendProcessManager:
             args,
             exclude={
                 "api_server_count",
+                "snapshot_control_dir",
+                "snapshot_policy",
+                "snapshot_policy_options",
+                "snapshot_clear_cache",
                 # Python passes the bootstrapped engine range explicitly.
                 "data_parallel_rank",
                 "data_parallel_external_lb",
@@ -408,7 +422,7 @@ class RustFrontendProcessManager:
 
         redacted_json = json.dumps(redact_sensitive_args(args_dict), sort_keys=True)
         logger.info("Launching Rust frontend: %s", " ".join(cmd[:-1] + [redacted_json]))
-        self._proc = subprocess.Popen(cmd, pass_fds=(fd,))
+        self._proc = subprocess.Popen(cmd, pass_fds=pass_fds)
 
         # Create a process wrapper with a sentinel fd for monitoring
         self.processes: list[_SubprocessWrapper] = [
