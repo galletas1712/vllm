@@ -202,7 +202,7 @@ class APIServerProcessManager:
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address
             tensor_queue: Optional tensor IPC queue for sharing MM tensors
-            checkpoint_sockets: Private launcher barrier sockets, one per frontend
+            checkpoint_sockets: Private launcher control sockets, one per frontend
 
         """
         self.listen_address = listen_address
@@ -395,7 +395,7 @@ class RustFrontendProcessManager:
             args,
             exclude={
                 "api_server_count",
-                "snapshot_control_dir",
+                "enable_checkpoint",
                 "snapshot_policy",
                 "snapshot_policy_options",
                 "snapshot_clear_cache",

@@ -2,30 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import json
 import socket
-from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any
 
-from vllm.logger import init_logger
-from vllm.snapshot.lifecycle.signaling import CheckpointSignal
-
-logger = init_logger(__name__)
+from vllm.snapshot.lifecycle.channel import ControlChannel
 
 
 class CheckpointCoordinator:
-    """Own the startup barrier for an entire local serve process tree.
-
-    All frontends connect to their engines before joining. Only one frontend
-    broadcasts utility calls to all engines; the others remain parked. The
-    internal sockets are captured with the process tree, so a reused image
-    cannot observe leftover internal release files from an earlier restore.
-    """
+    """Serialize HTTP lifecycle operations across all local frontends and engines."""
 
     def __init__(self, frontend_count: int):
         pairs = [socket.socketpair() for _ in range(frontend_count)]
         self.sockets = [pair[0] for pair in pairs]
         self.frontend_sockets = [pair[1] for pair in pairs]
+        self.channels: list[ControlChannel] = []
+        self.joined: set[int] = set()
+        self.ready = asyncio.Event()
+        self.lock = asyncio.Lock()
+        self.state = "starting"
 
     def close_frontend_sockets(self) -> None:
         for sock in self.frontend_sockets:
@@ -37,73 +32,71 @@ class CheckpointCoordinator:
             sock.close()
 
     async def run(
-        self,
-        signal: CheckpointSignal,
-        *,
-        policy: str,
-        options: dict[str, Any],
-        clear_cache: bool,
+        self, *, policy: str, options: dict[str, Any], clear_cache: bool
     ) -> None:
-        streams = []
+        self.policy = policy
+        self.options = options
+        self.clear_cache = clear_cache
         try:
-            for sock in self.sockets:
-                sock.setblocking(False)
-                streams.append(await asyncio.open_connection(sock=sock))
-            await asyncio.gather(*(_expect(reader, "ready") for reader, _ in streams))
-            reader, writer = streams[0]
-
-            async def call(method: str, *args: Any) -> None:
-                writer.write(
-                    json.dumps({"method": method, "args": args}).encode() + b"\n"
+            for index, sock in enumerate(self.sockets):
+                self.channels.append(
+                    await ControlChannel.connect(sock, partial(self._handle, index))
                 )
-                await writer.drain()
-                await _expect(reader, "ok")
-
-            await call("pause_scheduler", "wait", clear_cache)
-            await call("checkpoint_prepare", policy, options)
-            logger.info("Checkpoint group prepared; publishing readiness")
-            await signal.ready()
-            # No timeout and no rollback that could touch CUDA while the
-            # external orchestrator is reconstructing GPU resources.
-            await signal.wait_for_restore()
-            logger.info("External restore complete; recovering checkpoint resources")
-            await call("checkpoint_restore")
-            await call("resume_scheduler")
-            for _, writer in streams:
-                writer.write(b'{"method":"serve","args":[]}\n')
-                await writer.drain()
-            logger.info("Checkpoint recovery complete; frontends released to serve")
+            await asyncio.gather(*(channel.task for channel in self.channels))
         finally:
-            for _, writer in streams:
-                writer.close()
-            await asyncio.gather(*(writer.wait_closed() for _, writer in streams))
+            await asyncio.gather(*(channel.close() for channel in self.channels))
 
-
-async def _expect(reader: asyncio.StreamReader, message: str) -> None:
-    line = await reader.readline()
-    if not line or json.loads(line) != message:
-        raise RuntimeError(
-            f"Checkpoint participant did not acknowledge {message}: {line!r}"
+    async def _all(self, method: str, *args: Any) -> None:
+        # Wait for every participant even when one fails; no preparation work
+        # may still be running when the transition is reported as failed.
+        results = await asyncio.gather(
+            *(channel.call(method, *args) for channel in self.channels),
+            return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
-
-async def join_checkpoint(
-    sock: socket.socket, call: Callable[..., Awaitable[Any]]
-) -> None:
-    """Join before starting a frontend listener; propagate utility failures."""
-    sock.setblocking(False)
-    reader, writer = await asyncio.open_connection(sock=sock)
-    try:
-        writer.write(b'"ready"\n')
-        await writer.drain()
-        while line := await reader.readline():
-            command = json.loads(line)
-            if command["method"] == "serve":
-                return
-            await call(command["method"], *command["args"])
-            writer.write(b'"ok"\n')
-            await writer.drain()
-        raise RuntimeError("Checkpoint coordinator exited before releasing frontend")
-    finally:
-        writer.close()
-        await writer.wait_closed()
+    async def _handle(self, index: int, method: str) -> dict[str, str]:
+        if method == "join":
+            self.joined.add(index)
+            if len(self.joined) == len(self.sockets):
+                self.state = "running"
+                self.ready.set()
+            await self.ready.wait()
+        elif method == "status":
+            pass
+        elif method in ("prepare", "resume"):
+            async with self.lock:
+                target = "prepared" if method == "prepare" else "running"
+                if self.state == target:
+                    return {"state": self.state}
+                expected = "running" if method == "prepare" else "prepared"
+                if self.state != expected:
+                    raise RuntimeError(f"Cannot {method} checkpoint in {self.state}")
+                self.state = "preparing" if method == "prepare" else "resuming"
+                leader = self.channels[0]
+                try:
+                    if method == "prepare":
+                        await self._all("quiesce")
+                        await self._all("drain")
+                        await leader.call(
+                            "utility", "pause_scheduler", "wait", self.clear_cache
+                        )
+                        if self.clear_cache:
+                            await self._all("clear_cache")
+                        await leader.call(
+                            "utility", "checkpoint_prepare", self.policy, self.options
+                        )
+                    else:
+                        await leader.call("utility", "checkpoint_restore")
+                        await leader.call("utility", "resume_scheduler")
+                        await self._all("admit")
+                    self.state = target
+                except Exception:
+                    self.state = "failed"
+                    await self._all("quiesce")
+                    raise
+        else:
+            raise ValueError(f"Unknown checkpoint operation: {method}")
+        return {"state": self.state}

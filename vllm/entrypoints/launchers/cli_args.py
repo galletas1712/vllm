@@ -437,9 +437,9 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     )
     snapshot = parser.add_argument_group("Snapshot lifecycle")
     snapshot.add_argument(
-        "--snapshot-control-dir",
-        help="Prepare at startup and wait for an external checkpoint orchestrator. "
-        "Also settable with VLLM_SNAPSHOT_CONTROL_DIR or SNAPSHOT_CONTROL_DIR.",
+        "--enable-checkpoint",
+        action="store_true",
+        help="Enable HTTP checkpoint prepare/resume control for the local service.",
     )
     snapshot.add_argument(
         "--snapshot-policy",

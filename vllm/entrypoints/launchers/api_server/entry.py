@@ -115,6 +115,8 @@ async def build_and_serve(
     listen_address: str,
     sock: socket.socket,
     args: Namespace,
+    checkpoint=None,
+    checkpoint_socket=None,
     **uvicorn_kwargs,
 ) -> asyncio.Task:
     """Build FastAPI app, initialize state, and start serving.
@@ -130,8 +132,10 @@ async def build_and_serve(
     model_config = engine_client.model_config
 
     logger.info("Supported tasks: %s", supported_tasks)
-    app = build_app(args, supported_tasks, model_config)
+    app = build_app(args, supported_tasks, model_config, checkpoint=checkpoint)
     await init_app_state(engine_client, app.state, args, supported_tasks)
+    if checkpoint is not None:
+        await checkpoint.connect(checkpoint_socket)
 
     logger.info("Starting vLLM server on %s", listen_address)
 
@@ -188,18 +192,33 @@ async def run_server_worker(
         args,
         client_config=client_config,
     ) as engine_client:
-        if checkpoint_socket is not None:
-            from vllm.snapshot.lifecycle.coordinator import join_checkpoint
-            from vllm.v1.engine.async_llm import AsyncLLM
+        checkpoint = None
+        try:
+            if checkpoint_socket is not None:
+                from vllm.snapshot.lifecycle.frontend import CheckpointFrontend
+                from vllm.v1.engine.async_llm import AsyncLLM
 
-            assert isinstance(engine_client, AsyncLLM)
-
-            await join_checkpoint(
-                checkpoint_socket, engine_client.engine_core.call_utility_async
+                assert isinstance(engine_client, AsyncLLM)
+                checkpoint = CheckpointFrontend(
+                    engine_client.engine_core.call_utility_async,
+                    engine_client.renderer.clear_mm_cache_async,
+                )
+            shutdown_task = await build_and_serve(
+                engine_client,
+                listen_address,
+                sock,
+                args,
+                checkpoint=checkpoint,
+                checkpoint_socket=checkpoint_socket,
+                **uvicorn_kwargs,
             )
-        shutdown_task = await build_and_serve(
-            engine_client, listen_address, sock, args, **uvicorn_kwargs
-        )
+        except Exception:
+            if checkpoint is not None:
+                logger.exception("Checkpoint-enabled API server failed")
+            raise
+        finally:
+            if checkpoint is not None:
+                await checkpoint.close()
     # NB: Await server shutdown only after the backend context is exited
     try:
         await shutdown_task

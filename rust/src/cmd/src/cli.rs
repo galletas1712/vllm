@@ -678,7 +678,7 @@ fn parse_runtime_args_json(value: &str) -> Result<SharedRuntimeArgs, String> {
 #[derive(Educe, Clone, Args, PartialEq, Eq)]
 #[educe(Debug)]
 pub struct FrontendArgs {
-    /// Inherited private checkpoint barrier socket from the Python launcher.
+    /// Inherited private checkpoint control socket from the Python launcher.
     #[arg(long)]
     pub checkpoint_control_fd: Option<i32>,
     /// Inherited listening socket file descriptor passed by the Python

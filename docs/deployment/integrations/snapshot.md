@@ -1,80 +1,99 @@
-# Externally orchestrated startup checkpoints
+# HTTP checkpoint lifecycle
 
 `vllm serve` can prepare its complete local process tree for an external
 checkpoint orchestrator, including [ai-dynamo/snapshot](https://github.com/ai-dynamo/snapshot).
-The Python launcher owns the barrier for either the Python or Rust frontend.
-The frontend connects to all engines before joining the barrier; HTTP and gRPC
-serving start only after recovery finishes.
+Both Python and Rust frontends expose the same opt-in HTTP API:
 
 ```bash
-vllm serve Qwen/Qwen3-0.6B --snapshot-control-dir /snapshot-control
+vllm serve Qwen/Qwen3-0.6B --enable-checkpoint
+
+curl --fail -X POST http://localhost:8000/checkpoint/prepare
+# {"state":"prepared"}
+
+# Capture the container. Later, restore the container and its external resources.
+curl --fail -X POST http://localhost:8000/checkpoint/resume
+# {"state":"running"}
 ```
 
-`VLLM_SNAPSHOT_CONTROL_DIR` or `SNAPSHOT_CONTROL_DIR` can supply the directory
-instead. An explicit CLI directory takes precedence. Without a directory the
-normal serving path is unchanged. The Rust frontend uses the same command with
-`VLLM_USE_RUST_FRONTEND=1` and `VLLM_RUST_FRONTEND_PATH` pointing to a binary built
-with checkpoint barrier support.
+The Rust frontend uses the same command with `VLLM_USE_RUST_FRONTEND=1` and
+`VLLM_RUST_FRONTEND_PATH` pointing to a binary built with checkpoint control
+support. The endpoints do not require `VLLM_SERVER_DEV_MODE`. If API keys are
+configured, all three checkpoint routes require the usual bearer token.
 
-This is a startup barrier for a fixed local process tree, including multiple
-Python API servers and local TP/PP/DP engines. It is not a live HTTP snapshot
-API. Headless, standalone Python gRPC, multi-port DP supervisors, Ray executors,
-elastic EP and remote engines are outside this launcher's barrier. A process
-tree being locally supported does not certify its checkpoint compatibility.
-The orchestrator owns that decision and must capture the entire tree, including
-its IPC connections. Checkpointing only the EngineCore subtree is insufficient.
+| Endpoint | Contract |
+| --- | --- |
+| `POST /checkpoint/prepare` | Close admission across all frontends, drain requests and response streams, pause all engines, apply the configured policy and synchronize workers. Return `{"state":"prepared"}` only after preparation completes. |
+| `POST /checkpoint/resume` | Recover resources on all engines, resume scheduling, then reopen frontend admission. Return `{"state":"running"}`. |
+| `GET /checkpoint/status` | Report `starting`, `running`, `preparing`, `prepared`, `resuming`, or `failed` without invoking GPU operations. |
+
+POST requests have no configuration payload. Policies are trusted workload code
+selected at startup, not code selected by an HTTP caller. Repeating prepare
+while prepared or resume while running is a no-op. Transitions are serialized
+across all API processes. Losing an HTTP connection does not cancel a transition;
+query status or retry the operation through a fresh connection. A policy failure
+returns HTTP 503, leaves admission closed, and reports `failed`; restart the
+workload rather than retrying partially executed resource hooks.
+
+During preparation and until recovery finishes, ordinary routes (including
+`/health` and development control endpoints) return HTTP 503. Checkpoint routes
+remain available. Use `/checkpoint/status` for CPU-only liveness while parked,
+and ordinary readiness/inference checks before sending traffic. Long-lived
+streams and WebSockets must finish or disconnect before preparation completes.
+Python Responses API background requests are also drained.
+
+Address the specific pod or serving instance, not a load-balanced service that
+might send prepare and resume to different instances. Wait for the complete
+prepare response before capturing. After restore, connect anew to the restored
+listener; the old external HTTP connection need not survive the checkpoint.
 
 ## Lifecycle and ownership
 
 ```mermaid
 sequenceDiagram
     participant O as External orchestrator
-    participant L as Python launcher
     participant F as All frontends (Python or Rust)
+    participant L as Python launcher coordinator
     participant E as All EngineCores and workers
-    F->>E: Connect and initialize
-    F->>L: Join startup barrier
+    O->>F: POST /checkpoint/prepare
+    F->>L: Prepare service
+    L->>F: Close admission and drain responses
     L->>F: Leader: pause_scheduler(wait, clear_cache)
-    F->>E: Broadcast pause, drain, synchronize
+    F->>E: Broadcast pause and synchronize
     L->>F: Leader: checkpoint_prepare(policy, options)
-    F->>E: Run policy on every core, synchronize workers
-    E-->>L: All preparation completed (via leader)
-    L-->>O: ready-for-snapshot
-    Note over L,E: Frontends parked; scheduling paused
-    O->>O: Prepare sharing, CUDA checkpoint, CRIU capture
-    O->>O: CRIU restore, CUDA restore/unlock, sharing restore
-    O-->>L: restore-complete
+    F->>E: Run policy on every core and synchronize
+    L-->>O: 200 prepared, via frontend
+    Note over F,E: HTTP control available; scheduling paused
+    O->>O: Capture entire container
+    O->>O: Restore container, CUDA and external sharing
+    O->>F: POST /checkpoint/resume (new connection)
+    F->>L: Resume service
     L->>F: Leader: checkpoint_restore()
-    F->>E: Recover every core's policy, synchronize
+    F->>E: Recover policy on every core and synchronize
     L->>F: Leader: resume_scheduler()
-    L->>F: Release all frontends to serve
+    L->>F: Reopen admission on all frontends
+    L-->>O: 200 running, via frontend
 ```
 
-The source removes stale readiness and release markers before initialization.
-It creates `ready-for-snapshot` only after every frontend has joined and every
-engine has prepared. It waits indefinitely for `restore-complete`; a timeout
-does not grant permission to resume CUDA work. Marker contents are opaque.
-Use a separate control directory for each independently captured container.
+The coordinator and its private Unix control sockets are captured with the
+entire process tree. It owns sequencing, not artifact storage or compatibility.
+Preparation does not create a snapshot or certify that a backend can capture
+the selected resources. The orchestrator owns those decisions.
 
-The orchestrator must remove an old `restore-complete` before restoring an image,
-including each reuse of that image. Internal barriers use inherited Unix sockets
-captured with the tree, rather than files that could retain an old release.
-When snapshot mode is enabled, `SNAPSHOT_RESTORE_STANDBY=1` makes a newly launched
-`vllm serve` placeholder idle before creating engines or touching the markers.
-It never initializes a second model; the restored source tree crosses the barrier.
+For ai-dynamo/snapshot, the agent owns cuinterpose coordination and native CUDA
+checkpoint interfaces. Preparation must complete before the agent tears down
+shared GPU mappings. The agent must finish CUDA restore/unlock **and** cuinterpose
+sharing reconstruction before calling resume. vLLM makes no cuinterpose control
+calls, reads no Snapshot-specific environment variables, and uses no readiness
+or release files for this API. The orchestrator supplies a destination standby
+process rather than launching a second inference engine before restore.
 
-For ai-dynamo/snapshot, the agent owns the cuinterpose coordinator and native CUDA
-checkpoint interfaces. Application preparation must finish before the agent
-tears down shared GPU mappings. On restore, the agent must finish CUDA restore
-and unlock **and** cuinterpose sharing reconstruction before writing
-`restore-complete`. vLLM makes no cuinterpose control calls. Existing communicator
-`checkpoint_prepare`/`checkpoint_restore` worker hooks are optional resource
-operations, not a replacement for this group barrier.
-
-`ready-for-snapshot` means workload preparation completed; it is not a manifest
-or a compatibility certificate. `restore-complete` means external resources are
-ready; vLLM recovery still follows. Normal serving health checks determine when
-traffic can return. No extra success report to the orchestrator is required.
+This API coordinates a fixed local process tree, including multiple Python API
+servers and local TP/PP/DP engines. Headless serving, gRPC serving, multi-port DP
+supervisors, Ray executors, elastic EP, and remote engines are outside its scope.
+Changed network endpoints and cross-node restore require backend integration
+and validation. Retaining a listener does not preserve the state of external
+clients or peers. The orchestrator must preserve or reconstruct the internal
+IPC connections and the service's configured listener address.
 
 ## Resource policies
 
@@ -87,12 +106,11 @@ with `--snapshot-policy-options` as a JSON object.
 The default `vllm.snapshot.lifecycle.ResidentPolicy` preserves weights, KV
 allocations, caches and communications. It relies on the orchestrator's backend
 to capture those resources. `--snapshot-clear-cache` independently clears prefix,
-multimodal and encoder caches during pause. Policy hooks must complete their
+multimodal and encoder caches during preparation. Hooks must finish their
 operations before returning and must leave scheduling paused. Use
-`core.collective_rpc` for actions that must execute inside GPU workers.
+`core.collective_rpc` for actions inside GPU workers.
 
-For example, an installed integration can opt into the existing communicator
-hooks without forcing them on every checkpoint backend:
+For example, an installed integration can opt into existing communicator hooks:
 
 ```python
 # my_integration/checkpoint.py
@@ -111,46 +129,37 @@ class CommunicationPolicy:
 
 ```bash
 vllm serve Qwen/Qwen3-0.6B \
-  --snapshot-control-dir /snapshot-control \
+  --enable-checkpoint \
   --snapshot-policy my_integration.checkpoint.CommunicationPolicy \
   --snapshot-policy-options '{"release_communications": true}'
 ```
 
 These hooks implement the communicators' existing behavior; they do not promise
 to destroy and recreate every NCCL resource. A backend-specific policy can
-instead release other resources, reload selected state, or read externally
-updated configuration during recovery. Installed policy code is trusted workload
-code, like a worker extension. It does not need a wrapper around `vllm serve`.
+release other resources, reload selected state, or read externally updated
+configuration during recovery. It requires no wrapper around `vllm serve`.
 
 ## Common APIs and the local snapshot implementation
 
-| Seam | Common workload responsibility | Consumer-specific responsibility |
-| --- | --- | --- |
-| `vllm/snapshot/lifecycle/coordinator.py` | Aggregate frontend participation, prepare, park, recover, then serve | No artifact management |
-| `vllm/snapshot/lifecycle/signaling.py` | `CheckpointSignal.ready()` / `wait_for_restore()`; file implementation for the workload contract | Orchestrator creates snapshots and supplies the release |
-| `vllm/snapshot/lifecycle/policy.py` | Paired resource-policy interface and resident default | Select resource hooks and constructor options |
-| `vllm/v1/engine/core.py` | `checkpoint_prepare(policy, options)` / `checkpoint_restore()` utility RPCs | No identity, model-output or manifest checks |
-| `vllm/entrypoints/cli/serve.py` | Launcher owns the barrier and monitors its processes | Opt-in startup configuration |
-| `vllm/entrypoints/launchers/api_server/entry.py` | Python participant before `build_and_serve` | Existing Python HTTP serving |
-| `rust/src/server/src/checkpoint.rs` | Rust participant, using the same EngineCore utility RPCs | Existing Rust HTTP/gRPC serving |
-| `vllm/snapshot/policies.py` | Implements the common resource protocol | Local `ReloadWeightsPolicy`: discard and reload |
-| `vllm/snapshot/server.py` | Calls the common EngineCore resource API | Local canary, rehearsal, JSON release and listener configuration |
-| `vllm/snapshot/controller.py`, `runtime.py`, `manifest.py` | None; common lifecycle modules do not import them | Local CRIU/CUDA tooling, storage, manifests, identity checks and oracle validation |
+| Module | Responsibility |
+| --- | --- |
+| `vllm/snapshot/lifecycle/coordinator.py` | Common service-wide preparation/recovery ordering and state; one leader broadcasts EngineCore calls. |
+| `vllm/snapshot/lifecycle/channel.py` | Private duplex control transport between the launcher and Python frontends. Rust implements the same protocol. |
+| `vllm/snapshot/lifecycle/frontend.py` | Python HTTP adapter, admission gate and response/background-request drain. |
+| `rust/src/server/src/checkpoint.rs` | Rust HTTP adapter, response-body admission tracking and EngineCore utility calls. |
+| `vllm/snapshot/lifecycle/policy.py` | Common paired resource-policy interface and resident default. |
+| `vllm/v1/engine/core.py` | Common `checkpoint_prepare(policy, options)` / `checkpoint_restore()` utility RPCs. |
+| `vllm/snapshot/policies.py` | Local `ReloadWeightsPolicy`: discard and reload. |
+| `vllm/snapshot/server.py` | Local canary/rehearsal and JSON release protocol; calls the common EngineCore resource API. |
+| `vllm/snapshot/controller.py`, `runtime.py`, `manifest.py` | Local artifact management, CRIU/CUDA tooling, identity checks and oracle validation. |
 
 The existing `AsyncLLM.checkpoint_prepare()` and `checkpoint_restore()` methods
-remain worker-communicator helpers. The new EngineCore utility methods have a
-different scope: a selected resource policy, invoked after a completed group
-pause. The coordinator broadcasts recovery to every engine before broadcasting
-resume. Policies should use executor resource methods rather than
-`EngineCore.wake_up()`, which can resume scheduling automatically.
+remain worker-communicator helpers. The EngineCore utility methods run a selected
+resource policy after a completed pause. Rust calls those utilities directly;
+it does not use AsyncLLM. Policies should use executor resource methods rather
+than `EngineCore.wake_up()`, which can resume scheduling automatically.
 
-`vllm snapshot create/restore` retains its local compatibility and canary checks.
-Its child selects `ReloadWeightsPolicy` through the common EngineCore API, while
-retaining its existing control-file schema and artifact controller. It does not
-use the `vllm serve` frontend-group coordinator. ai-dynamo/snapshot does not
-inherit this local controller, policy, manifest, rehearsal, or validation logic.
-
-The startup path includes normal model initialization and engine warmup. It does
-not force the local snapshot server's extra canary generation or rehearsal.
-Live capture, changed network endpoint reconstruction, and cross-node recovery
-require additional integration and backend validation.
+`vllm snapshot create/restore` retains its local compatibility checks, canary,
+control-file schema and controller. Its child selects `ReloadWeightsPolicy`
+through the common EngineCore API. ai-dynamo/snapshot does not inherit that
+policy, manifest, rehearsal, validation logic or file protocol.

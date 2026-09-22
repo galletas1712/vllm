@@ -216,14 +216,22 @@ where
         result = build_state(&config) => result?,
         _ = shutdown.cancelled() => return Ok(()),
     };
-    if let Some(fd) = config.checkpoint_control_fd {
-        tokio::select! {
-            result = checkpoint::join(fd, state.engine_core_client()) => result?,
-            _ = shutdown.cancelled() => return Ok(()),
-        }
-    }
     let model = state.primary_model_name().to_owned();
-    let app = extend_router(build_router(state.clone()));
+    let mut app = extend_router(build_router(state.clone()));
+    let _checkpoint_task = if let Some(fd) = config.checkpoint_control_fd {
+        anyhow::ensure!(
+            config.grpc_port.is_none(),
+            "checkpoint control requires HTTP-only serving"
+        );
+        let (checkpoint, task) = tokio::select! {
+            result = checkpoint::connect(fd, state.clone(), shutdown.clone()) => result?,
+            _ = shutdown.cancelled() => return Ok(()),
+        };
+        app = checkpoint::attach(app, checkpoint, state.clone());
+        Some(task)
+    } else {
+        None
+    };
 
     info!(model, "starting vLLM server");
 

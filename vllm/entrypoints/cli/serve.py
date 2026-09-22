@@ -3,11 +3,9 @@
 
 import argparse
 import asyncio
-import os
 import signal
 import time
 from contextlib import closing
-from pathlib import Path
 
 import uvloop
 
@@ -62,19 +60,10 @@ class ServeSubcommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
-        args.snapshot_control_dir = (
-            getattr(args, "snapshot_control_dir", None)
-            or os.getenv("VLLM_SNAPSHOT_CONTROL_DIR")
-            or os.getenv("SNAPSHOT_CONTROL_DIR")
-        )
-        if args.snapshot_control_dir:
-            # A restore placeholder must not create a second engine or remove
-            # markers belonging to the process tree about to be restored.
-            if os.getenv("SNAPSHOT_RESTORE_STANDBY") == "1":
-                while True:
-                    signal.pause()
+        args.enable_checkpoint = getattr(args, "enable_checkpoint", False)
+        if args.enable_checkpoint:
             if args.headless or getattr(args, "grpc", False):
-                raise ValueError("Startup checkpointing requires vllm serve HTTP")
+                raise ValueError("Checkpoint control requires vllm serve HTTP")
             if not isinstance(args.snapshot_policy_options, dict):
                 raise ValueError("--snapshot-policy-options must be a JSON object")
 
@@ -166,15 +155,13 @@ class ServeSubcommand(CLISubcommand):
             )
             args.api_server_count = 1
 
-        if args.snapshot_control_dir and (is_multi_port or args.api_server_count < 1):
-            raise ValueError("Startup checkpointing requires one local serve launcher")
+        if args.enable_checkpoint and (is_multi_port or args.api_server_count < 1):
+            raise ValueError("Checkpoint control requires one local serve launcher")
         if is_multi_port:
             run_dp_supervisor(args)
         elif args.api_server_count < 1:
             run_headless(args)
-        elif (
-            args.api_server_count > 1 or rust_frontend_path or args.snapshot_control_dir
-        ):
+        elif args.api_server_count > 1 or rust_frontend_path or args.enable_checkpoint:
             run_multi_api_server(args)
         else:
             # Single API server (this process).
@@ -292,22 +279,17 @@ def run_headless(args: argparse.Namespace):
 
 
 def run_multi_api_server(args: argparse.Namespace):
-    if not getattr(args, "snapshot_control_dir", None):
+    if not getattr(args, "enable_checkpoint", False):
         _run_multi_api_server(args)
         return
 
     from vllm.snapshot.lifecycle.coordinator import CheckpointCoordinator
-    from vllm.snapshot.lifecycle.signaling import FileCheckpointSignal
 
-    checkpoint_signal = FileCheckpointSignal(Path(args.snapshot_control_dir))
-    checkpoint_signal.start_capture()
     with closing(CheckpointCoordinator(args.api_server_count)) as checkpoint:
-        _run_multi_api_server(args, checkpoint, checkpoint_signal)
+        _run_multi_api_server(args, checkpoint)
 
 
-def _run_multi_api_server(
-    args: argparse.Namespace, checkpoint=None, checkpoint_signal=None
-):
+def _run_multi_api_server(args: argparse.Namespace, checkpoint=None):
     assert not args.headless
     rust_frontend_path = (
         envs.VLLM_RUST_FRONTEND_PATH if envs.VLLM_USE_RUST_FRONTEND else None
@@ -361,7 +343,7 @@ def _run_multi_api_server(
         or parallel_config.distributed_executor_backend == "ray"
         or parallel_config.enable_elastic_ep
     ):
-        raise ValueError("Startup checkpointing requires a fixed, local process tree")
+        raise ValueError("Checkpoint control requires a fixed, local process tree")
     dp_rank = parallel_config.data_parallel_rank
     assert parallel_config.local_engines_only or dp_rank == 0
 
@@ -449,10 +431,9 @@ def _run_multi_api_server(
         if checkpoint is not None:
             checkpoint.close_frontend_sockets()
 
-            async def prepare_checkpoint():
+            async def serve_checkpoint_control():
                 task = asyncio.create_task(
                     checkpoint.run(
-                        checkpoint_signal,
                         policy=args.snapshot_policy,
                         options=args.snapshot_policy_options,
                         clear_cache=args.snapshot_clear_cache,
@@ -479,12 +460,13 @@ def _run_multi_api_server(
                         task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
 
-            uvloop.run(prepare_checkpoint())
-        wait_for_completion_or_failure(
-            api_server_manager=api_server_manager,
-            engine_manager=local_engine_manager,
-            coordinator=coordinator,
-        )
+            uvloop.run(serve_checkpoint_control())
+        else:
+            wait_for_completion_or_failure(
+                api_server_manager=api_server_manager,
+                engine_manager=local_engine_manager,
+                coordinator=coordinator,
+            )
     finally:
         timeout = shutdown_by = None
         if shutdown_requested:
