@@ -110,6 +110,12 @@ multimodal and encoder caches during preparation. Hooks must finish their
 operations before returning and must leave scheduling paused. Use
 `core.collective_rpc` for actions inside GPU workers.
 
+`vllm.snapshot.policies.OffloadWeightsPolicy` captures less GPU state. It clears
+the prefix, multimodal and encoder caches, runs the communicators'
+`checkpoint_prepare` hooks and sleeps at level 1, which offloads weights to host
+memory and discards the KV cache. Recovery wakes the executor and runs
+`checkpoint_restore`. It requires `--enable-sleep-mode`.
+
 For example, an installed integration can opt into existing communicator hooks:
 
 ```python
@@ -149,7 +155,7 @@ configuration during recovery. It requires no wrapper around `vllm serve`.
 | `rust/src/server/src/checkpoint.rs` | Rust HTTP adapter, response-body admission tracking and EngineCore utility calls. |
 | `vllm/snapshot/lifecycle/policy.py` | Common paired resource-policy interface and resident default. |
 | `vllm/v1/engine/core.py` | Common `checkpoint_prepare(policy, options)` / `checkpoint_restore()` utility RPCs. |
-| `vllm/snapshot/policies.py` | Local `ReloadWeightsPolicy`: discard and reload. |
+| `vllm/snapshot/policies.py` | `OffloadWeightsPolicy`: sleep level 1 and communicator hooks. Local `ReloadWeightsPolicy`: discard and reload. |
 | `vllm/snapshot/server.py` | Local canary/rehearsal and JSON release protocol; calls the common EngineCore resource API. |
 | `vllm/snapshot/controller.py`, `runtime.py`, `manifest.py` | Local artifact management, CRIU/CUDA tooling, identity checks and oracle validation. |
 

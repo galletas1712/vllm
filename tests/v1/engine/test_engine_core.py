@@ -741,6 +741,34 @@ def test_checkpoint_resource_policy_keeps_scheduler_paused(policy):
     )
 
 
+def test_checkpoint_offload_weights_policy_clears_caches_before_sleeping():
+    """Level-1 sleep discards KV blocks, so caches go first and restore is LIFO."""
+    order = []
+    core = _pausable_engine_core_proc()
+    core._checkpoint_policy = None
+    core._reset_caches = MagicMock(side_effect=lambda: order.append("reset_caches"))
+    core.scheduler.pause_state = PauseState.PAUSED_ALL
+    core.scheduler.has_unfinished_requests.return_value = False
+    core.model_executor.sleep.side_effect = lambda level: order.append(f"sleep{level}")
+    core.model_executor.wake_up.side_effect = lambda: order.append("wake_up")
+    rpc = core.model_executor.collective_rpc
+    rpc.side_effect = lambda method, *_: order.append(method)
+
+    core.checkpoint_prepare("vllm.snapshot.policies.OffloadWeightsPolicy", {})
+    core.checkpoint_restore()
+
+    assert order == [
+        "reset_caches",
+        "checkpoint_prepare",
+        "sleep1",
+        "synchronize_device",
+        "wake_up",
+        "checkpoint_restore",
+        "synchronize_device",
+    ]
+    core.scheduler.set_pause_state.assert_not_called()
+
+
 def test_checkpoint_custom_policy_keeps_constructor_options_and_prepared_state(
     monkeypatch,
 ):
