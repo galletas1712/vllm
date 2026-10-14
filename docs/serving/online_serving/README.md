@@ -175,6 +175,7 @@ For further details on derenderer APIs, please refer to [this page](derenderer.m
 
 For external checkpoint/restore orchestrators. Requires `--enable-sleep-mode`.
 `--checkpoint-prepare-on-startup` prepares once the engines start.
+`--checkpoint-offload-weights` also offloads weights to host memory during prepare.
 
 - `/checkpoint/prepare` - Drain requests, then release KV cache memory and communicator state (causes denial of service)
 - `/checkpoint/resume` - Rebuild released state and resume generation

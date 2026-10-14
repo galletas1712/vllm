@@ -698,6 +698,8 @@ def _pausable_engine_core_proc() -> EngineCoreProc:
     core.batch_queue = None
     core.engines_running = False
     core._idle_state_callbacks = []
+    core.vllm_config = MagicMock()
+    core.vllm_config.model_config.checkpoint_offload_weights = False
     return core
 
 
@@ -781,6 +783,34 @@ def test_checkpoint_releases_communicators_after_drain(deferred: bool):
         "synchronize_device",
         "checkpoint_restore",
         "wake_up:['kv_cache']",
+    ]
+
+
+def test_checkpoint_offloads_weights_after_kv_cache_release():
+    """Weights go to host memory after the KV cache is released and wake with
+    it after communicators are rebuilt."""
+    core = _pausable_engine_core_proc()
+    core._checkpoint = None
+    core.vllm_config.model_config.checkpoint_offload_weights = True
+    order: list[str] = []
+    core.model_executor.collective_rpc.side_effect = lambda method, *_: order.append(
+        method
+    )
+    core.model_executor.sleep.side_effect = lambda level: order.append(f"sleep:{level}")
+    core.release_kv_cache_memory = lambda: order.append("release_kv_cache_memory")
+    core.wake_up = lambda tags: order.append(f"wake_up:{tags}")
+
+    assert core.checkpoint_prepare().result(timeout=0) is None
+    core.checkpoint_restore()
+
+    assert order == [
+        "synchronize_device",
+        "release_kv_cache_memory",
+        "sleep:1",
+        "checkpoint_prepare",
+        "synchronize_device",
+        "checkpoint_restore",
+        "wake_up:['weights', 'kv_cache']",
     ]
 
 

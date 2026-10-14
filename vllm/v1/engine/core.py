@@ -1043,7 +1043,8 @@ class EngineCore:
     def checkpoint_prepare(self) -> Future[None]:
         """Prepare for an external process checkpoint: drain in-flight
         requests, then release KV cache memory and communicator state.
-        Weights stay resident. Requests added meanwhile wait for restore.
+        Weights stay resident unless checkpoint_offload_weights is set.
+        Requests added meanwhile wait for restore.
         Repeated calls return the same future.
         """
         if self._checkpoint is None:
@@ -1064,6 +1065,8 @@ class EngineCore:
             if pause is not None:
                 pause.result()
             self.release_kv_cache_memory()
+            if self.vllm_config.model_config.checkpoint_offload_weights:
+                self.model_executor.sleep(level=1)
             self.collective_rpc("checkpoint_prepare")
             self.collective_rpc("synchronize_device")
         except Exception as e:
@@ -1082,7 +1085,10 @@ class EngineCore:
         self._checkpoint.result()
         # Communicators must be usable before wake_up resumes scheduling.
         self.collective_rpc("checkpoint_restore")
-        self.wake_up(["kv_cache"])
+        if self.vllm_config.model_config.checkpoint_offload_weights:
+            self.wake_up(["weights", "kv_cache"])
+        else:
+            self.wake_up(["kv_cache"])
         self._checkpoint = None
 
     def is_checkpoint_prepared(self) -> bool:
