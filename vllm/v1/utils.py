@@ -875,3 +875,12 @@ def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDet
         num_encoder_inputs,
         num_encoder_output_tokens,
     )
+
+
+def apply_restore_context(env: dict[str, str | None], flags: dict[str, Any]) -> None:
+    """Make this process match the pod it was restored into, whose environment
+    may differ from the captured one. Engine arguments describe state captured
+    with the process, so none can change yet. Raises before any change."""
+    if flags:
+        raise ValueError(f"Engine arguments {sorted(flags)} cannot change on restore")
+    envs.update_environ(env)

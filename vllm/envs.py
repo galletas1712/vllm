@@ -2341,6 +2341,20 @@ def disable_envs_cache() -> None:
         __getattr__ = __getattr__.__wrapped__
 
 
+def update_environ(env: dict[str, str | None]) -> None:
+    """Change the environment after service initialization, such as to the
+    environment of the pod a checkpointed process was restored into. A None
+    value unsets the variable. Values cached by enable_envs_cache() refresh."""
+    for name, value in env.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    if _is_envs_cache_enabled():
+        disable_envs_cache()
+        enable_envs_cache()
+
+
 def __dir__():
     return list(environment_variables.keys())
 

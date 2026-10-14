@@ -48,7 +48,7 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
-from vllm.v1.engine import EngineCoreRequest, PauseMode
+from vllm.v1.engine import CheckpointState, EngineCoreRequest, PauseMode
 from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -65,6 +65,7 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.utils import apply_restore_context
 
 logger = init_logger(__name__)
 
@@ -207,10 +208,13 @@ class AsyncLLM(EngineClient):
         self._client_count = client_count
 
         self.output_handler: asyncio.Task | None = None
+        self._restore_watcher: asyncio.Task | None = None
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
             self._run_output_handler()
+            if self.model_config.checkpoint_prepare_on_startup:
+                self._restore_watcher = asyncio.create_task(self._apply_restored_env())
         except RuntimeError:
             pass
 
@@ -306,6 +310,9 @@ class AsyncLLM(EngineClient):
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+
+        if (watcher := getattr(self, "_restore_watcher", None)) is not None:
+            cancel_task_threadsafe(watcher)
 
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()
@@ -1175,10 +1182,29 @@ class AsyncLLM(EngineClient):
         return fully_awake
 
     async def checkpoint_prepare(self) -> None:
-        await self.collective_rpc("checkpoint_prepare")
+        await self.engine_core.checkpoint_prepare_async()
 
-    async def checkpoint_restore(self) -> None:
-        await self.collective_rpc("checkpoint_restore")
+    async def checkpoint_restore(
+        self,
+        env: dict[str, str | None] | None = None,
+        flags: dict[str, Any] | None = None,
+    ) -> None:
+        apply_restore_context(env or {}, flags or {})
+        await self.engine_core.checkpoint_restore_async(env, flags)
+
+    async def _apply_restored_env(self) -> None:
+        """Apply the environment and flags of a restore in this API server,
+        which may not be the one that received POST /checkpoint/resume."""
+        env, flags = await self.engine_core.checkpoint_restored_async()
+        logger.info(
+            "Applying the restore environment %s and flags %s",
+            sorted(env),
+            sorted(flags),
+        )
+        apply_restore_context(env, flags)
+
+    async def checkpoint_state(self) -> tuple[CheckpointState, str | None]:
+        return await self.engine_core.checkpoint_state_async()
 
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()

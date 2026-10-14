@@ -40,6 +40,30 @@ EEP_NOTIFICATION_CALL_ID = -1
 FT_STATUS_CALL_ID = -2
 
 
+class CheckpointState(enum.StrEnum):
+    """Process checkpoint lifecycle of an engine. Scheduling runs only while
+    RUNNING."""
+
+    RUNNING = "running"
+    # Draining and releasing state at startup.
+    PREPARING = "preparing"
+    # Safe to capture.
+    PREPARED = "prepared"
+    # Restored, with scheduling not yet resumed.
+    RESUMING = "resuming"
+    FAILED = "failed"
+
+    @property
+    def is_restored(self) -> bool:
+        """Whether external state is back, so memory may wake and scheduling
+        may resume."""
+        return self in (CheckpointState.RUNNING, CheckpointState.RESUMING)
+
+
+# The environment and engine arguments of the pod a checkpoint is restored into.
+RestoreContext = tuple[dict[str, str | None], dict[str, Any]]
+
+
 class EEPNotificationType(enum.Enum):
     RECONFIGURE_FINISHED = "RECONFIGURE_FINISHED"
     SHUTDOWN_COMPLETE = "SHUTDOWN_COMPLETE"
@@ -104,6 +128,8 @@ class EngineCoreReadyResponse:
     supports_draft_weight_updates: bool = False
     # Full-attention block size in tokens after initialization, or unavailable.
     effective_attention_block_size: int | None = None
+    # Whether the engine serves only after /checkpoint/resume.
+    checkpoint_prepare_on_startup: bool = False
 
 
 class EngineCoreRequest(
