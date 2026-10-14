@@ -15,7 +15,7 @@ from vllm.distributed.device_communicators.shm_broadcast import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
-from vllm.v1.kv_offload.cpu.host_register import host_unregister
+from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
 
 logger = init_logger(__name__)
 
@@ -210,6 +210,8 @@ class SharedOffloadRegion:
         self._canonical_offset = 0
         self.is_pinned: bool = False
         self.pinned_addresses: list[int] = []
+        # (start, end) of the registrations release_pages() dropped.
+        self._released_pins: list[tuple[int, int]] = []
 
         if populate_only_on_creator:
             return
@@ -352,7 +354,36 @@ class SharedOffloadRegion:
         )
         return memoryview(np_arr)
 
-    def cleanup(self) -> None:
+    def release_pages(self) -> None:
+        """Unpin and free the backing pages, keeping the mapping and addresses.
+        repin() registers the same ranges again.
+
+        Contents are lost. Pages fault back in, zeroed, on next use; pinning
+        again populates them. Freeing is shared by every worker mapping the
+        region, so repeated calls are harmless.
+        """
+        if self.is_pinned and self._base is not None:
+            # Registrations tile the region from its base, so each one ends
+            # where the next begins.
+            base_ptr = self._base.data_ptr()
+            starts = self.pinned_addresses or [base_ptr]
+            assert starts[0] == base_ptr
+            ends = [*starts[1:], base_ptr + self.total_size_bytes]
+            self._released_pins = list(zip(starts, ends))
+        self._unpin()
+        assert self.mmap_obj is not None
+        self.mmap_obj.madvise(mmap.MADV_REMOVE, 0, self.total_size_bytes)
+
+    def repin(self) -> None:
+        """Register again what release_pages() unpinned, at the same addresses."""
+        for start, end in self._released_pins:
+            if not host_register(start, end - start):
+                raise RuntimeError(f"Failed to pin {end - start} bytes again")
+            self.pinned_addresses.append(start)
+            self.is_pinned = True
+        self._released_pins = []
+
+    def _unpin(self) -> None:
         if self.is_pinned and self._base is not None:
             base_ptr = self._base.data_ptr()
             addresses = self.pinned_addresses or [base_ptr]
@@ -360,6 +391,9 @@ class SharedOffloadRegion:
                 host_unregister(address)
             self.pinned_addresses.clear()
             self.is_pinned = False
+
+    def cleanup(self) -> None:
+        self._unpin()
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts
         # drop so the storage (which holds the mmap_obj buffer export) is freed

@@ -326,6 +326,14 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
 
+    def unregister_kv_caches(self) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.unregister_kv_caches()
+
+    def restore_kv_caches(self) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.restore_kv_caches()
+
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """Get the KVConnector handshake metadata for this connector.
         This metadata is used for out-of-band connector handshake
@@ -348,6 +356,12 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
 
 class NixlPullConnector(NixlBaseConnector):
     """Pull-based (READ) NIXL KV transfer connector."""
+
+    @classmethod
+    def supports_checkpoint(cls, kv_transfer_config: KVTransferConfig) -> bool:
+        # Re-registered KV memory needs a new engine id so peers re-handshake;
+        # only the checkpoint lifecycle provides one.
+        return True
 
     def __init__(
         self,

@@ -77,6 +77,7 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.checkpoint_resources import register_checkpoint_resource
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -641,7 +642,15 @@ class NixlBaseConnectorWorker:
                 else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)
             )
 
-        self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
+        # Agent names must be unique per process image; a restored copy gets a new one.
+        self._new_nixl_wrapper = lambda: nixl_wrapper_cls(str(uuid.uuid4()), config)
+        # UCX caches network state, such as routes by interface index, for the
+        # life of the process. A checkpointed process restores into another
+        # network namespace, so an engine that prepares at startup creates its
+        # agent only after restore.
+        self._has_agent = not vllm_config.model_config.checkpoint_prepare_on_startup
+        if self._has_agent:
+            self.nixl_wrapper = self._new_nixl_wrapper()
         # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.
         # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).
         self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = defaultdict(
@@ -921,6 +930,7 @@ class NixlBaseConnectorWorker:
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
         )
+        register_checkpoint_resource(self)
 
     def _validate_remote_parallel_config(
         self, agent_metadata: NixlAgentMetadata
@@ -1442,6 +1452,7 @@ class NixlBaseConnectorWorker:
         track_region_layers = self._tracks_region_layers()
         region_layers: list[list[str]] = []
         packed_member_layouts: dict[str, tuple[int, int]] = {}
+        self._packed_member_layouts = packed_member_layouts
 
         # K and V are packed into the content dim, so each attention layer is a
         # single NIXL region whose block transfers as one unit. Mamba layers instead
@@ -1732,10 +1743,8 @@ class NixlBaseConnectorWorker:
                 "Mixed-device KV registration is only supported for MLA "
                 "models without Mamba layers."
             )
-        for mem_type in sorted(set(region_mem_types)):
-            if mem_type == "DRAM" and self._skip_dram_xfer:
-                continue
-            ranges_for_mem_type = [
+        self._registration_ranges = {
+            mem_type: [
                 (start, end - start, device_id, "")
                 for (_, cache_mem_type), (
                     start,
@@ -1744,9 +1753,9 @@ class NixlBaseConnectorWorker:
                 ) in registration_ranges.items()
                 if cache_mem_type == mem_type
             ]
-            descs = self.nixl_wrapper.get_reg_descs(ranges_for_mem_type, mem_type)
-            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
-            self._registered_descs.append(descs)
+            for mem_type in sorted(set(region_mem_types))
+            if not (mem_type == "DRAM" and self._skip_dram_xfer)
+        }
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
@@ -1770,6 +1779,16 @@ class NixlBaseConnectorWorker:
                 self._mamba_ssm_size,
                 set(self.block_len_per_layer),
             )
+
+        if self._has_agent:
+            self._register_with_nixl()
+
+    def _register_with_nixl(self) -> None:
+        """Register the KV regions with the agent and build the handshake payload."""
+        for mem_type, ranges in self._registration_ranges.items():
+            descs = self.nixl_wrapper.get_reg_descs(ranges, mem_type)
+            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+            self._registered_descs.append(descs)
 
         # Register local/src descr for NIXL xfer.
         self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
@@ -1802,7 +1821,7 @@ class NixlBaseConnectorWorker:
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
             region_members=self.region_members,
-            packed_member_layouts=packed_member_layouts,
+            packed_member_layouts=self._packed_member_layouts,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -3730,6 +3749,16 @@ class NixlBaseConnectorWorker:
             self.shutdown()
 
     def _finish_shutdown(self) -> None:
+        try:
+            self._release_nixl_state()
+        finally:
+            # Drop cache references before their owners release registered
+            # host memory; handshake futures may outlive model-runner shutdown.
+            self.device_kv_caches = {}
+            self.host_xfer_buffers = {}
+
+    def _release_nixl_state(self) -> None:
+        """Release local handles, remote peers and memory registrations."""
         self._recving_transfers.clear()
         try:
             for handle in self.src_xfer_handles_by_block_size.values():
@@ -3760,10 +3789,53 @@ class NixlBaseConnectorWorker:
                 self.nixl_wrapper.deregister_memory(desc)
         finally:
             self._registered_descs.clear()
-            # Drop cache references before their owners release registered
-            # host memory; handshake futures may outlive model-runner shutdown.
-            self.device_kv_caches = {}
-            self.host_xfer_buffers = {}
+
+    def unregister_kv_caches(self) -> None:
+        """Forget every peer and drop registrations before KV memory is unmapped.
+
+        Requests are drained, so no transfer handle is outstanding. Peers
+        re-handshake on their next request.
+        """
+        if self._registered_descs:
+            self._release_nixl_state()
+            self.xfer_handshake_metadata = None
+
+    def restore_kv_caches(self) -> None:
+        """Register the remapped KV regions, which keep their addresses."""
+        if self._has_agent and not self._registered_descs:
+            self._register_with_nixl()
+
+    @property
+    def restartable(self) -> bool:
+        # Destroying an agent does not reset UCX's process-wide network caches,
+        # which are wrong in the namespace the process is restored into.
+        return not self._has_agent
+
+    def checkpoint_prepare(self) -> None:
+        pass
+
+    def checkpoint_restore(self) -> None:
+        """Create the agent under the restored engine id. Several replicas may
+        restore from one checkpoint, and peers cache metadata by engine id."""
+        if self._has_agent:
+            return
+        self.nixl_wrapper = self._new_nixl_wrapper()
+        self._has_agent = True
+        engine_id = self.kv_transfer_config.engine_id
+        assert engine_id is not None
+        own_state: tuple[dict[EngineId, Any], ...] = (
+            self.kv_caches_base_addr,
+            self.dst_num_blocks,
+            self.dst_region_num_blocks,
+            self.dst_region_group_ids,
+            self.dst_uses_region_group_mapping,
+            self.dst_region_mem_types,
+        )
+        for state in own_state:
+            state[engine_id] = state.pop(self.engine_id)
+        if self.transfer_topo is not None:
+            self.transfer_topo.engine_id = engine_id
+        self.engine_id = engine_id
 
     def shutdown(self) -> None:
         """Shutdown the connector worker."""

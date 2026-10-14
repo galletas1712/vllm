@@ -1189,7 +1189,7 @@ class AsyncLLM(EngineClient):
         env: dict[str, str | None] | None = None,
         flags: dict[str, Any] | None = None,
     ) -> None:
-        apply_restore_context(env or {}, flags or {})
+        apply_restore_context(self.vllm_config, env or {}, flags or {})
         await self.engine_core.checkpoint_restore_async(env, flags)
 
     async def _apply_restored_env(self) -> None:
@@ -1201,7 +1201,7 @@ class AsyncLLM(EngineClient):
             sorted(env),
             sorted(flags),
         )
-        apply_restore_context(env, flags)
+        apply_restore_context(self.vllm_config, env, flags)
 
     async def checkpoint_state(self) -> tuple[CheckpointState, str | None]:
         return await self.engine_core.checkpoint_state_async()

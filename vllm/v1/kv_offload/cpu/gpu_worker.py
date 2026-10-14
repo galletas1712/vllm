@@ -16,6 +16,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.checkpoint_resources import register_checkpoint_resource
 from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
     CanonicalKVCacheRef,
@@ -782,6 +783,8 @@ class CPUOffloadingWorker(OffloadingWorker):
         # successful construction, the worker is the sole owner and releases
         # it after both transfer directions have stopped.
         self._mmap_region = mmap_region
+        if mmap_region is not None:
+            register_checkpoint_resource(self)
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
@@ -865,6 +868,16 @@ class CPUOffloadingWorker(OffloadingWorker):
 
     def get_finished(self) -> list[TransferResult]:
         return self._store_handler.get_finished() + self._load_handler.get_finished()
+
+    def checkpoint_prepare(self) -> None:
+        assert self._mmap_region is not None
+        # Copies run on side streams. The pages must be idle before release.
+        torch.accelerator.synchronize()
+        self._mmap_region.release_pages()
+
+    def checkpoint_restore(self) -> None:
+        assert self._mmap_region is not None
+        self._mmap_region.repin()
 
     def wait(self, job_ids: set[int]) -> None:
         self._store_handler.wait(job_ids)

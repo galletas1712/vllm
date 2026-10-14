@@ -6,6 +6,7 @@ import queue
 import signal
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
@@ -50,6 +51,10 @@ from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.v1.checkpoint_resources import (
+    prepare_checkpoint_resources,
+    restore_checkpoint_resources,
+)
 from vllm.v1.core.kv_cache_planning import get_kv_cache_configs
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -198,22 +203,7 @@ class EngineCore:
         # handshake metadata from all workers so the connector in the scheduler
         # will have the full context
         kv_connector = self.scheduler.get_kv_connector()
-        if kv_connector is not None:
-            # Collect and store KV connector xfer metadata from workers
-            # (after KV cache registration)
-            xfer_handshake_metadata = (
-                self.model_executor.get_kv_connector_handshake_metadata()
-            )
-
-            if xfer_handshake_metadata:
-                # xfer_handshake_metadata is list of dicts from workers
-                # Each dict already has structure {(pp_rank, tp_rank): metadata}
-                # Merge all worker dicts into a single dict
-                content: dict[tuple[int, int], Any] = {}
-                for worker_dict in xfer_handshake_metadata:
-                    if worker_dict is not None:
-                        content.update(worker_dict)
-                kv_connector.set_xfer_handshake_metadata_pp_aware(content)
+        self._publish_kv_connector_handshake_metadata()
 
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
@@ -988,6 +978,8 @@ class EngineCore:
                 documentation of pause_scheduler method.
 
         """
+        if level >= 1:
+            self._check_kv_connector_sleep()
         # Pause scheduler before sleeping.
         clear_prefix_cache = level >= 1
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
@@ -1031,6 +1023,10 @@ class EngineCore:
 
         if tags is None or tags:
             self.model_executor.wake_up(tags)
+            if tags is None or "kv_cache" in tags:
+                # A connector restored from a checkpoint registers its KV cache
+                # only now, and peers must reach it before requests schedule.
+                self._publish_kv_connector_handshake_metadata()
 
         # Partial wakes intentionally keep the remaining allocations asleep.
         # Resume scheduling only once all executor memory is resident again.
@@ -1055,12 +1051,46 @@ class EngineCore:
             raise RuntimeError(
                 "release_kv_cache_memory() requires a completed pause first"
             )
+        self._check_kv_connector_sleep()
         if self.model_executor.is_sleeping:
             raise RuntimeError(
                 "release_kv_cache_memory() requires all executor memory to be resident"
             )
         self._reset_caches()
         self.model_executor.discard(("kv_cache",))
+
+    def _check_kv_connector_sleep(self) -> None:
+        """A connector that cannot follow a KV cache remap releases it only to
+        checkpoint at startup, which restores it under a new identity."""
+        kv_connector = self.scheduler.get_kv_connector()
+        if kv_connector is None or self._checkpoint_state == CheckpointState.PREPARING:
+            return
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        if not kv_connector.supports_sleep_mode(kv_transfer_config):
+            raise RuntimeError(
+                f"{type(kv_connector).__name__} releases the KV cache only to "
+                "checkpoint at startup"
+            )
+
+    def _publish_kv_connector_handshake_metadata(self) -> None:
+        kv_connector = self.scheduler.get_kv_connector()
+        if kv_connector is not None:
+            # Collect and store KV connector xfer metadata from workers
+            # (after KV cache registration)
+            xfer_handshake_metadata = (
+                self.model_executor.get_kv_connector_handshake_metadata()
+            )
+
+            if xfer_handshake_metadata:
+                # xfer_handshake_metadata is list of dicts from workers
+                # Each dict already has structure {(pp_rank, tp_rank): metadata}
+                # Merge all worker dicts into a single dict
+                content: dict[tuple[int, int], Any] = {}
+                for worker_dict in xfer_handshake_metadata:
+                    if worker_dict is not None:
+                        content.update(worker_dict)
+                kv_connector.set_xfer_handshake_metadata_pp_aware(content)
 
     def checkpoint_prepare(self) -> None:
         """Release what a process checkpoint must not contain, such as
@@ -1074,6 +1104,7 @@ class EngineCore:
             raise RuntimeError("checkpoint_prepare() requires a completed pause first")
         try:
             self.collective_rpc("checkpoint_prepare")
+            prepare_checkpoint_resources()
             self.collective_rpc("synchronize_device")
         except Exception as e:
             self._fail_checkpoint(e)
@@ -1098,14 +1129,26 @@ class EngineCore:
         env, flags = env or {}, flags or {}
         # Outside the failure handling: a flag that cannot change leaves the
         # engine prepared, so the caller can retry without it.
-        apply_restore_context(env, flags)
+        apply_restore_context(self.vllm_config, env, flags)
         logger.info(
             "Restoring a checkpoint with environment %s and flags %s",
             sorted(env),
             sorted(flags),
         )
         try:
-            self.collective_rpc("checkpoint_restore", args=(env, flags))
+            # A fresh KV transfer identity: several replicas may restore from
+            # one checkpoint, and peers cache what they learn by engine id.
+            kv_engine_id = None
+            kv_transfer_config = self.vllm_config.kv_transfer_config
+            if kv_transfer_config is not None:
+                kv_engine_id = str(uuid.uuid4())
+                parallel_config = self.vllm_config.parallel_config
+                dp_rank = parallel_config.data_parallel_rank
+                if parallel_config.data_parallel_size > 1 or dp_rank > 0:
+                    kv_engine_id = f"{kv_engine_id}_dp{dp_rank}"
+                kv_transfer_config.engine_id = kv_engine_id
+            self.collective_rpc("checkpoint_restore", args=(env, flags, kv_engine_id))
+            restore_checkpoint_resources()
         except Exception as e:
             self._fail_checkpoint(e)
             raise

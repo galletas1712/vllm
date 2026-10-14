@@ -1208,11 +1208,15 @@ class VllmConfig:
             connector_cls = KVConnectorFactory.get_connector_class(
                 self.kv_transfer_config
             )
+            name = self.kv_transfer_config.kv_connector
             if not connector_cls.supports_sleep_mode(self.kv_transfer_config):
-                raise ValueError(
-                    f"{self.kv_transfer_config.kv_connector} does not support "
-                    "sleep mode."
-                )
+                if not connector_cls.supports_checkpoint(self.kv_transfer_config):
+                    raise ValueError(f"{name} does not support sleep mode.")
+                if not self.model_config.checkpoint_prepare_on_startup:
+                    raise ValueError(
+                        f"{name} does not support sleep mode except to checkpoint "
+                        "at startup with --checkpoint-prepare-on-startup."
+                    )
 
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
         # remap a virtual address range to different physical pages over the

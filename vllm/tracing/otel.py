@@ -52,6 +52,23 @@ except ImportError:
     Resource = None  # type: ignore
     SpanKind = Any  # type: ignore
 
+if _IS_OTEL_AVAILABLE:
+
+    class _SwappableTracerProvider(trace.TracerProvider):
+        """The global tracer provider, which OpenTelemetry lets a process set
+        only once. refresh_otel_tracer() swaps the provider behind it."""
+
+        def __init__(self, provider: TracerProvider) -> None:
+            self.provider = provider
+
+        def get_tracer(self, *args, **kwargs) -> Tracer:
+            return self.provider.get_tracer(*args, **kwargs)
+
+
+# This process's global tracer provider and its own resource attributes.
+_tracer_provider: Any = None
+_resource_attrs: dict[str, str] = {}
+
 
 def is_otel_available() -> bool:
     return _IS_OTEL_AVAILABLE
@@ -73,22 +90,41 @@ def init_otel_tracer(
     # Store the endpoint in environment so child processes can inherit it
     os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = otlp_traces_endpoint
 
-    resource_attrs = {}
-    resource_attrs["vllm.instrumenting_module_name"] = instrumenting_module_name
-    resource_attrs["vllm.process_id"] = str(os.getpid())
-    if extra_attributes:
-        resource_attrs.update(extra_attributes)
-    resource = Resource.create(resource_attrs)
+    global _tracer_provider, _resource_attrs
+    _resource_attrs = {
+        "vllm.instrumenting_module_name": instrumenting_module_name,
+        "vllm.process_id": str(os.getpid()),
+        **(extra_attributes or {}),
+    }
+    _tracer_provider = _SwappableTracerProvider(
+        _create_tracer_provider(otlp_traces_endpoint)
+    )
+    set_tracer_provider(_tracer_provider)
 
-    trace_provider = TracerProvider(resource=resource)
-    span_exporter = get_span_exporter(otlp_traces_endpoint)
-    trace_provider.add_span_processor(BatchSpanProcessor(span_exporter))
-    set_tracer_provider(trace_provider)
+    atexit.register(lambda: _tracer_provider.provider.shutdown())
 
-    atexit.register(trace_provider.shutdown)
+    return _tracer_provider.get_tracer(instrumenting_module_name)
 
-    tracer = trace_provider.get_tracer(instrumenting_module_name)
-    return tracer
+
+def refresh_otel_tracer(otlp_traces_endpoint: str) -> None:
+    """Rebuild this process's tracer provider, whose endpoint and resource
+    attributes (OTEL_RESOURCE_ATTRIBUTES) may have changed since it was
+    created."""
+    if _tracer_provider is None:
+        return
+    os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = otlp_traces_endpoint
+    previous = _tracer_provider.provider
+    _tracer_provider.provider = _create_tracer_provider(otlp_traces_endpoint)
+    previous.shutdown()
+
+
+def _create_tracer_provider(otlp_traces_endpoint: str) -> "TracerProvider":
+    # Resource.create also reads OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME.
+    provider = TracerProvider(resource=Resource.create(_resource_attrs))
+    provider.add_span_processor(
+        BatchSpanProcessor(get_span_exporter(otlp_traces_endpoint))
+    )
+    return provider
 
 
 def get_span_exporter(endpoint):

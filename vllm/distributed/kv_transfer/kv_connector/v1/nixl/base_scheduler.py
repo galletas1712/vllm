@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base scheduler-side logic for the NIXL connector."""
 
+import socket
 import threading
 import time
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import psutil
 import zmq
 
 from vllm import envs
@@ -32,6 +34,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path
+from vllm.v1.checkpoint_resources import register_checkpoint_resource
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -189,12 +192,56 @@ class NixlBaseConnectorScheduler:
                 self.kv_recompute_threshold,
                 self.decoder_kv_blocks_ttl,
             )
+        register_checkpoint_resource(self)
 
     def shutdown(self):
         self._stop_event.set()
         if self._nixl_handshake_listener_t is not None:
             self._nixl_handshake_listener_t.join()
             self._nixl_handshake_listener_t = None
+
+    def checkpoint_prepare(self) -> None:
+        """Stop the listener, whose socket and payload belong to this process.
+        Remember which interface carries the side-channel host, if it is an
+        interface address, so restore can find that interface's new address."""
+        self.shutdown()
+        self._side_channel_interface = next(
+            (
+                interface
+                for interface, addresses in psutil.net_if_addrs().items()
+                if any(a.address == self.side_channel_host for a in addresses)
+            ),
+            None,
+        )
+
+    def checkpoint_restore(self) -> None:
+        """Adopt the new engine id and this pod's side-channel address. The
+        next handshake metadata restarts the listener there."""
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None and kv_transfer_config.engine_id
+        self.engine_id = kv_transfer_config.engine_id
+        # checkpoint_restore applied the environment of the pod restored into,
+        # if the caller passed one. Otherwise the side-channel host is still
+        # the captured one, and an interface address names the pod that was
+        # checkpointed: take that interface's address in this pod instead.
+        # Names such as DNS names or localhost are kept.
+        host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
+        interface = self._side_channel_interface
+        if host == self.side_channel_host and interface is not None:
+            family = socket.AF_INET6 if ":" in host else socket.AF_INET
+            addresses = [
+                a.address
+                for a in psutil.net_if_addrs().get(interface, [])
+                if a.family == family and not a.address.startswith("fe80")
+            ]
+            if not addresses:
+                raise RuntimeError(
+                    f"Side-channel interface {interface} has no {family.name} "
+                    "address after restore"
+                )
+            host = addresses[0]
+        self.side_channel_host = host
+        self._stop_event.clear()
 
     def on_new_request(self, request: "Request") -> None:
         """Track a request that may need heartbeats."""
