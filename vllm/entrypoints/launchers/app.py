@@ -20,8 +20,6 @@ def build_app(
     args: Namespace,
     supported_tasks: tuple["SupportedTask", ...] | None = None,
     model_config: ModelConfig | None = None,
-    *,
-    checkpoint=None,
 ) -> FastAPI:
     if supported_tasks is None:
         warnings.warn(
@@ -46,15 +44,13 @@ def build_app(
 
     register_api_routers(args, app, supported_tasks, model_config)
 
-    # Endpoint plugins are attached last so their routes are registered after all core
-    # routers. This runs even for the CPU only render server. A plugin eligible for
+    # Endpoint plugin hooks run after core routers so plugins can inspect them.
+    # This runs even for the CPU only render server. A plugin eligible for
     # the `render` task still gets its routes registered. It receives
     # `engine_client=None` at Phase B (see `_init_endpoint_plugins_state`).
     attach_endpoint_plugins(app, supported_tasks)
 
     init_exception_handler(app)
     init_entrypoints_middleware(args, app, supported_tasks)
-    if checkpoint is not None:
-        checkpoint.attach(app)
     app = sagemaker_standards_bootstrap(app)
     return app

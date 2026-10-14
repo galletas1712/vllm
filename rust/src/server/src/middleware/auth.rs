@@ -13,7 +13,7 @@ use serde_json::json;
 
 use crate::state::{ApiKeyHash, AppState, hash_api_key};
 
-const GUARDED_PREFIXES: &[&str] = &["/v1", "/v2", "/inference", "/checkpoint"];
+const GUARDED_PREFIXES: &[&str] = &["/v1", "/v2", "/inference"];
 
 /// Authenticate guarded HTTP routes with an OpenAI-compatible bearer token.
 ///

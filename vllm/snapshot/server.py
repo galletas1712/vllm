@@ -91,16 +91,14 @@ def parse_control_args(argv: list[str]) -> tuple[ControlArgs, list[str]]:
 
 async def _release_reloadable_state(engine: Any) -> None:
     """Discard model and KV state before the process image is captured."""
-    await engine.pause_generation(mode="wait", clear_cache=True)
-    await engine.engine_core.call_utility_async(
-        "checkpoint_prepare", "vllm.snapshot.policies.ReloadWeightsPolicy", {}
-    )
+    await engine.sleep(level=2)
 
 
 async def _restore_reloadable_state(engine: Any) -> None:
     """Rebuild state discarded by ``_release_reloadable_state``."""
-    await engine.engine_core.call_utility_async("checkpoint_restore")
-    await engine.engine_core.resume_scheduler_async()
+    await engine.wake_up(tags=["weights"])
+    await engine.collective_rpc("reload_weights")
+    await engine.wake_up(tags=["kv_cache"])
 
 
 def oracle_from_request_output(request_output: Any) -> Oracle:

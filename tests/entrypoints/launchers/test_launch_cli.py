@@ -3,7 +3,6 @@
 """Unit tests for the `vllm launch` CLI subcommand."""
 
 import argparse
-import asyncio
 import hashlib
 import json
 import os
@@ -239,6 +238,46 @@ def test_snapshot_environment_contract(
 
 
 @pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(None, "1"), ("0", "0"), ("1", "1")],
+)
+def test_snapshot_child_defaults_nccl_ib_without_mutating_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    expected: str,
+):
+    if configured is None:
+        monkeypatch.delenv("NCCL_IB_DISABLE", raising=False)
+    else:
+        monkeypatch.setenv("NCCL_IB_DISABLE", configured)
+    parent_environment = os.environ.copy()
+    process = create_autospec(subprocess.Popen, instance=True)
+    process.pid = 100
+    popen = create_autospec(subprocess.Popen, return_value=process)
+    monkeypatch.setattr(snapshot_runtime.subprocess, "Popen", popen)
+
+    LocalSnapshotTools().launch_child(tmp_path, ("model",))
+
+    assert popen.call_args.kwargs["env"]["NCCL_IB_DISABLE"] == expected
+    assert os.environ == parent_environment
+
+
+def test_snapshot_environment_identity_applies_effective_nccl_ib_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("NCCL_IB_DISABLE", raising=False)
+    implicit = LocalSnapshotTools()._environment_identity()
+    monkeypatch.setenv("NCCL_IB_DISABLE", "1")
+    explicit_disabled = LocalSnapshotTools()._environment_identity()
+    monkeypatch.setenv("NCCL_IB_DISABLE", "0")
+    explicit_enabled = LocalSnapshotTools()._environment_identity()
+
+    assert implicit == explicit_disabled
+    assert explicit_enabled != implicit
+
+
+@pytest.mark.parametrize(
     "case",
     [
         (("--hf_token", "SECRET"), ("--hf_token", "***")),
@@ -368,6 +407,33 @@ ss() { :; }
     result = subprocess.run(["bash", "-c", shell], capture_output=True, timeout=10)
 
     assert result.returncode == (0 if probe is None else 1), result.stderr
+
+
+@pytest.mark.parametrize("container_attempted", [False, True])
+def test_snapshot_e2e_cleanup_checks_state_only_after_container_attempt(
+    container_attempted: bool,
+):
+    script = (
+        Path(__file__).resolve().parents[3]
+        / ".buildkite/scripts/initialized-snapshot-e2e.sh"
+    )
+    if not script.exists():
+        pytest.skip("snapshot E2E script is not packaged in this test image")
+    source = script.read_text()
+    cleanup = source[source.index("cleanup() {") : source.index("on_exit() {")]
+    shell = (
+        "set -Eeuo pipefail\n"
+        "CONTAINER_NAME='' PORT_TWO=18002\n"
+        f"CHECK_CLEANUP_STATE={int(container_attempted)}\n"
+        "wait_clean() { echo checked-state; return 1; }\n"
+        + cleanup
+        + "\nif cleanup; then exit 0; else exit 1; fi\n"
+    )
+
+    result = subprocess.run(["bash", "-c", shell], capture_output=True, timeout=10)
+
+    assert result.returncode == int(container_attempted), result.stderr
+    assert (b"checked-state" in result.stdout) == container_attempted
 
 
 def test_snapshot_create_cli_accepts_only_pinned_compact_mode(
@@ -653,6 +719,111 @@ def test_snapshot_create_rolls_back_failed_dump(tmp_path: Path):
     assert not target.exists()
 
 
+@pytest.mark.parametrize(
+    "failure_kind", ["called-process", "timeout", "missing", "unreadable"]
+)
+def test_snapshot_create_preserves_bounded_criu_diagnostics_after_cleanup(
+    tmp_path: Path, failure_kind: str, caplog: pytest.LogCaptureFixture
+):
+    target = tmp_path / "snapshot"
+    tools = _fake_snapshot_tools()
+    criu_tools = LocalSnapshotTools()
+    criu_tools.plugin_dir = tmp_path
+    original_run = criu_tools._run
+    criu_tools._privileged = lambda: []  # type: ignore[method-assign]
+    captured = "captured stderr " + "x" * 9000
+    if failure_kind == "timeout":
+        primary: subprocess.SubprocessError = subprocess.TimeoutExpired(
+            ["criu", "dump"], 1, output=b"captured stdout\xff", stderr=captured.encode()
+        )
+    else:
+        primary = subprocess.CalledProcessError(
+            1, ["criu", "dump"], output="captured stdout", stderr=captured
+        )
+
+    def run(command: list[str], **_kwargs: object):
+        if "tail" not in command:
+            raise primary
+        if failure_kind == "unreadable":
+            raise PermissionError("log is root-owned")
+        if failure_kind == "timeout":
+            return subprocess.CompletedProcess(command, 0, "timeout log tail", "")
+        return original_run(command, **_kwargs)
+
+    criu_tools._run = run  # type: ignore[method-assign]
+
+    def fail_dump(workdir: Path, _inventory: ProcessInventory) -> None:
+        images = workdir / "images"
+        images.mkdir()
+        if failure_kind != "missing":
+            (images / "dump.log").write_text(
+                "omitted dump prefix" + "d" * 9000 + "distinctive dump diagnostic"
+            )
+        criu_tools._criu("dump", workdir, [])
+
+    tools.dump.side_effect = fail_dump
+    with pytest.raises(type(primary)) as excinfo:
+        create_snapshot(
+            argparse.Namespace(snapshot_dir=str(target), model_tag="Qwen/Qwen3-0.6B"),
+            tools=tools,
+        )
+
+    assert excinfo.value is primary
+    assert not target.exists()
+    diagnostics = "\n".join(caplog.messages)
+    assert "captured stdout" in diagnostics
+    assert "captured stderr" not in diagnostics
+    assert "x" * 100 in diagnostics
+    assert len(diagnostics) < 17000
+    if failure_kind in {"missing", "unreadable"}:
+        assert "dump.log unavailable" in diagnostics
+        expected_error = (
+            "CalledProcessError" if failure_kind == "missing" else "PermissionError"
+        )
+        assert expected_error in diagnostics
+    elif failure_kind == "called-process":
+        assert "distinctive dump diagnostic" in diagnostics
+        assert "omitted dump prefix" not in diagnostics
+    else:
+        assert "timeout log tail" in diagnostics
+    if failure_kind == "timeout":
+        assert "captured stdout�" in diagnostics
+
+
+def test_snapshot_criu_failure_selects_restore_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    tools = LocalSnapshotTools()
+    tools.plugin_dir = tmp_path
+    tools._privileged = lambda: []  # type: ignore[method-assign]
+    artifact = tmp_path / "snapshot"
+    images = artifact / "images"
+    images.mkdir(parents=True)
+    (images / "restore.log").write_text(
+        "omitted restore prefix" + "r" * 9000 + "distinctive restore diagnostic"
+    )
+    primary = subprocess.CalledProcessError(1, ["criu", "restore"])
+    original_run = tools._run
+    tailed: list[str] = []
+
+    def run(command: list[str], **_kwargs: object):
+        if "tail" not in command:
+            raise primary
+        tailed.append(command[-1])
+        return original_run(command, **_kwargs)
+
+    tools._run = run  # type: ignore[method-assign]
+
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        tools._criu("restore", artifact, [])
+
+    assert excinfo.value is primary
+    assert tailed == [str(images / "restore.log")]
+    diagnostics = "\n".join(caplog.messages)
+    assert "distinctive restore diagnostic" in diagnostics
+    assert "omitted restore prefix" not in diagnostics
+
+
 def _restore_fixture(tmp_path: Path) -> argparse.Namespace:
     artifact = tmp_path / "snapshot"
     artifact.mkdir(mode=0o700)
@@ -869,6 +1040,96 @@ def test_snapshot_private_path_and_link_remap_security(
         tools.restore(artifact, _manifest())
 
 
+@pytest.mark.parametrize("inventory_error", [None, PermissionError("denied")])
+def test_snapshot_dump_rejects_unavailable_link_remap_inventory_before_criu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inventory_error: PermissionError | None,
+):
+    tools = LocalSnapshotTools()
+    workdir = tmp_path / "snapshot"
+    workdir.mkdir()
+    tools.shm_dir = tmp_path / "missing-shm"
+    if inventory_error is not None:
+        tools.shm_dir.mkdir()
+
+        def fail_inventory(_path: Path):
+            raise inventory_error
+
+        monkeypatch.setattr(Path, "iterdir", fail_inventory)
+    monkeypatch.setattr(tools, "_criu", lambda *_args: pytest.fail("CRIU called"))
+
+    with pytest.raises(SnapshotCreateError, match="inventory CRIU link remaps"):
+        tools.dump(workdir, ProcessInventory(100, (100,), (100,), "GPU"))
+
+
+def test_snapshot_restore_rejects_saved_remap_without_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _mark_snapshot_pids_free(monkeypatch)
+    artifact = _local_restore_artifact(tmp_path)
+    saved = artifact / "link-remaps"
+    saved.mkdir()
+    (saved / "270").write_bytes(b"invalid remap name")
+    tools = LocalSnapshotTools()
+    tools.shm_dir = tmp_path / "shm"
+    tools.shm_dir.mkdir()
+    monkeypatch.setattr(tools, "_criu", lambda *_args: pytest.fail("CRIU called"))
+
+    with pytest.raises(SnapshotRestoreError, match="invalid saved link remap"):
+        tools.restore(artifact, _manifest())
+
+    assert not tuple(tools.shm_dir.iterdir())
+
+
+def test_snapshot_link_remap_inventory_matches_only_numeric_suffixes(tmp_path: Path):
+    for name in (
+        "link_remap.0",
+        "link_remap.270",
+        "link_remap.",
+        "link_remap.12a",
+        "link-remap.12",
+        "prefix.link_remap.12",
+        "270",
+    ):
+        (tmp_path / name).touch()
+    tools = LocalSnapshotTools()
+    tools.shm_dir = tmp_path
+
+    assert tools._link_remap_names() == {"link_remap.0", "link_remap.270"}
+
+
+def test_snapshot_dump_preserves_primary_failure_when_cleanup_inventory_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    tools = LocalSnapshotTools()
+    workdir = tmp_path / "snapshot"
+    workdir.mkdir()
+    inventory_calls = 0
+
+    def inventory_names() -> set[str]:
+        nonlocal inventory_calls
+        inventory_calls += 1
+        if inventory_calls > 1:
+            raise SnapshotCreateError(
+                "could not inventory CRIU link remaps: PermissionError: denied"
+            )
+        return set()
+
+    monkeypatch.setattr(tools, "_link_remap_names", inventory_names)
+
+    def fail_dump(*_args):
+        raise RuntimeError("dump failed")
+
+    monkeypatch.setattr(tools, "_criu", fail_dump)
+
+    with pytest.raises(SnapshotCreateError) as failure:
+        tools.dump(workdir, ProcessInventory(100, (100,), (100,), "GPU"))
+
+    assert "RuntimeError: dump failed" in str(failure.value)
+    assert "cleanup inventory failed" in str(failure.value)
+
+
 @pytest.mark.parametrize(
     ("blocked_state", "message"),
     [("tcp", "external established TCP"), ("io_uring", "kernel.io_uring_disabled=1")],
@@ -899,6 +1160,28 @@ def test_snapshot_rejects_unsafe_process_state_before_criu(
     if blocked_state == "tcp":
         assert "pid 101" in str(excinfo.value)
         assert "1.1.1.1:443" in str(excinfo.value)
+
+
+def test_snapshot_rejects_open_infiniband_device_before_criu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    tools = LocalSnapshotTools()
+    monkeypatch.setattr(tools, "_tree_pids", lambda _root_pid: (100, 101))
+    monkeypatch.setattr(tools, "_cuda_process_rows", lambda: ("101, GPU-abc",))
+    monkeypatch.setattr(
+        tools,
+        "_descriptor_targets",
+        lambda pid: ("/dev/infiniband/uverbs7",) if pid == 101 else (),
+    )
+    monkeypatch.setattr(tools, "_criu", lambda *_args: pytest.fail("CRIU called"))
+
+    with pytest.raises(SnapshotCreateError) as failure:
+        tools.inventory(100, tmp_path)
+
+    message = str(failure.value)
+    assert "pid 101" in message
+    assert "/dev/infiniband/uverbs7" in message
+    assert "NCCL_IB_DISABLE=1" in message
 
 
 def test_decode_endpoint_families():
@@ -1151,240 +1434,3 @@ def test_snapshot_runtime_installer_logs_the_failing_exit_code():
 
     assert result.returncode == 7
     assert "(exit 7)" in result.stdout
-
-
-@asynccontextmanager
-async def _checkpoint_http_group(call, *, clear_cache=False, root_path=""):
-    import httpx
-    from fastapi import FastAPI
-
-    from vllm.snapshot.lifecycle.coordinator import CheckpointCoordinator
-    from vllm.snapshot.lifecycle.frontend import CheckpointFrontend
-
-    async def clear():
-        await call("frontend_clear_cache")
-
-    coordinator = CheckpointCoordinator(2)
-    group = asyncio.create_task(
-        coordinator.run(
-            policy="custom.Policy",
-            options={"retain": True},
-            clear_cache=clear_cache,
-        )
-    )
-    frontends = [CheckpointFrontend(call, clear) for _ in range(2)]
-    clients = []
-    apps = []
-    try:
-        await asyncio.gather(
-            *(
-                frontend.connect(sock)
-                for frontend, sock in zip(frontends, coordinator.frontend_sockets)
-            )
-        )
-        for frontend in frontends:
-            app = FastAPI(root_path=root_path)
-            frontend.attach(app)
-            apps.append(app)
-            clients.append(
-                httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=app), base_url="http://test"
-                )
-            )
-        yield apps, clients
-    finally:
-        await asyncio.gather(*(client.aclose() for client in clients))
-        group.cancel()
-        await asyncio.gather(group, return_exceptions=True)
-        await asyncio.gather(*(frontend.close() for frontend in frontends))
-        coordinator.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("root_path", ["", "/proxy"])
-async def test_checkpoint_http_drains_all_frontends_before_preparing(root_path):
-    """Prepare waits for streaming responses; resume waits for engine recovery."""
-    from starlette.responses import StreamingResponse
-
-    calls = []
-    stream_started = asyncio.Event()
-    finish_stream = asyncio.Event()
-    restore_started = asyncio.Event()
-    finish_restore = asyncio.Event()
-
-    async def call(method, *args):
-        calls.append((method, args))
-        if method == "checkpoint_restore":
-            restore_started.set()
-            await finish_restore.wait()
-
-    async with _checkpoint_http_group(call, clear_cache=True, root_path=root_path) as (
-        apps,
-        clients,
-    ):
-
-        async def stream():
-            yield b"first"
-            stream_started.set()
-            await finish_stream.wait()
-            yield b"last"
-
-        @apps[1].get("/inference")
-        async def inference():
-            return StreamingResponse(stream())
-
-        request = asyncio.create_task(clients[1].get("/inference"))
-        await asyncio.wait_for(stream_started.wait(), 5)
-        preparing = asyncio.create_task(clients[0].post("/checkpoint/prepare"))
-        # A status round trip observes the transition without waiting for drain.
-        while (await clients[1].get("/checkpoint/status")).json()["state"] == "running":
-            await asyncio.sleep(0)
-        assert (await clients[1].get("/health")).status_code == 503
-        assert not preparing.done()
-        assert calls == []
-        finish_stream.set()
-        assert (await request).text == "firstlast"
-        assert (await asyncio.wait_for(preparing, 5)).json() == {"state": "prepared"}
-        assert calls == [
-            ("pause_scheduler", ("wait", True)),
-            ("frontend_clear_cache", ()),
-            ("frontend_clear_cache", ()),
-            ("checkpoint_prepare", ("custom.Policy", {"retain": True})),
-        ]
-        # Either API process can retry or release the same service-wide operation.
-        assert (await clients[1].post("/checkpoint/prepare")).json() == {
-            "state": "prepared"
-        }
-        assert len(calls) == 4
-        resuming = asyncio.create_task(clients[1].post("/checkpoint/resume"))
-        await asyncio.wait_for(restore_started.wait(), 5)
-        assert (await clients[0].get("/checkpoint/status")).json() == {
-            "state": "resuming"
-        }
-        assert (await clients[0].get("/health")).status_code == 503
-        finish_restore.set()
-        assert (await asyncio.wait_for(resuming, 5)).json() == {"state": "running"}
-        assert (await clients[0].post("/checkpoint/resume")).json() == {
-            "state": "running"
-        }
-        assert [method for method, _ in calls[-2:]] == [
-            "checkpoint_restore",
-            "resume_scheduler",
-        ]
-        assert (await clients[1].get("/inference")).text == "firstlast"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failed_method", ["checkpoint_prepare", "checkpoint_restore"])
-async def test_checkpoint_http_policy_failure_keeps_admission_closed(failed_method):
-    calls = []
-
-    async def call(method, *args):
-        calls.append(method)
-        if method == failed_method:
-            raise RuntimeError("policy failed")
-
-    async with _checkpoint_http_group(call) as (_, clients):
-        response = await clients[0].post("/checkpoint/prepare")
-        if failed_method == "checkpoint_restore":
-            assert response.status_code == 200
-            response = await clients[1].post("/checkpoint/resume")
-        assert response.status_code == 503
-        assert "policy failed" in response.text
-        assert "resume_scheduler" not in calls
-        assert "frontend_clear_cache" not in calls
-        for client in clients:
-            assert (await client.get("/checkpoint/status")).json() == {
-                "state": "failed"
-            }
-            assert (await client.get("/health")).status_code == 503
-            assert (await client.post("/checkpoint/resume")).status_code == 503
-
-
-@pytest.mark.asyncio
-async def test_checkpoint_http_disconnect_does_not_cancel_preparation():
-    started = asyncio.Event()
-    finish = asyncio.Event()
-    calls = []
-
-    async def call(method, *args):
-        calls.append(method)
-        if method == "checkpoint_prepare":
-            started.set()
-            await finish.wait()
-
-    async with _checkpoint_http_group(call) as (_, clients):
-        preparing = asyncio.create_task(clients[0].post("/checkpoint/prepare"))
-        await asyncio.wait_for(started.wait(), 5)
-        preparing.cancel()
-        await asyncio.gather(preparing, return_exceptions=True)
-        finish.set()
-        assert (await clients[1].post("/checkpoint/prepare")).json() == {
-            "state": "prepared"
-        }
-        assert calls.count("checkpoint_prepare") == 1
-        assert (await clients[0].post("/checkpoint/resume")).json() == {
-            "state": "running"
-        }
-
-
-@pytest.mark.asyncio
-async def test_checkpoint_prepare_drains_background_responses():
-    """A Responses background task can submit work after its HTTP response ends."""
-    from types import SimpleNamespace
-
-    finish = asyncio.Event()
-    background_started = asyncio.Event()
-    calls = []
-
-    async def call(method, *args):
-        calls.append(method)
-
-    async def background():
-        background_started.set()
-        await finish.wait()
-
-    task = asyncio.create_task(background())
-    try:
-        async with _checkpoint_http_group(call) as (apps, clients):
-            apps[1].state.openai_serving_responses = SimpleNamespace(
-                background_tasks={"response": task}
-            )
-            await background_started.wait()
-            preparing = asyncio.create_task(clients[0].post("/checkpoint/prepare"))
-            while (await clients[1].get("/checkpoint/status")).json()[
-                "state"
-            ] == "running":
-                await asyncio.sleep(0)
-            assert not preparing.done()
-            assert not calls
-            finish.set()
-            assert (await asyncio.wait_for(preparing, 5)).json() == {
-                "state": "prepared"
-            }
-            assert task.done()
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-
-def test_checkpoint_routes_registered_before_hosting_bootstrap(monkeypatch):
-    """Hosting adapters may finalize the middleware stack during build_app."""
-    from vllm.entrypoints.launchers import app as app_module
-    from vllm.entrypoints.launchers.cli_args import make_arg_parser
-    from vllm.snapshot.lifecycle.frontend import CheckpointFrontend
-
-    async def unused(*args):
-        raise AssertionError("App construction must not call the engine")
-
-    def bootstrap(app):
-        app.middleware_stack = app.build_middleware_stack()
-        return app
-
-    monkeypatch.setattr(app_module, "sagemaker_standards_bootstrap", bootstrap)
-    args = make_arg_parser(FlexibleArgumentParser()).parse_args([])
-    checkpoint = CheckpointFrontend(unused, unused)
-    app = app_module.build_app(args, ("generate",), checkpoint=checkpoint)
-    assert {"/checkpoint/prepare", "/checkpoint/resume", "/checkpoint/status"} <= {
-        route.path for route in app.routes
-    }

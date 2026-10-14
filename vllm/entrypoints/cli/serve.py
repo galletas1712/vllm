@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
-import asyncio
 import signal
 import time
-from contextlib import closing
 
 import uvloop
 
@@ -15,20 +13,18 @@ from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.launchers.api_server.entry import run_server, setup_server
 from vllm.entrypoints.launchers.cli_args import (
     make_arg_parser,
+    propagate_flash_late_interaction,
     validate_parsed_serve_args,
 )
 from vllm.entrypoints.launchers.dp_supervisor import run_dp_supervisor
+from vllm.entrypoints.launchers.launcher import create_server_socket
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import get_tcp_uri
-from vllm.v1.engine.utils import (
-    CoreEngineProcManager,
-    FrontendProcess,
-    launch_core_engines,
-)
+from vllm.v1.engine.utils import CoreEngineProcManager, launch_core_engines
 from vllm.v1.executor import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
@@ -59,13 +55,6 @@ class ServeSubcommand(CLISubcommand):
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
-
-        args.enable_checkpoint = getattr(args, "enable_checkpoint", False)
-        if args.enable_checkpoint:
-            if args.headless or getattr(args, "grpc", False):
-                raise ValueError("Checkpoint control requires vllm serve HTTP")
-            if not isinstance(args.snapshot_policy_options, dict):
-                raise ValueError("--snapshot-policy-options must be a JSON object")
 
         if getattr(args, "grpc", False):
             from vllm.entrypoints.launchers.grpc_server import serve_grpc
@@ -155,13 +144,11 @@ class ServeSubcommand(CLISubcommand):
             )
             args.api_server_count = 1
 
-        if args.enable_checkpoint and (is_multi_port or args.api_server_count < 1):
-            raise ValueError("Checkpoint control requires one local serve launcher")
         if is_multi_port:
             run_dp_supervisor(args)
         elif args.api_server_count < 1:
             run_headless(args)
-        elif args.api_server_count > 1 or rust_frontend_path or args.enable_checkpoint:
+        elif args.api_server_count > 1 or rust_frontend_path:
             run_multi_api_server(args)
         else:
             # Single API server (this process).
@@ -200,6 +187,7 @@ def run_headless(args: argparse.Namespace):
 
     # Create the EngineConfig.
     engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+    propagate_flash_late_interaction(args, engine_args)
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(
         usage_context=usage_context, headless=True
@@ -279,17 +267,6 @@ def run_headless(args: argparse.Namespace):
 
 
 def run_multi_api_server(args: argparse.Namespace):
-    if not getattr(args, "enable_checkpoint", False):
-        _run_multi_api_server(args)
-        return
-
-    from vllm.snapshot.lifecycle.coordinator import CheckpointCoordinator
-
-    with closing(CheckpointCoordinator(args.api_server_count)) as checkpoint:
-        _run_multi_api_server(args, checkpoint)
-
-
-def _run_multi_api_server(args: argparse.Namespace, checkpoint=None):
     assert not args.headless
     rust_frontend_path = (
         envs.VLLM_RUST_FRONTEND_PATH if envs.VLLM_USE_RUST_FRONTEND else None
@@ -319,8 +296,16 @@ def _run_multi_api_server(args: argparse.Namespace, checkpoint=None):
     signal.signal(signal.SIGINT, signal_handler)
 
     listen_address, sock = setup_server(args, reuse_port=num_api_servers > 1)
+    # `--grpc-port` is only accepted for the Rust frontend, which inherits this
+    # listener like the HTTP one. gRPC follows the HTTP TCP host, or IPv4
+    # loopback when HTTP uses a Unix socket.
+    grpc_sock = None
+    if args.grpc_port is not None:
+        grpc_host = "127.0.0.1" if args.uds else (args.host or "")
+        grpc_sock = create_server_socket((grpc_host, args.grpc_port), reuse_port=False)
 
     engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+    propagate_flash_late_interaction(args, engine_args)
     engine_args._api_process_count = num_api_servers
     engine_args._api_process_rank = -1
 
@@ -336,14 +321,6 @@ def _run_multi_api_server(args: argparse.Namespace, checkpoint=None):
     log_stats = not engine_args.disable_log_stats
 
     parallel_config = vllm_config.parallel_config
-    if checkpoint is not None and (
-        parallel_config.data_parallel_size_local != parallel_config.data_parallel_size
-        or parallel_config.nnodes != 1
-        or parallel_config.data_parallel_backend == "ray"
-        or parallel_config.distributed_executor_backend == "ray"
-        or parallel_config.enable_elastic_ep
-    ):
-        raise ValueError("Checkpoint control requires a fixed, local process tree")
     dp_rank = parallel_config.data_parallel_rank
     assert parallel_config.local_engines_only or dp_rank == 0
 
@@ -351,19 +328,10 @@ def _run_multi_api_server(args: argparse.Namespace, checkpoint=None):
         None
     )
 
-    from vllm.v1.engine.utils import get_engine_zmq_addresses
+    from vllm.v1.engine.utils import bind_engine_zmq_listeners
 
-    # Defer port allocation to the child's bind() to avoid TOCTOU, except
-    # for Rust front-end and Ray DP, which can't see the post-bind rebind
-    # (CLI-arg subprocess / pickled-into-actor snapshot respectively) and
-    # so pre-allocate driver-side -- reintroducing the original race only
-    # there.
-    is_ray_dp = parallel_config.data_parallel_backend == "ray"
-    addresses = get_engine_zmq_addresses(
-        vllm_config,
-        num_api_servers,
-        defer_api_server_ports=not (rust_frontend_path or is_ray_dp),
-    )
+    zmq_listeners = bind_engine_zmq_listeners(vllm_config, num_api_servers)
+    addresses = zmq_listeners.addresses
 
     with launch_core_engines(
         vllm_config, executor_class, log_stats, addresses
@@ -386,15 +354,13 @@ def _run_multi_api_server(args: argparse.Namespace, checkpoint=None):
             api_server_manager = RustFrontendProcessManager(
                 binary_path=rust_frontend_path,
                 sock=sock,
+                grpc_sock=grpc_sock,
                 args=args,
-                input_address=addresses.inputs[0],
-                output_address=addresses.outputs[0],
+                input_listener=zmq_listeners.inputs[0],
+                output_listener=zmq_listeners.outputs[0],
                 engine_start_index=expected_engine_start_index,
                 engine_count=expected_engine_count,
                 data_parallel_size=parallel_config.data_parallel_size,
-                checkpoint_socket=checkpoint.frontend_sockets[0]
-                if checkpoint
-                else None,
                 stats_update_address=stats_update_address,
             )
         else:
@@ -404,22 +370,11 @@ def _run_multi_api_server(args: argparse.Namespace, checkpoint=None):
                 sock=sock,
                 args=args,
                 num_servers=num_api_servers,
-                input_addresses=addresses.inputs,
-                output_addresses=addresses.outputs,
+                input_listeners=zmq_listeners.inputs,
+                output_listeners=zmq_listeners.outputs,
                 stats_update_address=stats_update_address,
                 tensor_queue=engine_launch.tensor_queue,
-                checkpoint_sockets=checkpoint.frontend_sockets if checkpoint else None,
             )
-
-            if not is_ray_dp:
-                # Forward each child's bound endpoints to the engine handshake
-                # (runs on ``with`` exit). Skipped for Ray DP, where addresses
-                # are pre-allocated above and Ray actors already hold them.
-                actual_inputs, actual_outputs = (
-                    api_server_manager.gather_actual_addresses()
-                )
-                addresses.inputs = actual_inputs
-                addresses.outputs = actual_outputs
 
         # Set frontend processes to watch during engine startup.
         # If any of these processes exit before the engines are up, the engine startup
@@ -428,45 +383,11 @@ def _run_multi_api_server(args: argparse.Namespace, checkpoint=None):
 
     # Wait for API servers.
     try:
-        if checkpoint is not None:
-            checkpoint.close_frontend_sockets()
-
-            async def serve_checkpoint_control():
-                task = asyncio.create_task(
-                    checkpoint.run(
-                        policy=args.snapshot_policy,
-                        options=args.snapshot_policy_options,
-                        clear_cache=args.snapshot_clear_cache,
-                    )
-                )
-                try:
-                    while not task.done():
-                        processes: list[FrontendProcess] = list(
-                            api_server_manager.processes
-                        )
-                        if isinstance(local_engine_manager, CoreEngineProcManager):
-                            processes.extend(local_engine_manager.processes)
-                        if coordinator:
-                            processes.append(coordinator.proc)
-                        for proc in processes:
-                            if not proc.is_alive():
-                                raise RuntimeError(
-                                    f"{proc.name} exited during checkpoint lifecycle"
-                                )
-                        await asyncio.wait({task}, timeout=0.1)
-                    await task
-                finally:
-                    if not task.done():
-                        task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
-
-            uvloop.run(serve_checkpoint_control())
-        else:
-            wait_for_completion_or_failure(
-                api_server_manager=api_server_manager,
-                engine_manager=local_engine_manager,
-                coordinator=coordinator,
-            )
+        wait_for_completion_or_failure(
+            api_server_manager=api_server_manager,
+            engine_manager=local_engine_manager,
+            coordinator=coordinator,
+        )
     finally:
         timeout = shutdown_by = None
         if shutdown_requested:

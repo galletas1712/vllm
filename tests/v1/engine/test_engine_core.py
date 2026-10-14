@@ -4,6 +4,7 @@
 import copy
 import time
 import uuid
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -395,6 +396,38 @@ def test_engine_core_concurrent_batches():
         req_id = (req_id + 1) % 2
 
 
+@pytest.mark.parametrize("encoder_only", [True, False])
+def test_async_step_skips_sampling_for_mm_encoder_only(encoder_only):
+    """Encoder outputs are complete; only language-model steps need sampling."""
+    core = MagicMock()
+    core.batch_queue = deque()
+    core.batch_queue_size = 2
+    core.is_mm_encoder_only = encoder_only
+    core.is_pooling_model = False
+    core.scheduler.has_requests.side_effect = [True, False, False]
+    scheduled = core.scheduler.schedule.return_value
+    scheduled.total_num_scheduled_tokens = 16
+    scheduled.pending_structured_output_tokens = False
+
+    output = MagicMock()
+    executed: Future[ModelRunnerOutput | None] = Future()
+    executed.set_result(output if encoder_only else None)
+    sampled: Future[ModelRunnerOutput | None] = Future()
+    sampled.set_result(None if encoder_only else output)
+    core.model_executor.execute_model.return_value = executed
+    core.model_executor.sample_tokens.return_value = sampled
+
+    EngineCore.step_with_batch_queue(core)
+    if core.batch_queue:
+        EngineCore.step_with_batch_queue(core)
+
+    core.scheduler.update_from_output.assert_called_once_with(scheduled, output)
+    if encoder_only:
+        core.model_executor.sample_tokens.assert_not_called()
+    else:
+        core.model_executor.sample_tokens.assert_called_once()
+
+
 @multi_gpu_test(num_gpus=2)
 def test_engine_core_tp():
     """Test engine can initialize worker in tp properly."""
@@ -713,89 +746,52 @@ def test_pause_synchronizes_device_before_cache_reset(deferred: bool):
     assert order == ["synchronize_device", "reset_caches"]
 
 
-@pytest.mark.parametrize(
-    "policy",
-    [
-        "vllm.snapshot.lifecycle.ResidentPolicy",
-        "vllm.snapshot.policies.ReloadWeightsPolicy",
-    ],
-)
-def test_checkpoint_resource_policy_keeps_scheduler_paused(policy):
-    """Resident and compact policies recover resources without admitting work."""
+@pytest.mark.parametrize("deferred", [False, True])
+def test_checkpoint_releases_communicators_after_drain(deferred: bool):
+    """Communicators are released after the drain and rebuilt before
+    scheduling resumes. Repeated calls are no-ops."""
     core = _pausable_engine_core_proc()
-    core._checkpoint_policy = None
-    core.scheduler.pause_state = PauseState.PAUSED_ALL
-    core.scheduler.has_unfinished_requests.return_value = False
-    core.checkpoint_prepare(policy, {})
-    assert core.is_scheduler_paused()
-    core.checkpoint_restore()
-    core.scheduler.set_pause_state.assert_not_called()
-    if policy.endswith("ResidentPolicy"):
-        core.model_executor.sleep.assert_not_called()
-        core.model_executor.wake_up.assert_not_called()
-    else:
-        core.model_executor.sleep.assert_called_once_with(level=2)
-        assert core.model_executor.wake_up.call_count == 2
-    core.model_executor.collective_rpc.assert_any_call(
-        "synchronize_device", None, (), None
+    core._checkpoint = None
+    core.engines_running = deferred
+    order: list[str] = []
+    core.model_executor.collective_rpc.side_effect = lambda method, *_: order.append(
+        method
     )
+    core.release_kv_cache_memory = lambda: order.append("release_kv_cache_memory")
+    core.wake_up = lambda tags: order.append(f"wake_up:{tags}")
 
+    prepared = core.checkpoint_prepare()
+    assert core.checkpoint_prepare() is prepared
+    if deferred:
+        assert not core.is_checkpoint_prepared()
+        with pytest.raises(RuntimeError, match="in progress"):
+            core.checkpoint_restore()
+        core.engines_running = False
+        core._notify_idle_state_callbacks()
+    assert prepared.result(timeout=0) is None
+    assert core.is_checkpoint_prepared()
 
-def test_checkpoint_offload_weights_policy_clears_caches_before_sleeping():
-    """Level-1 sleep discards KV blocks, so caches go first and restore is LIFO."""
-    order = []
-    core = _pausable_engine_core_proc()
-    core._checkpoint_policy = None
-    core._reset_caches = MagicMock(side_effect=lambda: order.append("reset_caches"))
-    core.scheduler.pause_state = PauseState.PAUSED_ALL
-    core.scheduler.has_unfinished_requests.return_value = False
-    core.model_executor.sleep.side_effect = lambda level: order.append(f"sleep{level}")
-    core.model_executor.wake_up.side_effect = lambda: order.append("wake_up")
-    rpc = core.model_executor.collective_rpc
-    rpc.side_effect = lambda method, *_: order.append(method)
-
-    core.checkpoint_prepare("vllm.snapshot.policies.OffloadWeightsPolicy", {})
     core.checkpoint_restore()
-
+    core.checkpoint_restore()
+    assert not core.is_checkpoint_prepared()
     assert order == [
-        "reset_caches",
+        "synchronize_device",
+        "release_kv_cache_memory",
         "checkpoint_prepare",
-        "sleep1",
         "synchronize_device",
-        "wake_up",
         "checkpoint_restore",
-        "synchronize_device",
+        "wake_up:['kv_cache']",
     ]
-    core.scheduler.set_pause_state.assert_not_called()
 
 
-def test_checkpoint_custom_policy_keeps_constructor_options_and_prepared_state(
-    monkeypatch,
-):
-    """Recovery uses the integration's prepared policy instance, not a new one."""
-    events = []
-
-    class Policy:
-        def __init__(self, resource):
-            self.resource = resource
-            self.prepared = False
-
-        def prepare(self, core):
-            events.append(("release", self.resource))
-            self.prepared = True
-
-        def restore(self, core):
-            assert self.prepared
-            events.append(("recreate", self.resource))
-
-    monkeypatch.setattr(
-        "vllm.utils.import_utils.resolve_obj_by_qualname", lambda name: Policy
-    )
+def test_failed_checkpoint_preparation_is_never_reported_prepared():
     core = _pausable_engine_core_proc()
-    core._checkpoint_policy = None
-    core.scheduler.pause_state = PauseState.PAUSED_ALL
-    core.scheduler.has_unfinished_requests.return_value = False
-    core.checkpoint_prepare("integration.Policy", {"resource": "custom-channel"})
-    core.checkpoint_restore()
-    assert events == [("release", "custom-channel"), ("recreate", "custom-channel")]
-    core.scheduler.set_pause_state.assert_not_called()
+    core._checkpoint = None
+    core.release_kv_cache_memory = MagicMock(side_effect=RuntimeError("busy"))
+
+    with pytest.raises(RuntimeError, match="busy"):
+        core.checkpoint_prepare().result(timeout=0)
+    assert not core.is_checkpoint_prepared()
+    with pytest.raises(RuntimeError, match="busy"):
+        core.checkpoint_restore()
+    core.model_executor.collective_rpc.assert_called_once_with("synchronize_device")
