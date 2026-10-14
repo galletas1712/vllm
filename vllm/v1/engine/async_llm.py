@@ -1175,10 +1175,14 @@ class AsyncLLM(EngineClient):
         return fully_awake
 
     async def checkpoint_prepare(self) -> None:
-        await self.collective_rpc("checkpoint_prepare")
+        await self.renderer.clear_mm_cache_async()
+        await self.engine_core.checkpoint_prepare_async()
 
     async def checkpoint_restore(self) -> None:
-        await self.collective_rpc("checkpoint_restore")
+        await self.engine_core.checkpoint_restore_async()
+
+    async def is_checkpoint_prepared(self) -> bool:
+        return await self.engine_core.is_checkpoint_prepared_async()
 
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()

@@ -215,6 +215,22 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def checkpoint_prepare(self) -> None:
+        """Drain requests and release KV cache memory and communicator state
+        before an external process checkpoint."""
+        ...
+
+    @abstractmethod
+    async def checkpoint_restore(self) -> None:
+        """Rebuild state released by checkpoint_prepare and resume serving."""
+        ...
+
+    @abstractmethod
+    async def is_checkpoint_prepared(self) -> bool:
+        """Check whether every engine is prepared for a checkpoint."""
+        ...
+
+    @abstractmethod
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         ...

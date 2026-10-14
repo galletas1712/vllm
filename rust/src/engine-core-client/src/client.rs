@@ -975,6 +975,29 @@ impl EngineCoreClient {
             .all(|fully_awake| fully_awake))
     }
 
+    /// Drain requests, then release KV cache memory and communicator state
+    /// before an external process checkpoint.
+    pub async fn checkpoint_prepare(&self) -> Result<()> {
+        self.call_utility::<(), _>("checkpoint_prepare", ()).await?;
+        Ok(())
+    }
+
+    /// Rebuild the state released by `checkpoint_prepare` and resume
+    /// scheduling.
+    pub async fn checkpoint_restore(&self) -> Result<()> {
+        self.call_utility::<(), _>("checkpoint_restore", ()).await?;
+        Ok(())
+    }
+
+    /// Return whether every engine is prepared for a checkpoint.
+    pub async fn is_checkpoint_prepared(&self) -> Result<bool> {
+        Ok(self
+            .call_utility::<bool, _>("is_checkpoint_prepared", ())
+            .await?
+            .into_iter()
+            .all(|prepared| prepared))
+    }
+
     /// Pause the scheduler so generation can be halted
     pub async fn pause_scheduler(&self, mode: PauseMode, clear_cache: bool) -> Result<()> {
         self.call_utility::<(), _>("pause_scheduler", (mode, clear_cache)).await?;

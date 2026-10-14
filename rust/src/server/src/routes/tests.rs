@@ -6269,6 +6269,77 @@ async fn sleep_route_rejects_invalid_query_before_engine_dispatch() {
     }
 }
 
+/// Build a router without dev mode whose mock engine answers one utility call.
+async fn test_checkpoint_app(
+    method: &'static str,
+    result: UtilityResultEnvelope,
+) -> (axum::Router, MockEngineTask) {
+    let (state, engine_task) = test_admin_state_with_ready_and_engine_script(
+        default_ready_response(),
+        move |dealer, push| {
+            boxed_test_future(async move {
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                let call_id = array[1].as_u64().expect("call id");
+
+                assert_eq!(array[2], Value::from(method));
+                assert_eq!(array[3], Value::Array(Vec::new()));
+
+                send_outputs(push, utility_outputs(call_id, result)).await;
+            })
+        },
+    )
+    .await;
+    (build_router_with_dev_mode(state, false), engine_task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn checkpoint_prepare_route_is_available_without_dev_mode() {
+    let (app, engine_task) = test_checkpoint_app("checkpoint_prepare", utility_none_result()).await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/checkpoint/prepare")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn checkpoint_status_route_is_unavailable_until_prepared() {
+    let (app, engine_task) =
+        test_checkpoint_app("is_checkpoint_prepared", utility_result_value(false)).await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/checkpoint/status")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, r#"{"prepared":false}"#);
+    engine_task.await.expect("mock engine task");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn release_kv_cache_memory_route_sends_expected_utility_call() {

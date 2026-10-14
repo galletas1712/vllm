@@ -312,6 +312,15 @@ class EngineCoreClient(ABC):
     async def is_sleeping_async(self) -> bool:
         raise NotImplementedError
 
+    async def checkpoint_prepare_async(self) -> None:
+        raise NotImplementedError
+
+    async def checkpoint_restore_async(self) -> None:
+        raise NotImplementedError
+
+    async def is_checkpoint_prepared_async(self) -> bool:
+        raise NotImplementedError
+
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
@@ -1355,6 +1364,15 @@ class AsyncMPClient(MPClient):
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_consensus_async("is_sleeping")
 
+    async def checkpoint_prepare_async(self) -> None:
+        await self.call_utility_async("checkpoint_prepare")
+
+    async def checkpoint_restore_async(self) -> None:
+        await self.call_utility_async("checkpoint_restore")
+
+    async def is_checkpoint_prepared_async(self) -> bool:
+        return await self.call_utility_async("is_checkpoint_prepared")
+
     async def execute_dummy_batch_async(self) -> None:
         await self.call_utility_async("execute_dummy_batch")
 
@@ -1699,6 +1717,17 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
         return (await self.call_utility_all_async(method, *args))[0]
+
+    async def is_checkpoint_prepared_async(self) -> bool:
+        # Engines finish preparing independently; all must be prepared.
+        return all(
+            await asyncio.gather(
+                *[
+                    self._call_utility_async("is_checkpoint_prepared", engine=engine)
+                    for engine in self.core_engines
+                ]
+            )
+        )
 
     @staticmethod
     async def process_engine_outputs(

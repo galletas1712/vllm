@@ -207,6 +207,9 @@ The following endpoints **do not require authentication** even when `--api-key` 
 - `/abort_requests` - Abort in-flight requests (causes loss of in-flight work)
 - `/scale_elastic_ep` - Trigger scaling operations
 - `/is_scaling_elastic_ep` - Check if scaling is in progress
+- `/checkpoint/prepare` - Prepare for a process checkpoint (causes denial of service)
+- `/checkpoint/resume` - Resume after a process checkpoint
+- `/checkpoint/status` - Check if the server is prepared for a checkpoint
 - `/init_weight_transfer_engine` - Initialize weight transfer engine for RLHF
 - `/update_weights` - Update model weights (can alter model behavior)
 - `/get_world_size` - Get distributed world size
@@ -258,7 +261,7 @@ These endpoints are only available when profiling is enabled and should only be 
 An attacker who can reach the vLLM HTTP server can:
 
 1. **Bypass authentication** by using endpoints outside the protected path prefixes, such as `/invocations`, `/generative_scoring`, `/pooling`, `/classify`, `/score`, or `/rerank`, to run arbitrary inference without credentials
-2. **Cause denial of service** by calling `/pause`, `/scale_elastic_ep`, or `/abort_requests` without a token
+2. **Cause denial of service** by calling `/pause`, `/scale_elastic_ep`, `/abort_requests`, or `/checkpoint/prepare` without a token
 3. **Access operational controls** to manipulate server state (e.g., pausing generation, updating model weights via `/update_weights`)
 4. **If `--enable-tokenizer-info-endpoint` is set:** Access sensitive tokenizer configuration including chat templates, which may reveal prompt engineering strategies or other implementation details
 5. **If `VLLM_SERVER_DEV_MODE=1` is set:** Execute arbitrary RPC commands via `/collective_rpc`, reset caches, put the engine to sleep, and access detailed server configuration

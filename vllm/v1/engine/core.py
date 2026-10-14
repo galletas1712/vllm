@@ -247,6 +247,8 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
+        # Set from checkpoint_prepare until checkpoint_restore completes.
+        self._checkpoint: Future[None] | None = None
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -1038,6 +1040,58 @@ class EngineCore:
         self._reset_caches()
         self.model_executor.discard(("kv_cache",))
 
+    def checkpoint_prepare(self) -> Future[None]:
+        """Prepare for an external process checkpoint: drain in-flight
+        requests, then release KV cache memory and communicator state.
+        Weights stay resident. Requests added meanwhile wait for restore.
+        Repeated calls return the same future.
+        """
+        if self._checkpoint is None:
+            pause = self.pause_scheduler(mode="wait", clear_cache=False)
+            self._checkpoint = future = Future[None]()
+            if pause is None:
+                self._finish_checkpoint_prepare(future, None)
+            else:
+                pause.add_done_callback(
+                    lambda pause: self._finish_checkpoint_prepare(future, pause)
+                )
+        return self._checkpoint
+
+    def _finish_checkpoint_prepare(
+        self, future: Future[None], pause: Future | None
+    ) -> None:
+        try:
+            if pause is not None:
+                pause.result()
+            self.release_kv_cache_memory()
+            self.collective_rpc("checkpoint_prepare")
+            self.collective_rpc("synchronize_device")
+        except Exception as e:
+            logger.exception("Checkpoint preparation failed")
+            future.set_exception(e)
+        else:
+            future.set_result(None)
+
+    def checkpoint_restore(self) -> None:
+        """Rebuild what checkpoint_prepare released and resume scheduling.
+        No-op unless prepared."""
+        if self._checkpoint is None:
+            return
+        if not self._checkpoint.done():
+            raise RuntimeError("checkpoint_prepare is still in progress")
+        self._checkpoint.result()
+        # Communicators must be usable before wake_up resumes scheduling.
+        self.collective_rpc("checkpoint_restore")
+        self.wake_up(["kv_cache"])
+        self._checkpoint = None
+
+    def is_checkpoint_prepared(self) -> bool:
+        return (
+            self._checkpoint is not None
+            and self._checkpoint.done()
+            and self._checkpoint.exception() is None
+        )
+
     def is_sleeping(self) -> bool:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
@@ -1245,6 +1299,9 @@ class EngineCoreProc(EngineCore):
                     raise RuntimeError("Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
+
+            if vllm_config.model_config.checkpoint_prepare_on_startup:
+                self.checkpoint_prepare()
 
     @contextmanager
     def _perform_handshakes(

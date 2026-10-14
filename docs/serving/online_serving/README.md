@@ -171,6 +171,15 @@ For further details on derenderer APIs, please refer to [this page](derenderer.m
 - `/scale_elastic_ep` - Trigger scaling operations
 - `/is_scaling_elastic_ep` - Check if scaling is in progress
 
+## Process Checkpoint APIs
+
+For external checkpoint/restore orchestrators. Requires `--enable-sleep-mode`.
+`--checkpoint-prepare-on-startup` prepares once the engines start.
+
+- `/checkpoint/prepare` - Drain requests, then release KV cache memory and communicator state (causes denial of service)
+- `/checkpoint/resume` - Rebuild released state and resume generation
+- `/checkpoint/status` - Return 200 once prepared, otherwise 503
+
 ## Server in development mode
 
 When using the flag VLLM_SERVER_DEV_MODE=1, you enable development endpoints.
