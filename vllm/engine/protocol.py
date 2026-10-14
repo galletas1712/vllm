@@ -19,7 +19,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
-from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine import CheckpointState, EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 from vllm.v1.kv_hints import KvHintsEnvelope
@@ -212,6 +212,23 @@ class EngineClient(ABC):
     @abstractmethod
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping."""
+        ...
+
+    @abstractmethod
+    async def checkpoint_prepare(self) -> None:
+        """Release what a process checkpoint must not contain, after a drained
+        pause and any sleep or KV release the caller wants captured."""
+        ...
+
+    @abstractmethod
+    async def checkpoint_restore(self) -> None:
+        """Bring back what checkpoint_prepare released, before wake_up and
+        resume_generation."""
+        ...
+
+    @abstractmethod
+    async def checkpoint_state(self) -> tuple[CheckpointState, str | None]:
+        """Return the checkpoint lifecycle state and the error that failed it."""
         ...
 
     @abstractmethod

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
@@ -46,6 +46,9 @@ pub struct AppState {
     api_key_hashes: Vec<ApiKeyHash>,
     /// Number of in-flight inference requests currently owned by this frontend.
     server_load: AtomicU64,
+    /// Whether the engines serve requests. Engines started with
+    /// `--checkpoint-prepare-on-startup` serve only after `/checkpoint/resume`.
+    pub(crate) engine_serving: AtomicBool,
     /// Dynamic LoRA adapter registry.
     lora_manager: LoraManager,
     /// Backend model path reported as `root` for base-model cards.
@@ -71,6 +74,11 @@ impl AppState {
             !served_model_names.is_empty(),
             "served_model_names must not be empty"
         );
+        let engine_serving = !chat
+            .engine_core_client()
+            .ready_responses()
+            .iter()
+            .any(|ready| ready.checkpoint_prepare_on_startup);
         Self {
             served_model_names,
             chat,
@@ -79,6 +87,7 @@ impl AppState {
             server_info: None,
             api_key_hashes: Vec::new(),
             server_load: AtomicU64::new(0),
+            engine_serving: AtomicBool::new(engine_serving),
             lora_manager: LoraManager::new(),
             model_path: None,
             request_runtime: OnceLock::new(),
