@@ -28,6 +28,7 @@ from torch.autograd.profiler import record_function
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.tracing import refresh_tracer
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils.network_utils import ZmqListener, get_open_zmq_ipc_path, get_tcp_uri
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
@@ -37,6 +38,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 if TYPE_CHECKING:
     import numpy as np
 
+    from vllm.config import VllmConfig
     from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
 
@@ -877,10 +879,25 @@ def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDet
     )
 
 
-def apply_restore_context(env: dict[str, str | None], flags: dict[str, Any]) -> None:
-    """Make this process match the pod it was restored into, whose environment
-    may differ from the captured one. Engine arguments describe state captured
-    with the process, so none can change yet. Raises before any change."""
-    if flags:
-        raise ValueError(f"Engine arguments {sorted(flags)} cannot change on restore")
+# Engine arguments that describe the pod a checkpoint is restored into, by the
+# config and field each one sets. The others describe state captured with the
+# process and cannot change on restore.
+_RESTORABLE_FLAGS = {
+    "otlp_traces_endpoint": ("observability_config", "otlp_traces_endpoint"),
+}
+
+
+def apply_restore_context(
+    vllm_config: "VllmConfig", env: dict[str, str | None], flags: dict[str, Any]
+) -> None:
+    """Make this process match the pod it was restored into, whose engine
+    arguments and environment may differ from the captured ones, then rebuild
+    the tracer built from them. Raises before any change if an argument
+    cannot change."""
+    if unknown := sorted(flags.keys() - _RESTORABLE_FLAGS.keys()):
+        raise ValueError(f"Engine arguments {unknown} cannot change on restore")
+    for name, value in flags.items():
+        config_name, field = _RESTORABLE_FLAGS[name]
+        setattr(getattr(vllm_config, config_name), field, value)
     envs.update_environ(env)
+    refresh_tracer(vllm_config.observability_config.otlp_traces_endpoint)

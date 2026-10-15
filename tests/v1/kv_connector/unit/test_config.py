@@ -123,6 +123,7 @@ def _build_config(
     cfg.model_config = SimpleNamespace(
         enable_sleep_mode=enable_sleep_mode,
         enable_cumem_allocator=(enable_cumem_allocator or enable_sleep_mode),
+        checkpoint_prepare_on_startup=False,
     )
     cfg._verify_kv_transfer_compat()
     return cfg

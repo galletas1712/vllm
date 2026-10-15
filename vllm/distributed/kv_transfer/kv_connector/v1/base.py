@@ -211,6 +211,12 @@ class KVConnectorBase_V1(ABC):
         """Whether the connector can follow the KV cache remap of sleep mode."""
         return True
 
+    @classmethod
+    def supports_checkpoint(cls, kv_transfer_config: "KVTransferConfig") -> bool:
+        """Whether the connector can follow the KV cache release of the process
+        checkpoint lifecycle, which also restarts it under a new engine id."""
+        return cls.supports_sleep_mode(kv_transfer_config)
+
     def __init__(
         self,
         vllm_config: "VllmConfig",

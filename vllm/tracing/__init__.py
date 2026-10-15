@@ -15,6 +15,7 @@ from .otel import (
     is_otel_available,
     manual_instrument_otel,
     otel_import_error_traceback,
+    refresh_otel_tracer,
 )
 from .utils import (
     SpanAttributes,
@@ -28,6 +29,7 @@ __all__ = [
     "instrument_manual",
     "init_tracer",
     "maybe_init_worker_tracer",
+    "refresh_tracer",
     "is_tracing_available",
     "SpanAttributes",
     "SpanKind",
@@ -85,6 +87,12 @@ def maybe_init_worker_tracer(
         return init_worker_tracer_fn(
             instrumenting_module_name, process_kind, process_name
         )
+
+
+def refresh_tracer(otlp_traces_endpoint: str | None) -> None:
+    """Rebuild this process's tracer, if any, from the current environment."""
+    if is_otel_available() and otlp_traces_endpoint is not None:
+        refresh_otel_tracer(otlp_traces_endpoint)
 
 
 def instrument(
