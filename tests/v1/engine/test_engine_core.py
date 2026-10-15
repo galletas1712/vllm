@@ -745,3 +745,33 @@ def test_pause_synchronizes_device_before_cache_reset(deferred: bool):
     else:
         assert result is None
     assert order == ["synchronize_device", "reset_caches"]
+
+
+@pytest.mark.parametrize("offload_weights", [False, True])
+def test_startup_prepare_offloads_weights_after_kv_cache_release(
+    offload_weights: bool,
+):
+    """Weights go to host memory only after the KV cache is released and
+    before communicators are released."""
+    core = _pausable_engine_core_proc()
+    core._checkpoint_state = CheckpointState.PREPARING
+    core.scheduler.pause_state = PauseState.PAUSED_NEW
+    core.vllm_config = MagicMock()
+    core.vllm_config.model_config.checkpoint_offload_weights = offload_weights
+    order: list[str] = []
+    core.model_executor.collective_rpc.side_effect = lambda method, *_: order.append(
+        method
+    )
+    core.model_executor.sleep.side_effect = lambda level: order.append(f"sleep:{level}")
+    core.release_kv_cache_memory = lambda: order.append("release_kv_cache_memory")
+
+    core._finish_pause(clear_cache=False)
+
+    assert core._checkpoint_state == CheckpointState.PREPARED
+    assert order == [
+        "synchronize_device",
+        "release_kv_cache_memory",
+        *(["sleep:1"] if offload_weights else []),
+        "checkpoint_prepare",
+        "synchronize_device",
+    ]

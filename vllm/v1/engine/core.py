@@ -925,6 +925,8 @@ class EngineCore:
             # FAILED instead of serving.
             try:
                 self.release_kv_cache_memory()
+                if self.vllm_config.model_config.checkpoint_offload_weights:
+                    self.model_executor.sleep(level=1)
                 self.checkpoint_prepare()
             except Exception as e:
                 self._fail_checkpoint(e)

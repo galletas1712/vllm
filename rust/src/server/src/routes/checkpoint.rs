@@ -49,7 +49,7 @@ pub async fn resume(State(state): State<Arc<AppState>>) -> CheckpointResult {
             .await
             .map_err(|error| utility_call_error("checkpoint_restore", error))?;
         client
-            .wake_up(Some(vec!["kv_cache".to_string()]))
+            .wake_up(None)
             .await
             .map_err(|error| utility_call_error("wake_up", error))?;
     }

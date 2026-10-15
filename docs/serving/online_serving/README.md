@@ -176,6 +176,7 @@ For further details on derenderer APIs, please refer to [this page](derenderer.m
 For external checkpoint/restore orchestrators. With `--enable-sleep-mode` and
 `--checkpoint-prepare-on-startup`, each engine drains, releases its KV cache and
 prepares for a checkpoint once it starts. `/health` returns 503 until resumed.
+`--checkpoint-offload-weights` also offloads weights to host memory until resumed.
 
 - `/checkpoint/status` - Return 200 once prepared, otherwise 503, with the state
 - `/checkpoint/resume` - Bring back released state and serve; 409 while preparing, while another resume is in progress or after a failure
