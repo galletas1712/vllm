@@ -35,7 +35,7 @@ async def checkpoint_resume(raw_request: Request):
         return _state_response(state, error, 409)
     if state != CheckpointState.RUNNING:
         await client.checkpoint_restore()
-        await client.wake_up(["kv_cache"])
+        await client.wake_up()
     return _state_response(CheckpointState.RUNNING, None, 200)
 
 
