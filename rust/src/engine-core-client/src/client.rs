@@ -21,7 +21,7 @@ use crate::protocol::dtype::ModelDtype;
 use crate::protocol::handshake::EngineCoreReadyResponse;
 use crate::protocol::lora::LoraRequest;
 use crate::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
-use crate::protocol::utility::{EngineCoreUtilityRequest, PauseMode};
+use crate::protocol::utility::{CheckpointState, EngineCoreUtilityRequest, PauseMode};
 use crate::runtime::{BackgroundShutdownRuntime, build_zmq_runtime};
 use crate::transport::{self, ConnectedEngine};
 
@@ -973,6 +973,41 @@ impl EngineCoreClient {
             .await?
             .into_iter()
             .all(|fully_awake| fully_awake))
+    }
+
+    /// Bring back what `checkpoint_prepare` released, before `wake_up` and
+    /// `resume_scheduler`. `env` and `flags` are the environment and engine
+    /// arguments of the pod restored into, applied in every engine process
+    /// first. A `None` env value unsets a variable.
+    pub async fn checkpoint_restore(
+        &self,
+        env: &BTreeMap<String, Option<String>>,
+        flags: &BTreeMap<String, JsonValue>,
+    ) -> Result<()> {
+        self.call_utility::<(), _>("checkpoint_restore", (env, flags)).await?;
+        Ok(())
+    }
+
+    /// Return the checkpoint lifecycle state and the error that failed it.
+    ///
+    /// Under data parallel, engines move independently: failed if any failed,
+    /// otherwise the state all engines share, otherwise the transition in
+    /// progress.
+    pub async fn checkpoint_state(&self) -> Result<(CheckpointState, Option<String>)> {
+        let states: Vec<(CheckpointState, Option<String>)> =
+            self.call_utility("checkpoint_state", ()).await?;
+        if let Some(failed) = states.iter().find(|(state, _)| *state == CheckpointState::Failed) {
+            return Ok(failed.clone());
+        }
+        let state = if states.iter().map(|(state, _)| state).all_equal() {
+            // `engine_count >= 1` is enforced during startup handshake.
+            states[0].0
+        } else if states.iter().any(|(state, _)| *state == CheckpointState::Preparing) {
+            CheckpointState::Preparing
+        } else {
+            CheckpointState::Resuming
+        };
+        Ok((state, None))
     }
 
     /// Pause the scheduler so generation can be halted

@@ -97,7 +97,11 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.utils import (
+    apply_restore_context,
+    compute_iteration_details,
+    report_usage_stats,
+)
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -367,7 +371,12 @@ class Worker(WorkerBase):
     def checkpoint_prepare(self) -> None:
         checkpoint_prepare_distributed_state()
 
-    def checkpoint_restore(self) -> None:
+    def checkpoint_restore(
+        self,
+        env: dict[str, str | None] | None = None,
+        flags: dict[str, Any] | None = None,
+    ) -> None:
+        apply_restore_context(env or {}, flags or {})
         checkpoint_restore_distributed_state()
 
     def _weight_checksum_prefix(self) -> str:

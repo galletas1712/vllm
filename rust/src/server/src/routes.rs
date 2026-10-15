@@ -3,6 +3,7 @@
 
 mod abort_requests;
 mod cache;
+mod checkpoint;
 mod collective_rpc;
 mod health;
 mod inference;
@@ -113,6 +114,9 @@ fn build_router_with_options(
         .route("/load", get(load::load))
         .route("/version", get(version::version))
         .route("/kv_event_sources", get(kv_event_sources::kv_event_sources))
+        // Checkpoint lifecycle
+        .route("/checkpoint/resume", post(checkpoint::resume))
+        .route("/checkpoint/status", get(checkpoint::status))
         // OpenAI-compatible endpoints
         .route("/v1/models", get(openai::list_models))
         .route("/v1/completions", post(openai::completions))
