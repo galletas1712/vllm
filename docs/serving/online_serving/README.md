@@ -173,13 +173,12 @@ For further details on derenderer APIs, please refer to [this page](derenderer.m
 
 ## Process Checkpoint APIs
 
-For external checkpoint/restore orchestrators. Requires `--enable-sleep-mode`.
-`--checkpoint-prepare-on-startup` prepares once the engines start.
-`--checkpoint-offload-weights` also offloads weights to host memory during prepare.
+For external checkpoint/restore orchestrators. With `--enable-sleep-mode` and
+`--checkpoint-prepare-on-startup`, each engine drains, releases its KV cache and
+prepares for a checkpoint once it starts. `/health` returns 503 until resumed.
 
-- `/checkpoint/prepare` - Drain requests, then release KV cache memory and communicator state (causes denial of service)
-- `/checkpoint/resume` - Rebuild released state and resume generation
-- `/checkpoint/status` - Return 200 once prepared, otherwise 503
+- `/checkpoint/status` - Return 200 once prepared, otherwise 503, with the state
+- `/checkpoint/resume` - Bring back released state and serve; 409 while preparing, while another resume is in progress or after a failure
 
 ## Server in development mode
 

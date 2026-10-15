@@ -65,6 +65,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
+    CheckpointState,
     EEPNotificationType,
     EngineCoreOutput,
     EngineCoreOutputs,
@@ -247,8 +248,8 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
-        # Set from checkpoint_prepare until checkpoint_restore completes.
-        self._checkpoint: Future[None] | None = None
+        self._checkpoint_state = CheckpointState.RUNNING
+        self._checkpoint_error: str | None = None
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -919,6 +920,14 @@ class EngineCore:
         self.model_executor.collective_rpc("synchronize_device")
         if clear_cache:
             self._reset_caches()
+        if self._checkpoint_state == CheckpointState.PREPARING:
+            # The startup drain is complete. A failure leaves the engine
+            # FAILED instead of serving.
+            try:
+                self.release_kv_cache_memory()
+                self.checkpoint_prepare()
+            except Exception as e:
+                self._fail_checkpoint(e)
 
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -952,7 +961,11 @@ class EngineCore:
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
+        if not self._checkpoint_state.is_restored:
+            raise RuntimeError("resume_scheduler() requires checkpoint_restore() first")
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
+        if self._checkpoint_state == CheckpointState.RESUMING:
+            self._checkpoint_state = CheckpointState.RUNNING
 
     def is_scheduler_paused(self) -> bool:
         """Return whether the scheduler is in any pause state."""
@@ -1006,6 +1019,8 @@ class EngineCore:
             Whether all executor memory is resident again (fully awake).
 
         """
+        if not self._checkpoint_state.is_restored:
+            raise RuntimeError("wake_up() requires checkpoint_restore() first")
         if tags is not None and "scheduling" in tags:
             # Remove "scheduling" from tags if there are other tags to process.
             tags = [t for t in tags if t != "scheduling"]
@@ -1020,16 +1035,19 @@ class EngineCore:
             self.resume_scheduler()
         return fully_awake
 
+    def _is_drained(self) -> bool:
+        return (
+            self.is_scheduler_paused()
+            and not self.scheduler.has_requests()
+            and not self.batch_queue
+        )
+
     def release_kv_cache_memory(self) -> None:
         """Discard KV cache physical memory. Requires a completed pause
         and all executor memory to be resident. Kept requests are recomputed
         after wake-up.
         """
-        if not (
-            self.is_scheduler_paused()
-            and not self.scheduler.has_requests()
-            and not self.batch_queue
-        ):
+        if not self._is_drained():
             raise RuntimeError(
                 "release_kv_cache_memory() requires a completed pause first"
             )
@@ -1040,63 +1058,47 @@ class EngineCore:
         self._reset_caches()
         self.model_executor.discard(("kv_cache",))
 
-    def checkpoint_prepare(self) -> Future[None]:
-        """Prepare for an external process checkpoint: drain in-flight
-        requests, then release KV cache memory and communicator state.
-        Weights stay resident unless checkpoint_offload_weights is set.
-        Requests added meanwhile wait for restore.
-        Repeated calls return the same future.
-        """
-        if self._checkpoint is None:
-            pause = self.pause_scheduler(mode="wait", clear_cache=False)
-            self._checkpoint = future = Future[None]()
-            if pause is None:
-                self._finish_checkpoint_prepare(future, None)
-            else:
-                pause.add_done_callback(
-                    lambda pause: self._finish_checkpoint_prepare(future, pause)
-                )
-        return self._checkpoint
-
-    def _finish_checkpoint_prepare(
-        self, future: Future[None], pause: Future | None
-    ) -> None:
+    def checkpoint_prepare(self) -> None:
+        """Release what a process checkpoint must not contain, such as
+        communicator state. Requires a drained pause. Memory stays as the
+        caller left it with sleep() or release_kv_cache_memory()."""
+        if self._checkpoint_state == CheckpointState.PREPARED:
+            return
+        if self._checkpoint_state == CheckpointState.FAILED:
+            raise RuntimeError(f"Checkpoint failed: {self._checkpoint_error}")
+        if not self._is_drained():
+            raise RuntimeError("checkpoint_prepare() requires a completed pause first")
         try:
-            if pause is not None:
-                pause.result()
-            self.release_kv_cache_memory()
-            if self.vllm_config.model_config.checkpoint_offload_weights:
-                self.model_executor.sleep(level=1)
             self.collective_rpc("checkpoint_prepare")
             self.collective_rpc("synchronize_device")
         except Exception as e:
-            logger.exception("Checkpoint preparation failed")
-            future.set_exception(e)
-        else:
-            future.set_result(None)
+            self._fail_checkpoint(e)
+            raise
+        self._checkpoint_state = CheckpointState.PREPARED
 
     def checkpoint_restore(self) -> None:
-        """Rebuild what checkpoint_prepare released and resume scheduling.
-        No-op unless prepared."""
-        if self._checkpoint is None:
+        """Bring back what checkpoint_prepare released. Memory and scheduling
+        stay as they are. wake_up() and resume_scheduler() follow."""
+        if self._checkpoint_state.is_restored:
             return
-        if not self._checkpoint.done():
-            raise RuntimeError("checkpoint_prepare is still in progress")
-        self._checkpoint.result()
-        # Communicators must be usable before wake_up resumes scheduling.
-        self.collective_rpc("checkpoint_restore")
-        if self.vllm_config.model_config.checkpoint_offload_weights:
-            self.wake_up(["weights", "kv_cache"])
-        else:
-            self.wake_up(["kv_cache"])
-        self._checkpoint = None
+        if self._checkpoint_state != CheckpointState.PREPARED:
+            raise RuntimeError(
+                f"Cannot restore while the checkpoint state is {self._checkpoint_state}"
+            )
+        try:
+            self.collective_rpc("checkpoint_restore")
+        except Exception as e:
+            self._fail_checkpoint(e)
+            raise
+        self._checkpoint_state = CheckpointState.RESUMING
 
-    def is_checkpoint_prepared(self) -> bool:
-        return (
-            self._checkpoint is not None
-            and self._checkpoint.done()
-            and self._checkpoint.exception() is None
-        )
+    def checkpoint_state(self) -> tuple[CheckpointState, str | None]:
+        return self._checkpoint_state, self._checkpoint_error
+
+    def _fail_checkpoint(self, error: Exception) -> None:
+        logger.exception("Checkpoint lifecycle failed")
+        self._checkpoint_state = CheckpointState.FAILED
+        self._checkpoint_error = str(error)
 
     def is_sleeping(self) -> bool:
         """Check if engine is sleeping at any level."""
@@ -1307,7 +1309,10 @@ class EngineCoreProc(EngineCore):
                 logger.info("Waiting for READY message from DP Coordinator...")
 
             if vllm_config.model_config.checkpoint_prepare_on_startup:
-                self.checkpoint_prepare()
+                # _finish_pause releases the KV cache and prepares once the
+                # drain completes, which for DP happens in the busy loop.
+                self._checkpoint_state = CheckpointState.PREPARING
+                self.pause_scheduler(mode="wait", clear_cache=False)
 
     @contextmanager
     def _perform_handshakes(
@@ -1888,6 +1893,9 @@ class EngineCoreProc(EngineCore):
                 self.model_executor.supports_draft_weight_updates()
                 if self.vllm_config.weight_transfer_config is not None
                 else False
+            ),
+            checkpoint_prepare_on_startup=(
+                self.vllm_config.model_config.checkpoint_prepare_on_startup
             ),
         )
 

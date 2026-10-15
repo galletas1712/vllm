@@ -38,6 +38,7 @@ from vllm.utils.network_utils import (
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     FT_STATUS_CALL_ID,
+    CheckpointState,
     EEPNotificationType,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
@@ -318,7 +319,7 @@ class EngineCoreClient(ABC):
     async def checkpoint_restore_async(self) -> None:
         raise NotImplementedError
 
-    async def is_checkpoint_prepared_async(self) -> bool:
+    async def checkpoint_state_async(self) -> tuple[CheckpointState, str | None]:
         raise NotImplementedError
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -1370,8 +1371,9 @@ class AsyncMPClient(MPClient):
     async def checkpoint_restore_async(self) -> None:
         await self.call_utility_async("checkpoint_restore")
 
-    async def is_checkpoint_prepared_async(self) -> bool:
-        return await self.call_utility_async("is_checkpoint_prepared")
+    async def checkpoint_state_async(self) -> tuple[CheckpointState, str | None]:
+        state, error = await self.call_utility_async("checkpoint_state")
+        return CheckpointState(state), error
 
     async def execute_dummy_batch_async(self) -> None:
         await self.call_utility_async("execute_dummy_batch")
@@ -1718,16 +1720,20 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # Only the result from the first engine is returned.
         return (await self.call_utility_all_async(method, *args))[0]
 
-    async def is_checkpoint_prepared_async(self) -> bool:
-        # Engines finish preparing independently; all must be prepared.
-        return all(
-            await asyncio.gather(
-                *[
-                    self._call_utility_async("is_checkpoint_prepared", engine=engine)
-                    for engine in self.core_engines
-                ]
-            )
-        )
+    async def checkpoint_state_async(self) -> tuple[CheckpointState, str | None]:
+        # Engines move independently: failed if any failed, otherwise a state
+        # all share or the transition in progress.
+        states = {
+            CheckpointState(state): error
+            for state, error in await self.call_utility_all_async("checkpoint_state")
+        }
+        if CheckpointState.FAILED in states:
+            return CheckpointState.FAILED, states[CheckpointState.FAILED]
+        if len(states) == 1:
+            return next(iter(states)), None
+        if CheckpointState.PREPARING in states:
+            return CheckpointState.PREPARING, None
+        return CheckpointState.RESUMING, None
 
     @staticmethod
     async def process_engine_outputs(

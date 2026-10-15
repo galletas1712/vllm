@@ -7,52 +7,67 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use serde::Serialize;
+use vllm_engine_core_client::protocol::utility::CheckpointState;
 
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::utils::utility_call_error;
 
 #[derive(Serialize)]
-pub(crate) struct CheckpointStatusResponse {
-    prepared: bool,
+pub(crate) struct CheckpointStateResponse {
+    state: CheckpointState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
-/// Prepare the engines for an external process checkpoint.
-pub async fn prepare(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
-    state
-        .engine_core_client()
-        .checkpoint_prepare()
-        .await
-        .map_err(|error| utility_call_error("checkpoint_prepare", error))?;
+type CheckpointResult = Result<(StatusCode, Json<CheckpointStateResponse>), ApiError>;
 
-    Ok(StatusCode::OK)
+fn state_response(
+    status: StatusCode,
+    state: CheckpointState,
+    error: Option<String>,
+) -> CheckpointResult {
+    Ok((status, Json(CheckpointStateResponse { state, error })))
 }
 
-/// Rebuild released state and resume serving after a checkpoint restore.
-pub async fn resume(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
-    state
-        .engine_core_client()
-        .checkpoint_restore()
+/// Bring back what preparation released and serve. Repeating is a no-op.
+pub async fn resume(State(state): State<Arc<AppState>>) -> CheckpointResult {
+    let client = state.engine_core_client();
+    let (checkpoint_state, error) = client
+        .checkpoint_state()
         .await
-        .map_err(|error| utility_call_error("checkpoint_restore", error))?;
-
-    Ok(StatusCode::OK)
+        .map_err(|error| utility_call_error("checkpoint_state", error))?;
+    if matches!(
+        checkpoint_state,
+        CheckpointState::Preparing | CheckpointState::Resuming | CheckpointState::Failed
+    ) {
+        return state_response(StatusCode::CONFLICT, checkpoint_state, error);
+    }
+    if checkpoint_state != CheckpointState::Running {
+        client
+            .checkpoint_restore()
+            .await
+            .map_err(|error| utility_call_error("checkpoint_restore", error))?;
+        client
+            .wake_up(Some(vec!["kv_cache".to_string()]))
+            .await
+            .map_err(|error| utility_call_error("wake_up", error))?;
+    }
+    state_response(StatusCode::OK, CheckpointState::Running, None)
 }
 
-/// Return 200 only once every engine is prepared, so orchestrators can poll it.
-pub async fn status(
-    State(state): State<Arc<AppState>>,
-) -> Result<(StatusCode, Json<CheckpointStatusResponse>), ApiError> {
-    let prepared = state
+/// Return 200 only once every engine is prepared, so orchestrators can poll it
+/// to learn when the process is safe to capture.
+pub async fn status(State(state): State<Arc<AppState>>) -> CheckpointResult {
+    let (checkpoint_state, error) = state
         .engine_core_client()
-        .is_checkpoint_prepared()
+        .checkpoint_state()
         .await
-        .map_err(|error| utility_call_error("is_checkpoint_prepared", error))?;
-    let status = if prepared {
+        .map_err(|error| utility_call_error("checkpoint_state", error))?;
+    let status = if checkpoint_state == CheckpointState::Prepared {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-
-    Ok((status, Json(CheckpointStatusResponse { prepared })))
+    state_response(status, checkpoint_state, error)
 }

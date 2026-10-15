@@ -473,6 +473,7 @@ class EngineCoreReadyResponse:
     enable_sleep_mode: bool = False
     supports_draft_weight_updates: bool = False
     effective_attention_block_size: int | None = None
+    checkpoint_prepare_on_startup: bool = False
 
 
 ready_response = EngineCoreReadyResponse(

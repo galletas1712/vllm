@@ -385,11 +385,9 @@ class ModelConfig:
     (``ncclCommSuspend``/``ncclCommResume``). Experimental; when disabled
     (the default) sleep still releases weights/KV-cache memory as before."""
     checkpoint_prepare_on_startup: bool = False
-    """Prepare each engine for an external process checkpoint once it starts,
-    as if `/checkpoint/prepare` were called. Requires sleep mode."""
-    checkpoint_offload_weights: bool = False
-    """Also offload weights to host memory when preparing for an external
-    process checkpoint, as sleep level 1 does. Requires sleep mode."""
+    """Once each engine starts, drain it, release its KV cache and prepare it
+    for an external process checkpoint. It serves only after
+    `/checkpoint/resume`. Requires sleep mode."""
     enable_cumem_allocator: bool = False
     """Enable the custom cumem allocator to leverage advanced GPU memory
     allocation features such as multi-node NVLink support.
@@ -503,7 +501,6 @@ class ModelConfig:
             "skip_mm_profiling",
             "mm_ipc_gpu_memory_gb",
             "checkpoint_prepare_on_startup",
-            "checkpoint_offload_weights",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -662,8 +659,6 @@ class ModelConfig:
 
         if self.checkpoint_prepare_on_startup and not self.enable_sleep_mode:
             raise ValueError("checkpoint_prepare_on_startup requires enable_sleep_mode")
-        if self.checkpoint_offload_weights and not self.enable_sleep_mode:
-            raise ValueError("checkpoint_offload_weights requires enable_sleep_mode")
         if self.enable_sleep_mode:
             if not current_platform.is_sleep_mode_available():
                 raise ValueError("Sleep mode is not supported on current platform.")

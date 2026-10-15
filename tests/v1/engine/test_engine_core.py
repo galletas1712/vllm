@@ -25,7 +25,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine import CheckpointState, EngineCoreRequest
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
@@ -698,8 +698,7 @@ def _pausable_engine_core_proc() -> EngineCoreProc:
     core.batch_queue = None
     core.engines_running = False
     core._idle_state_callbacks = []
-    core.vllm_config = MagicMock()
-    core.vllm_config.model_config.checkpoint_offload_weights = False
+    core._checkpoint_state = CheckpointState.RUNNING
     return core
 
 
@@ -746,82 +745,3 @@ def test_pause_synchronizes_device_before_cache_reset(deferred: bool):
     else:
         assert result is None
     assert order == ["synchronize_device", "reset_caches"]
-
-
-@pytest.mark.parametrize("deferred", [False, True])
-def test_checkpoint_releases_communicators_after_drain(deferred: bool):
-    """Communicators are released after the drain and rebuilt before
-    scheduling resumes. Repeated calls are no-ops."""
-    core = _pausable_engine_core_proc()
-    core._checkpoint = None
-    core.engines_running = deferred
-    order: list[str] = []
-    core.model_executor.collective_rpc.side_effect = lambda method, *_: order.append(
-        method
-    )
-    core.release_kv_cache_memory = lambda: order.append("release_kv_cache_memory")
-    core.wake_up = lambda tags: order.append(f"wake_up:{tags}")
-
-    prepared = core.checkpoint_prepare()
-    assert core.checkpoint_prepare() is prepared
-    if deferred:
-        assert not core.is_checkpoint_prepared()
-        with pytest.raises(RuntimeError, match="in progress"):
-            core.checkpoint_restore()
-        core.engines_running = False
-        core._notify_idle_state_callbacks()
-    assert prepared.result(timeout=0) is None
-    assert core.is_checkpoint_prepared()
-
-    core.checkpoint_restore()
-    core.checkpoint_restore()
-    assert not core.is_checkpoint_prepared()
-    assert order == [
-        "synchronize_device",
-        "release_kv_cache_memory",
-        "checkpoint_prepare",
-        "synchronize_device",
-        "checkpoint_restore",
-        "wake_up:['kv_cache']",
-    ]
-
-
-def test_checkpoint_offloads_weights_after_kv_cache_release():
-    """Weights go to host memory after the KV cache is released and wake with
-    it after communicators are rebuilt."""
-    core = _pausable_engine_core_proc()
-    core._checkpoint = None
-    core.vllm_config.model_config.checkpoint_offload_weights = True
-    order: list[str] = []
-    core.model_executor.collective_rpc.side_effect = lambda method, *_: order.append(
-        method
-    )
-    core.model_executor.sleep.side_effect = lambda level: order.append(f"sleep:{level}")
-    core.release_kv_cache_memory = lambda: order.append("release_kv_cache_memory")
-    core.wake_up = lambda tags: order.append(f"wake_up:{tags}")
-
-    assert core.checkpoint_prepare().result(timeout=0) is None
-    core.checkpoint_restore()
-
-    assert order == [
-        "synchronize_device",
-        "release_kv_cache_memory",
-        "sleep:1",
-        "checkpoint_prepare",
-        "synchronize_device",
-        "checkpoint_restore",
-        "wake_up:['weights', 'kv_cache']",
-    ]
-
-
-def test_failed_checkpoint_preparation_is_never_reported_prepared():
-    core = _pausable_engine_core_proc()
-    core._checkpoint = None
-    core.release_kv_cache_memory = MagicMock(side_effect=RuntimeError("busy"))
-
-    with pytest.raises(RuntimeError, match="busy"):
-        core.checkpoint_prepare().result(timeout=0)
-    assert not core.is_checkpoint_prepared()
-    with pytest.raises(RuntimeError, match="busy"):
-        core.checkpoint_restore()
-    core.model_executor.collective_rpc.assert_called_once_with("synchronize_device")

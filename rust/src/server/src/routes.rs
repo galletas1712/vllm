@@ -115,7 +115,6 @@ fn build_router_with_options(
         .route("/version", get(version::version))
         .route("/kv_event_sources", get(kv_event_sources::kv_event_sources))
         // Checkpoint lifecycle
-        .route("/checkpoint/prepare", post(checkpoint::prepare))
         .route("/checkpoint/resume", post(checkpoint::resume))
         .route("/checkpoint/status", get(checkpoint::status))
         // OpenAI-compatible endpoints

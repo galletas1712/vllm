@@ -21,7 +21,7 @@ use crate::protocol::dtype::ModelDtype;
 use crate::protocol::handshake::EngineCoreReadyResponse;
 use crate::protocol::lora::LoraRequest;
 use crate::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
-use crate::protocol::utility::{EngineCoreUtilityRequest, PauseMode};
+use crate::protocol::utility::{CheckpointState, EngineCoreUtilityRequest, PauseMode};
 use crate::runtime::{BackgroundShutdownRuntime, build_zmq_runtime};
 use crate::transport::{self, ConnectedEngine};
 
@@ -975,27 +975,33 @@ impl EngineCoreClient {
             .all(|fully_awake| fully_awake))
     }
 
-    /// Drain requests, then release KV cache memory and communicator state
-    /// before an external process checkpoint.
-    pub async fn checkpoint_prepare(&self) -> Result<()> {
-        self.call_utility::<(), _>("checkpoint_prepare", ()).await?;
-        Ok(())
-    }
-
-    /// Rebuild the state released by `checkpoint_prepare` and resume
-    /// scheduling.
+    /// Bring back what `checkpoint_prepare` released, before `wake_up` and
+    /// `resume_scheduler`.
     pub async fn checkpoint_restore(&self) -> Result<()> {
         self.call_utility::<(), _>("checkpoint_restore", ()).await?;
         Ok(())
     }
 
-    /// Return whether every engine is prepared for a checkpoint.
-    pub async fn is_checkpoint_prepared(&self) -> Result<bool> {
-        Ok(self
-            .call_utility::<bool, _>("is_checkpoint_prepared", ())
-            .await?
-            .into_iter()
-            .all(|prepared| prepared))
+    /// Return the checkpoint lifecycle state and the error that failed it.
+    ///
+    /// Under data parallel, engines move independently: failed if any failed,
+    /// otherwise the state all engines share, otherwise the transition in
+    /// progress.
+    pub async fn checkpoint_state(&self) -> Result<(CheckpointState, Option<String>)> {
+        let states: Vec<(CheckpointState, Option<String>)> =
+            self.call_utility("checkpoint_state", ()).await?;
+        if let Some(failed) = states.iter().find(|(state, _)| *state == CheckpointState::Failed) {
+            return Ok(failed.clone());
+        }
+        let state = if states.iter().map(|(state, _)| state).all_equal() {
+            // `engine_count >= 1` is enforced during startup handshake.
+            states[0].0
+        } else if states.iter().any(|(state, _)| *state == CheckpointState::Preparing) {
+            CheckpointState::Preparing
+        } else {
+            CheckpointState::Resuming
+        };
+        Ok((state, None))
     }
 
     /// Pause the scheduler so generation can be halted
