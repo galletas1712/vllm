@@ -237,6 +237,14 @@ impl AppState {
         self.chat.engine_core_client()
     }
 
+    /// Return whether every engine runs with sleep mode enabled.
+    pub(crate) fn sleep_mode_enabled(&self) -> bool {
+        self.engine_core_client()
+            .ready_responses()
+            .iter()
+            .all(|ready| ready.enable_sleep_mode)
+    }
+
     /// Runtime used by middleware to isolate heavyweight request handlers from
     /// the HTTP reactor.
     pub(crate) fn request_runtime(&self) -> &Runtime {
