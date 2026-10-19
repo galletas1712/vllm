@@ -95,6 +95,11 @@ from vllm.utils.mem_utils import (
 )
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.checkpoint_resources import (
+    checkpoint_blockers,
+    prepare_checkpoint_resources,
+    restore_checkpoint_resources,
+)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -371,11 +376,16 @@ class Worker(WorkerBase):
             get_kv_transfer_group().unregister_kv_caches()
         self.sleep_mode_backend.discard(tags)
 
+    def checkpoint_blockers(self) -> list[str]:
+        return checkpoint_blockers()
+
     def checkpoint_prepare(self) -> None:
+        prepare_checkpoint_resources()
         checkpoint_prepare_distributed_state()
 
     def checkpoint_restore(self) -> None:
         checkpoint_restore_distributed_state()
+        restore_checkpoint_resources()
 
     def _weight_checksum_prefix(self) -> str:
         # data_parallel_rank is 0 in dense workers; only the index is unique.
