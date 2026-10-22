@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base scheduler-side logic for the NIXL connector."""
 
+import ipaddress
 import threading
 import time
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import psutil
 import zmq
 
 from vllm import envs
@@ -74,6 +76,9 @@ class NixlBaseConnectorScheduler:
         self.engine_id: EngineId = engine_id
         self.kv_cache_config = kv_cache_config
         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
+        # (interface, address family) carrying the side-channel host at a
+        # checkpoint prepare, if it is an interface address.
+        self._side_channel_interface: tuple[str, int] | None = None
         self.side_channel_port = (
             envs.VLLM_NIXL_SIDE_CHANNEL_PORT
             + vllm_config.parallel_config.data_parallel_index
@@ -198,6 +203,43 @@ class NixlBaseConnectorScheduler:
         if self._nixl_handshake_listener_t is not None:
             self._nixl_handshake_listener_t.join()
             self._nixl_handshake_listener_t = None
+
+    def checkpoint_prepare(self) -> None:
+        # The listener's socket belongs to this process.
+        self.shutdown()
+        self._side_channel_interface = next(
+            (
+                (name, addr.family)
+                for name, addrs in psutil.net_if_addrs().items()
+                for addr in addrs
+                if addr.address.split("%")[0] == self.side_channel_host
+            ),
+            None,
+        )
+
+    def checkpoint_restore(self) -> None:
+        # The next handshake metadata restarts the listener.
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None and kv_transfer_config.engine_id
+        self.engine_id = kv_transfer_config.engine_id
+        if self._side_channel_interface is not None:
+            # The restored environment names the source pod's address; take
+            # the address of the same interface in this pod. Names are kept.
+            name, family = self._side_channel_interface
+            addresses = [
+                address
+                for addr in psutil.net_if_addrs().get(name, [])
+                if addr.family == family
+                and not ipaddress.ip_address(
+                    address := addr.address.split("%")[0]
+                ).is_link_local
+            ]
+            if not addresses:
+                raise RuntimeError(
+                    f"Side-channel interface {name} has no address after restore"
+                )
+            self.side_channel_host = addresses[0]
+        self._stop_event.clear()
 
     def on_new_request(self, request: "Request") -> None:
         """Track a request that may need heartbeats."""

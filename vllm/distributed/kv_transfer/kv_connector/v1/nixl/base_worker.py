@@ -702,19 +702,21 @@ class NixlBaseConnectorWorker:
                 else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)
             )
 
-        sleep_mode = vllm_config.model_config.enable_sleep_mode and config is not None
-        if sleep_mode:
+        self._sleep_mode = (
+            vllm_config.model_config.enable_sleep_mode and config is not None
+        )
+        if self._sleep_mode:
             config = nixl_agent_config(backends=[], capture_telemetry=True)
-        self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
-        if sleep_mode:
-            # Keep slept pages unpinned, for this agent only; UCX_* env vars win.
-            self.nixl_wrapper.create_backend(
-                "UCX",
-                {
-                    "num_threads": str(num_threads),
-                    "engine_config": "RCACHE_ENABLE=n,TLS=^cuda_ipc",
-                },
-            )
+        self._nixl_wrapper_cls = nixl_wrapper_cls
+        self._nixl_agent_config = config
+        self._nixl_num_threads = num_threads
+        # UCX caches network state, such as routes by interface index, for the
+        # life of the process, and a checkpointed process restores into another
+        # network namespace. So an engine that prepares at startup creates its
+        # agent at checkpoint restore.
+        self._has_agent = not vllm_config.model_config.checkpoint_prepare_on_startup
+        if self._has_agent:
+            self.nixl_wrapper = self._create_nixl_wrapper()
         # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.
         # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).
         self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = defaultdict(
@@ -1812,10 +1814,8 @@ class NixlBaseConnectorWorker:
                 "Mixed-device KV registration is only supported for MLA "
                 "models without Mamba layers."
             )
-        for mem_type in sorted(set(region_mem_types)):
-            if mem_type == "DRAM" and self._skip_dram_xfer:
-                continue
-            ranges_for_mem_type = [
+        self._registration_ranges = {
+            mem_type: [
                 (start, end - start, device_id, "")
                 for (_, cache_mem_type), (
                     start,
@@ -1824,9 +1824,9 @@ class NixlBaseConnectorWorker:
                 ) in registration_ranges.items()
                 if cache_mem_type == mem_type
             ]
-            descs = self.nixl_wrapper.get_reg_descs(ranges_for_mem_type, mem_type)
-            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
-            self._registered_descs.append(descs)
+            for mem_type in sorted(set(region_mem_types))
+            if not (mem_type == "DRAM" and self._skip_dram_xfer)
+        }
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
@@ -1850,6 +1850,16 @@ class NixlBaseConnectorWorker:
                 self._mamba_ssm_size,
                 set(self.block_len_per_layer),
             )
+
+        if self._has_agent:
+            self._register_with_nixl()
+
+    def _register_with_nixl(self) -> None:
+        """Register the KV regions with the agent and build the handshake payload."""
+        for mem_type, ranges in self._registration_ranges.items():
+            descs = self.nixl_wrapper.get_reg_descs(ranges, mem_type)
+            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+            self._registered_descs.append(descs)
 
         # Register local/src descr for NIXL xfer.
         self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
@@ -1917,6 +1927,10 @@ class NixlBaseConnectorWorker:
         self._kv_unregistered = True
 
     def restore_kv_caches(self) -> None:
+        if self.xfer_handshake_metadata is None:
+            # The agent created at checkpoint restore registers for the first time.
+            self._register_with_nixl()
+            return
         if not self._kv_unregistered:
             return
         for descs in self._registered_descs:
@@ -4011,6 +4025,43 @@ class NixlBaseConnectorWorker:
             # host memory; handshake futures may outlive model-runner shutdown.
             self.device_kv_caches = {}
             self.host_xfer_buffers = {}
+
+    def _create_nixl_wrapper(self):
+        # Agent names must be unique per process image; a restored copy gets a
+        # new one.
+        wrapper = self._nixl_wrapper_cls(str(uuid.uuid4()), self._nixl_agent_config)
+        if self._sleep_mode:
+            # Keep slept pages unpinned, for this agent only; UCX_* env vars win.
+            wrapper.create_backend(
+                "UCX",
+                {
+                    "num_threads": str(self._nixl_num_threads),
+                    "engine_config": "RCACHE_ENABLE=n,TLS=^cuda_ipc",
+                },
+            )
+        return wrapper
+
+    def checkpoint_restore(self) -> None:
+        """Create the agent under the restored engine id; the KV cache wake-up
+        registers it. Peers cache metadata by engine id, and several replicas
+        may restore from one checkpoint."""
+        self.nixl_wrapper = self._create_nixl_wrapper()
+        self._has_agent = True
+        engine_id = self.kv_transfer_config.engine_id
+        assert engine_id is not None
+        local_state: tuple[dict[EngineId, Any], ...] = (
+            self.kv_caches_base_addr,
+            self.dst_num_blocks,
+            self.dst_region_num_blocks,
+            self.dst_region_group_ids,
+            self.dst_uses_region_group_mapping,
+            self.dst_region_mem_types,
+        )
+        for state in local_state:
+            state[engine_id] = state.pop(self.engine_id)
+        if self.transfer_topo is not None:
+            self.transfer_topo.engine_id = engine_id
+        self.engine_id = engine_id
 
     def shutdown(self) -> None:
         """Shutdown the connector worker."""

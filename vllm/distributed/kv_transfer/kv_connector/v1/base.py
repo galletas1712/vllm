@@ -308,6 +308,16 @@ class KVConnectorBase_V1(ABC):
         """Redo `unregister_kv_caches` after wake-up. Idempotent."""
         return
 
+    def checkpoint_prepare(self) -> None:
+        """Release what a process checkpoint must not contain, after the KV
+        cache is released. Called only on an engine that prepares at startup."""
+        return
+
+    def checkpoint_restore(self) -> None:
+        """Rebuild what `checkpoint_prepare` released, under the restored
+        `kv_transfer_config.engine_id`, before the KV cache wakes up."""
+        return
+
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Set the xPU-specific ops for copying KV between host and device.
         Needed when host buffer is used for kv transfer (e.g., in NixlConnector)

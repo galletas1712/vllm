@@ -5,6 +5,7 @@ import contextlib
 import inspect
 import os
 import queue
+import socket
 import tempfile
 import textwrap
 import threading
@@ -2919,6 +2920,96 @@ def test_sleep_unregisters_and_restores_kv_caches(dist_init):
     agent = msgspec.msgpack.decode(payload.agent_metadata_bytes, type=NixlAgentMetadata)
     assert agent.agent_metadata == b"re-registered"
     connector.shutdown()
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_checkpoint_restore_creates_the_agent_under_a_new_engine_id(dist_init):
+    """UCX keeps process-wide network state, so an engine that prepares at
+    startup has no agent before its checkpoint restore. The restored agent
+    registers on wake-up and advertises the restored engine id."""
+    vllm_config = create_vllm_config()
+    vllm_config.model_config.checkpoint_prepare_on_startup = True
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    vllm_config.kv_transfer_config.kv_buffer_device = "cpu"
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=4, head_size=16, dtype=torch.float16
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
+    )
+    raw = torch.zeros(spec.page_size_bytes * 2, dtype=torch.int8)
+    (cache,) = dense_kv_cache_views(
+        raw, spec, 2, num_layers=1, layout=KVCacheLayout.BLHNC
+    )
+    with set_current_vllm_config(vllm_config):
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+        connector.register_kv_caches({"layer0": cache})
+    worker = connector.connector_worker
+    assert not worker._registered_descs
+
+    vllm_config.kv_transfer_config.engine_id = "restored"
+    connector.checkpoint_restore()
+    connector.restore_kv_caches()
+    assert worker._registered_descs
+    payload = worker.xfer_handshake_metadata
+    agent = msgspec.msgpack.decode(payload.agent_metadata_bytes, type=NixlAgentMetadata)
+    assert agent.engine_id == "restored"
+    connector.shutdown()
+
+
+@pytest.mark.parametrize(
+    "source,source_eth0,restored_eth0,expected",
+    [
+        (
+            "10.0.0.5",
+            [(socket.AF_INET, "10.0.0.5")],
+            [(socket.AF_INET, "10.0.9.7")],
+            "10.0.9.7",
+        ),
+        (
+            "fd00::5",
+            [(socket.AF_INET6, "fd00::5")],
+            [(socket.AF_INET6, "fe80::1%eth0"), (socket.AF_INET6, "fd00::7")],
+            "fd00::7",
+        ),
+        (
+            "prefill.ns.svc",
+            [(socket.AF_INET, "10.0.0.5")],
+            [(socket.AF_INET, "10.0.9.7")],
+            "prefill.ns.svc",
+        ),
+    ],
+)
+def test_checkpoint_restore_moves_the_side_channel_to_the_new_pod(
+    default_vllm_config, dist_init, source, source_eth0, restored_eth0, expected
+):
+    """The restored environment still names the source pod's side-channel
+    address. The listener must bind and advertise the same interface's
+    address in the new pod, not a link-local one; a name is kept."""
+
+    def interfaces(eth0):
+        return {
+            "lo": [SimpleNamespace(family=socket.AF_INET, address="127.0.0.1")],
+            "eth0": [SimpleNamespace(family=f, address=a) for f, a in eth0],
+        }
+
+    vllm_config = create_vllm_config()
+    scheduler = NixlConnectorScheduler(
+        vllm_config, vllm_config.kv_transfer_config.engine_id, make_kv_cache_config(16)
+    )
+    scheduler.side_channel_host = source
+    with patch("psutil.net_if_addrs", return_value=interfaces(source_eth0)):
+        scheduler.checkpoint_prepare()
+    vllm_config.kv_transfer_config.engine_id = "restored"
+    with patch("psutil.net_if_addrs", return_value=interfaces(restored_eth0)):
+        scheduler.checkpoint_restore()
+    assert scheduler.side_channel_host == expected
+    assert scheduler.engine_id == "restored"
 
 
 def test_registration_generation_bumps_on_changed_payload(

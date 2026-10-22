@@ -370,9 +370,15 @@ class Worker(WorkerBase):
 
     def checkpoint_prepare(self) -> None:
         checkpoint_prepare_distributed_state()
+        if has_kv_transfer_group():
+            get_kv_transfer_group().checkpoint_prepare()
 
-    def checkpoint_restore(self) -> None:
+    def checkpoint_restore(self, kv_engine_id: str | None = None) -> None:
         checkpoint_restore_distributed_state()
+        if kv_engine_id is not None:
+            assert self.vllm_config.kv_transfer_config is not None
+            self.vllm_config.kv_transfer_config.engine_id = kv_engine_id
+            get_kv_transfer_group().checkpoint_restore()
 
     def _weight_checksum_prefix(self) -> str:
         # data_parallel_rank is 0 in dense workers; only the index is unique.

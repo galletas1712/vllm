@@ -758,6 +758,7 @@ def _pausable_engine_core_proc() -> EngineCoreProc:
     core._idle_state_callbacks = []
     core._checkpoint_state = CheckpointState.RUNNING
     core._checkpoint_error = None
+    core._kv_transport_started = False
     return core
 
 
@@ -895,6 +896,38 @@ def test_checkpoint_prepare_then_restore_run_in_order():
     assert _executor_calls(core) == ["checkpoint_restore", "wake_up"]
     core.scheduler.set_pause_state.assert_called_with(PauseState.UNPAUSED)
     assert not core.reject_new_requests
+
+
+def test_checkpoint_kv_connector_prepares_only_before_its_first_restore():
+    """A started KV transport keeps network state that a checkpoint cannot
+    contain, so later prepares are refused with nothing changed. Restoring
+    gives the connector a new engine id, since several replicas may restore
+    from one checkpoint and peers cache what they learn by engine id."""
+    core = _pausable_engine_core_proc()
+    core.vllm_config = MagicMock()
+    core.vllm_config.kv_transfer_config.engine_id = "source"
+    core.model_executor.is_sleeping = False
+    core._reset_caches = MagicMock()
+    core.reject_new_requests = False
+    kv_connector = core.scheduler.get_kv_connector.return_value
+
+    assert core.checkpoint_prepare("wait") is None
+    kv_connector.checkpoint_prepare.assert_called_once_with()
+    core.checkpoint_restore()
+    restore = next(
+        c
+        for c in core.model_executor.collective_rpc.call_args_list
+        if c.args[0] == "checkpoint_restore"
+    )
+    (engine_id,) = restore.args[2]
+    assert engine_id.startswith("source_")
+    assert core.vllm_config.kv_transfer_config.engine_id == engine_id
+    kv_connector.checkpoint_restore.assert_called_once_with()
+
+    core.scheduler.set_pause_state.reset_mock()
+    assert "transport" in core.checkpoint_prepare("wait")
+    assert core.checkpoint_state() == (CheckpointState.RUNNING, None)
+    core.scheduler.set_pause_state.assert_not_called()
 
 
 @pytest.mark.parametrize("deferred", [False, True])
