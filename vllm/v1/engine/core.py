@@ -6,6 +6,7 @@ import queue
 import signal
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
@@ -233,6 +234,12 @@ class EngineCore:
         self._idle_state_callbacks: list[Callable] = []
         self._checkpoint_state = CheckpointState.RUNNING
         self._checkpoint_error: str | None = None
+        # A KV connector's transport, such as a NIXL agent, keeps process-wide
+        # network state once started, so the engine can no longer prepare.
+        self._kv_transport_started = (
+            vllm_config.kv_transfer_config is not None
+            and not vllm_config.model_config.checkpoint_prepare_on_startup
+        )
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -932,6 +939,8 @@ class EngineCore:
             if preparing:
                 self.release_kv_cache_memory()
                 self.collective_rpc("checkpoint_prepare")
+                if (kv_connector := self.scheduler.get_kv_connector()) is not None:
+                    kv_connector.checkpoint_prepare()
                 self.collective_rpc("synchronize_device")
                 self._checkpoint_state = CheckpointState.PREPARED
         except Exception as e:
@@ -2248,6 +2257,12 @@ class EngineCoreProc(EngineCore):
             return "Preparing for a checkpoint requires --enable-sleep-mode"
         if self.model_executor.is_sleeping:
             return "Preparing for a checkpoint requires an awake engine"
+        if self._kv_transport_started:
+            return (
+                "A KV connector's transport cannot be released once started; only "
+                "an engine started with --checkpoint-prepare-on-startup can "
+                "prepare, before its first resume"
+            )
         self._checkpoint_state = CheckpointState.PREPARING
         try:
             self.pause_generation(mode=mode, clear_cache=False)
@@ -2268,7 +2283,16 @@ class EngineCoreProc(EngineCore):
         logger.info("Resuming from a process checkpoint")
         self._checkpoint_state = CheckpointState.RESUMING
         try:
-            self.collective_rpc("checkpoint_restore")
+            kv_engine_id = None
+            if (kv_transfer_config := self.vllm_config.kv_transfer_config) is not None:
+                # Peers cache what they learn by engine id, and several replicas
+                # may restore from one checkpoint.
+                kv_engine_id = f"{kv_transfer_config.engine_id}_{uuid.uuid4().hex[:12]}"
+                kv_transfer_config.engine_id = kv_engine_id
+            self.collective_rpc("checkpoint_restore", args=(kv_engine_id,))
+            if (kv_connector := self.scheduler.get_kv_connector()) is not None:
+                kv_connector.checkpoint_restore()
+                self._kv_transport_started = True
             self.wake_up(["kv_cache"])
         except Exception as e:
             self._fail_checkpoint(e)
