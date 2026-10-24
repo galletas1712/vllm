@@ -976,8 +976,7 @@ class EngineCore:
         """Resume the scheduler and flush any requests queued while paused."""
         if not self._checkpoint_state.is_restored:
             raise RuntimeError(
-                f"Cannot resume scheduling while the checkpoint state is "
-                f"{self._checkpoint_state}"
+                f"Cannot resume scheduling in checkpoint state {self._checkpoint_state}"
             )
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
         if self._checkpoint_state == CheckpointState.RESUMING:
@@ -1297,8 +1296,7 @@ class EngineCoreProc(EngineCore):
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
 
-            # Completes once the drain does, which for DP happens in the busy
-            # loop.
+            # Completes once the drain does, which for DP happens in the busy loop.
             if vllm_config.model_config.checkpoint_prepare_on_startup and (
                 refusal := self.checkpoint_prepare()
             ):
