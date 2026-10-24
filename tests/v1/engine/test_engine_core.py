@@ -874,12 +874,14 @@ def test_checkpoint_prepare_then_restore_run_in_order():
     core._reset_caches = MagicMock()
     core.reject_new_requests = False
     core.scheduler.get_kv_connector.return_value = None
+    core.model_executor.collective_rpc.return_value = []
 
     assert core.checkpoint_prepare("wait") is None
     assert core.checkpoint_prepare("wait") is None
     assert core.checkpoint_state() == (CheckpointState.PREPARED, None)
     assert core.reject_new_requests
     assert _executor_calls(core) == [
+        "checkpoint_blockers",
         "synchronize_device",
         "discard",
         "checkpoint_prepare",
@@ -893,6 +895,20 @@ def test_checkpoint_prepare_then_restore_run_in_order():
     assert _executor_calls(core) == ["checkpoint_restore", "wake_up"]
     core.scheduler.set_pause_state.assert_called_with(PauseState.UNPAUSED)
     assert not core.reject_new_requests
+
+
+def test_unreleasable_resource_refuses_checkpoint_prepare():
+    """A worker resource that cannot be released, such as a started NIXL agent,
+    refuses preparation before anything changes, so the engine keeps serving."""
+    core = _pausable_engine_core_proc()
+    core.vllm_config = MagicMock()
+    core.model_executor.is_sleeping = False
+    core.model_executor.collective_rpc.return_value = [["NixlConnectorWorker"]]
+
+    assert "--checkpoint-prepare-on-startup" in core.checkpoint_prepare("wait")
+
+    assert core._checkpoint_state == CheckpointState.RUNNING
+    core.scheduler.set_pause_state.assert_not_called()
 
 
 @pytest.mark.parametrize("deferred", [False, True])

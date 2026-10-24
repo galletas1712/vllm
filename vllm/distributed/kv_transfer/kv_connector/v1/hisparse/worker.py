@@ -24,6 +24,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import current_stream
+from vllm.v1.checkpoint_resources import register_checkpoint_resource
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.layout import HISPARSE_HOT_SUFFIX
 from vllm.v1.hisparse.runtime import (
@@ -257,6 +258,20 @@ class HiSparseConnectorWorker:
             )
             drop_hisparse_host_pool(self.vllm_config)
             raise
+        if shared_host_region is not None:
+            # The shared pool is a deleted /dev/shm file, which a checkpoint can
+            # carry only once its pages are freed.
+            register_checkpoint_resource(self)
+
+    def checkpoint_prepare(self) -> None:
+        assert self.shared_host_region is not None
+        # Copies run on side streams. The pool must be idle before release.
+        torch.accelerator.synchronize()
+        self.shared_host_region.release_pages()
+
+    def checkpoint_restore(self) -> None:
+        assert self.shared_host_region is not None
+        self.shared_host_region.repin()
 
     def initialize(
         self,
