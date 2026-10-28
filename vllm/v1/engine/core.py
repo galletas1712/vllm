@@ -54,6 +54,11 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.v1.checkpoint_resources import (
+    checkpoint_blockers,
+    prepare_checkpoint_resources,
+    restore_checkpoint_resources,
+)
 from vllm.v1.core.kv_cache_planning import (
     get_global_kv_cache_groups,
     get_kv_cache_configs,
@@ -964,6 +969,7 @@ class EngineCore:
             if preparing:
                 self.release_kv_cache_memory()
                 self.collective_rpc("checkpoint_prepare")
+                prepare_checkpoint_resources()
                 self.collective_rpc("synchronize_device")
                 self._checkpoint_state = CheckpointState.PREPARED
         except Exception as e:
@@ -2312,6 +2318,15 @@ class EngineCoreProc(EngineCore):
             return "Preparing for a checkpoint requires --enable-sleep-mode"
         if self.model_executor.is_sleeping:
             return "Preparing for a checkpoint requires an awake engine"
+        blockers = set(checkpoint_blockers())
+        worker_blockers: list[list[str]] = self.collective_rpc("checkpoint_blockers")
+        for names in worker_blockers:
+            blockers.update(names)
+        if blockers:
+            return (
+                f"{sorted(blockers)} cannot be released once started; start the "
+                "engine with --checkpoint-prepare-on-startup"
+            )
         self._checkpoint_state = CheckpointState.PREPARING
         try:
             self.pause_generation(mode=mode, clear_cache=False)
@@ -2333,6 +2348,7 @@ class EngineCoreProc(EngineCore):
         self._checkpoint_state = CheckpointState.RESTORING
         try:
             self.collective_rpc("checkpoint_restore")
+            restore_checkpoint_resources()
             self.wake_up(["kv_cache"])
         except Exception as e:
             self._fail_checkpoint(e)
